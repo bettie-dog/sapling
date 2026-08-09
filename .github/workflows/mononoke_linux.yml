@@ -58,7 +58,7 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages query-paths --recursive --src-dir=. mononoke  >> "$GITHUB_OUTPUT"
 
     - name: Install Rust 1.91
-      uses: dtolnay/rust-toolchain@1.91
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Fetch ninja
       if: ${{ steps.paths.outputs.ninja_SOURCE }}
