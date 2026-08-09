@@ -28,8 +28,11 @@ REPO_NAME = "test_github_repo"
 REPO_ID = "R_test_github_repo"
 USER_NAME = "facebook_username"
 
-ParamsType = Dict[str, Union[bool, int, str]]
-MakeRequestType = Callable[[ParamsType, str, str, Optional[str]], Result[JsonDict, str]]
+ParamsType = Dict[str, Union[bool, int, str, List[int], List[str]]]
+HeadersType = Optional[Dict[str, str]]
+MakeRequestType = Callable[
+    [ParamsType, str, str, Optional[str], HeadersType], Result[JsonDict, str]
+]
 RunGitCommandType = Callable[[List[str], str], bytes]
 
 
@@ -83,6 +86,7 @@ class MockGitHubServer:
         hostname: str,
         endpoint: str = "graphql",
         method: Optional[str] = None,
+        headers: HeadersType = None,
     ) -> Result[JsonDict, str]:
         """Wrapper function for `github_gh_cli.make_request`.
 
@@ -92,7 +96,7 @@ class MockGitHubServer:
             f"expected '_make_request', but got '{real_make_request.__name__}'"
         )
 
-        key = create_request_key(params, hostname, endpoint, method)
+        key = create_request_key(params, hostname, endpoint, method, headers)
 
         if key not in self.requests:
             raise MockRequestNotFound(key, self.requests)
@@ -621,13 +625,21 @@ def create_request_key(
     hostname: str = GITHUB_HOSTNAME,
     endpoint: str = "graphql",
     method: Optional[str] = None,
+    headers: HeadersType = None,
 ) -> str:
     """Create a string key from the input of `make_request` function.
 
     This will be used to verify the input and find corresponding output.
+
+    Headers are part of the key so expectations assert them (e.g. the
+    X-GitHub-Api-Version header on stacks API calls); when no headers are
+    passed the key format is unchanged.
     """
     s = ",".join(f"{k}={v}" for k, v in sorted(params.items()))
     v = f"{hostname}|{endpoint}|{method}|{s}"
+    if headers:
+        h = ",".join(f"{k}: {v}" for k, v in sorted(headers.items()))
+        v = f"{v}|{h}"
     return v
 
 
