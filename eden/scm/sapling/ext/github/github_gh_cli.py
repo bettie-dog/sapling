@@ -16,33 +16,41 @@ from sapling.result import Err, Ok, Result
 
 JsonDict = Dict[str, Any]
 
+ParamValue = Union[str, int, bool, List[int], List[str]]
+
 
 async def make_request(
-    params: Dict[str, Union[str, int, bool]],
+    params: Dict[str, ParamValue],
     hostname: str,
     endpoint="graphql",
     method: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Result[JsonDict, str]:
     """If successful, returns a Result whose value is parsed JSON returned by
     the request.
     """
-    return await _make_request(params, hostname, endpoint, method)
+    return await _make_request(params, hostname, endpoint, method, headers)
 
 
 # Unexported extension/mock point.
 async def _make_request(
-    params: Dict[str, Union[str, int, bool]],
+    params: Dict[str, ParamValue],
     hostname: str,
     endpoint: str,
     method: Optional[str],
+    headers: Optional[Dict[str, str]] = None,
 ) -> Result[JsonDict, str]:
     if method:
         endpoint_args = ["-X", method.upper(), endpoint]
     else:
         endpoint_args = [endpoint]
+    header_args = list(
+        itertools.chain(*[["-H", f"{k}: {v}"] for (k, v) in (headers or {}).items()])
+    )
     args = (
         ["gh", "api", "--hostname", hostname]
         + endpoint_args
+        + header_args
         + list(itertools.chain(*[_format_param(k, v) for (k, v) in params.items()]))
     )
 
@@ -68,6 +76,9 @@ async def _make_request(
         response = None
 
     if proc.returncode == 0:
+        if response is None and not stdout.strip():
+            # Some REST endpoints return 204 No Content on success.
+            return Ok({})
         assert response is not None
         assert "errors" not in response
         return Ok(response)
@@ -82,7 +93,12 @@ async def _make_request(
         )
 
 
-def _format_param(key: str, value: Union[str, int, bool]) -> List[str]:
+def _format_param(key: str, value: ParamValue) -> List[str]:
+    # gh api represents JSON arrays as a repeated "key[]=element" field.
+    if isinstance(value, list):
+        return list(
+            itertools.chain(*[_format_param(f"{key}[]", element) for element in value])
+        )
     # In Python, bool is a subclass of int, so check it first.
     if isinstance(value, bool):
         opt = "-F"
