@@ -583,6 +583,9 @@ async def rewrite_pull_request_body(
         index,
         repository,
         reviewstack=ui.configbool("github", "pull-request-include-reviewstack"),
+        # GitHub renders its own stack map for native stacks, so the footer
+        # would be redundant there.
+        stack_footer=not workflow.use_native_stacks(),
     )
 
     if pr.state != PullRequestState.OPEN:
