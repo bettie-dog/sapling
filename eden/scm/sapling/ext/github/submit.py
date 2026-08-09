@@ -14,7 +14,7 @@ from sapling import error, formatter, git, hintutil, templatekw
 from sapling.context import changectx
 from sapling.i18n import _
 from sapling.node import hex, nullid
-from sapling.result import Result
+from sapling.result import Ok, Result
 
 from . import gh_submit, github_repo_util
 from .archive_commit import add_commit_to_archives
@@ -70,6 +70,16 @@ class SubmitWorkflow(Enum):
     """
     OVERLAP = "overlap"
 
+    """Like SINGLE, but additionally links the pull requests into a native
+    GitHub "stacked pull requests" stack so GitHub renders each PR's
+    incremental diff and stack map. Native stacks require all branches to live
+    in the same repository, so pull requests are created against the push
+    remote's repository rather than its upstream. GitHub rejects base-branch
+    changes for a pull request while it is part of a stack, so base updates
+    only happen while PRs are unstacked.
+    """
+    STACK = "stack"
+
     @staticmethod
     def from_config(ui) -> "SubmitWorkflow":
         workflow = ui.config(
@@ -80,12 +90,48 @@ class SubmitWorkflow(Enum):
             return SubmitWorkflow.OVERLAP
         elif workflow == "single":
             return SubmitWorkflow.SINGLE
+        elif workflow == "stack":
+            return SubmitWorkflow.STACK
         else:
             # Note that "classic" is not recognized yet.
             ui.warn(
                 _("unrecognized config for github.pr_workflow: defaulting to 'overlap'")
             )
             return SubmitWorkflow.OVERLAP
+
+    def use_stacked_branches(self) -> bool:
+        """Whether each PR's base is the head branch of the PR below it in the
+        stack (one commit per PR), as opposed to a shared base branch.
+        """
+        return self in (SubmitWorkflow.SINGLE, SubmitWorkflow.STACK)
+
+    def use_native_stacks(self) -> bool:
+        """Whether PRs are linked into a native GitHub stack via the REST
+        stacks API.
+        """
+        return self == SubmitWorkflow.STACK
+
+
+def get_pr_owner_and_name(
+    workflow: SubmitWorkflow, repository: Repository
+) -> Tuple[str, str]:
+    """owner and name of the repo that pull requests are created against.
+
+    Native GitHub stacks require every branch in the stack to live in the same
+    repository (cross-fork stacks are not supported), so the STACK workflow
+    creates pull requests against the push remote's repository itself. All
+    other workflows target the upstream repo when the push remote is a fork.
+    """
+    if workflow.use_native_stacks():
+        return (repository.owner, repository.name)
+    return repository.get_upstream_owner_and_name()
+
+
+def get_pr_trunk_branch(workflow: SubmitWorkflow, repository: Repository) -> str:
+    """The branch the bottom of the stack is based on."""
+    if workflow.use_native_stacks():
+        return repository.default_branch
+    return repository.get_base_branch()
 
 
 @dataclass
@@ -170,11 +216,11 @@ async def update_commits_in_stack(
     use_placeholder_strategy = ui.configbool("github", "placeholder-strategy")
     if use_placeholder_strategy:
         params = await create_placeholder_strategy_params(
-            ui, partitions, github_repo, origin
+            ui, partitions, github_repo, origin, workflow
         )
     else:
         params = await create_serial_strategy_params(
-            ui, partitions, github_repo, origin
+            ui, partitions, github_repo, origin, workflow
         )
 
     max_pull_requests_to_create = ui.configint("github", "max-prs-to-create", "5")
@@ -208,17 +254,28 @@ async def update_commits_in_stack(
 
     if not refs_to_update:
         ui.status_err(_("no pull requests to update\n"))
+        if workflow.use_native_stacks():
+            # Even with nothing to push, reconcile the native stack: if
+            # linking failed on a previous submit (API hiccup, crash), simply
+            # re-running `sl pr submit` should heal it without requiring a
+            # content change to force a push.
+            repository = params.repository
+            if not repository:
+                repository = await get_repository_for_origin(
+                    origin, github_repo.hostname
+                )
+            await sync_native_stack(ui, partitions, repository)
         return 0
 
     repository = params.repository
 
-    # For the SINGLE workflow, we must update the base branch on existing PRs
-    # BEFORE pushing the new branch contents. Otherwise, when commits are
+    # For stacked-branch workflows, we must update the base branch on existing
+    # PRs BEFORE pushing the new branch contents. Otherwise, when commits are
     # reordered in the stack, GitHub may see that a PR's commits already exist
     # in its (old) base branch and auto-close the PR as "merged".
     #
     # See https://github.com/facebook/sapling/issues/1275
-    if workflow == SubmitWorkflow.SINGLE:
+    if workflow.use_stacked_branches():
         existing_prs = [
             p for p in partitions if p[0].pr and p[0].pr.state == PullRequestState.OPEN
         ]
@@ -227,26 +284,35 @@ async def update_commits_in_stack(
                 repository = await get_repository_for_origin(
                     origin, github_repo.hostname
                 )
-            # Update base branches on existing PRs before pushing.
-            # Process from bottom of stack to top so bases are set correctly.
-            for index in range(len(partitions)):
-                partition = partitions[index]
-                pr = partition[0].pr
-                if not pr or pr.state != PullRequestState.OPEN:
-                    continue
-                base = repository.get_base_branch()
-                if index < len(partitions) - 1:
-                    base = none_throws(partitions[index + 1][0].head_branch_name)
-                result = await gh_submit.update_pull_request(
-                    repository.hostname, pr.node_id, pr.title, pr.body, base
-                )
-                if result.is_err():
-                    ui.status_err(
-                        _("warning, updating base for #%d may not have succeeded: %s\n")
-                        % (pr.number, result.unwrap_err())
+            if workflow.use_native_stacks():
+                # GitHub rejects base changes on a pull request while it is
+                # part of a native stack, so only retarget when a base
+                # actually changed, dissolving the stack first if necessary
+                # (it is re-linked after the push).
+                await prepare_native_stack_bases(ui, partitions, workflow, repository)
+            else:
+                # Update base branches on existing PRs before pushing.
+                # Process from bottom of stack to top so bases are set correctly.
+                for index in range(len(partitions)):
+                    partition = partitions[index]
+                    pr = partition[0].pr
+                    if not pr or pr.state != PullRequestState.OPEN:
+                        continue
+                    base = repository.get_base_branch()
+                    if index < len(partitions) - 1:
+                        base = none_throws(partitions[index + 1][0].head_branch_name)
+                    result = await gh_submit.update_pull_request(
+                        repository.hostname, pr.node_id, pr.title, pr.body, base
                     )
-                else:
-                    ui.status_err(_("updated base for %s\n") % pr.url)
+                    if result.is_err():
+                        ui.status_err(
+                            _(
+                                "warning, updating base for #%d may not have succeeded: %s\n"
+                            )
+                            % (pr.number, result.unwrap_err())
+                        )
+                    else:
+                        ui.status_err(_("updated base for %s\n") % pr.url)
 
     gitdir = get_gitdir()
     git_push_args = ["push", "--force", origin] + refs_to_update
@@ -304,6 +370,11 @@ async def update_commits_in_stack(
     ]
     await asyncio.gather(*rewrite_and_archive_requests)
 
+    # Link the pull requests into a native GitHub stack, now that they all
+    # exist with their bases chained.
+    if workflow.use_native_stacks():
+        await sync_native_stack(ui, partitions, repository)
+
     # Open pull requests in browser if --open flag was specified
     if is_open:
         pr_urls = [none_throws(p[0].pr).url for p in partitions if p[0].pr]
@@ -312,6 +383,234 @@ async def update_commits_in_stack(
             webbrowser.open(url)
 
     return 0
+
+
+async def _get_stack_for_any(
+    hostname: str, owner: str, name: str, numbers: List[int]
+) -> Result:
+    """Queries the stacks API for each pull request number in turn, returning
+    the first stack found, Ok(None) if none of them is in a stack, or Err on
+    the first API failure.
+    """
+    for number in numbers:
+        result = await gh_submit.get_stack_for_pull_request(
+            hostname, owner, name, number
+        )
+        if result.is_err() or result.unwrap() is not None:
+            return result
+    return Ok(None)
+
+
+async def find_native_stack(
+    partitions: List[List[CommitData]], repository: Repository
+) -> Result:
+    """Returns Ok(PullRequestStack) for the native stack containing the local
+    stack's pull requests, Ok(None) if there is no associated pull request or
+    none is in a stack, or Err on API failure.
+
+    Queries with the bottom-most existing pull request first (the most stable
+    member of an existing stack), then the top-most, to catch stacks whose
+    bottom was reordered or replaced locally.
+    """
+    # partitions is ordered from the top of the stack to the bottom.
+    existing = [p[0].pr.number for p in reversed(partitions) if p[0].pr]
+    candidates = list(dict.fromkeys([existing[0], existing[-1]])) if existing else []
+    return await _get_stack_for_any(
+        repository.hostname, repository.owner, repository.name, candidates
+    )
+
+
+async def prepare_native_stack_bases(
+    ui,
+    partitions: List[List[CommitData]],
+    workflow: SubmitWorkflow,
+    repository: Repository,
+) -> None:
+    """Retargets the base branch of existing open PRs whose position in the
+    local stack changed, dissolving the native GitHub stack first if the PRs
+    are part of one (base branches are locked while stacked). The stack is
+    re-linked after the push by sync_native_stack().
+    """
+    trunk = get_pr_trunk_branch(workflow, repository)
+    mismatched = []
+    for index, partition in enumerate(partitions):
+        pr = partition[0].pr
+        if not pr or pr.state != PullRequestState.OPEN:
+            continue
+        base = trunk
+        if index < len(partitions) - 1:
+            base = none_throws(partitions[index + 1][0].head_branch_name)
+        if pr.base_branch_name != base:
+            mismatched.append((pr, base))
+    if not mismatched:
+        return
+
+    stack_result = await find_native_stack(partitions, repository)
+    if stack_result.is_err():
+        ui.status_err(
+            _("warning: could not query native stack state: %s\n")
+            % stack_result.unwrap_err()
+        )
+    else:
+        stack = stack_result.unwrap()
+        if stack and stack.is_open:
+            local_numbers = [
+                p[0].pr.number
+                for p in partitions
+                if p[0].pr and p[0].pr.state == PullRequestState.OPEN
+            ]
+            foreign = [
+                n for n in stack.open_pr_numbers() if n not in local_numbers
+            ]
+            if foreign:
+                # Same ownership rule as sync_native_stack: never dissolve a
+                # stack containing pull requests that are not ours. But the
+                # bases of our PRs need to change and are locked by the
+                # stack, so pushing now would risk GitHub auto-closing PRs
+                # as merged (see #1275) -- refuse to continue.
+                raise error.Abort(
+                    _(
+                        "cannot update pull request bases: stack #%d contains "
+                        "pull requests not in your local stack (%s); resolve "
+                        "this on GitHub (e.g. with 'gh stack unstack') and "
+                        "re-run"
+                    )
+                    % (stack.number, ", ".join(f"#{n}" for n in foreign))
+                )
+            unstack_result = await gh_submit.unstack_pull_requests(
+                repository.hostname,
+                repository.owner,
+                repository.name,
+                stack.number,
+                stack.open_pr_numbers(),
+            )
+            if unstack_result.is_err():
+                # Pushing reordered branches while bases are locked risks
+                # GitHub auto-closing PRs as "merged" (see #1275), so refuse
+                # to continue.
+                raise error.Abort(
+                    _("cannot update pull request bases while they are in stack #%d: %s")
+                    % (stack.number, unstack_result.unwrap_err())
+                )
+            ui.status_err(
+                _("temporarily unstacked #%d to update pull request bases\n")
+                % stack.number
+            )
+
+    for pr, base in mismatched:
+        result = await gh_submit.update_pull_request(
+            repository.hostname, pr.node_id, pr.title, pr.body, base
+        )
+        if result.is_err():
+            ui.status_err(
+                _("warning, updating base for #%d may not have succeeded: %s\n")
+                % (pr.number, result.unwrap_err())
+            )
+        else:
+            ui.status_err(_("updated base for %s\n") % pr.url)
+
+
+async def sync_native_stack(
+    ui, partitions: List[List[CommitData]], repository: Repository
+) -> None:
+    """Ensures the pull requests for `partitions` are linked into a native
+    GitHub stack, bottom to top.
+
+    Failures are reported as warnings rather than errors: by this point the
+    pull requests already exist with chained bases (plain SINGLE-workflow
+    topology), so linking can be retried on a future submit. This also serves
+    as the fallback for repos where the stacks API (a public preview) is not
+    available.
+    """
+    prs = [p[0].pr for p in partitions]
+    non_open = [pr for pr in prs if pr and pr.state != PullRequestState.OPEN]
+    if non_open:
+        ui.status_err(
+            _("not syncing native stack because #%d is not open\n")
+            % non_open[0].number
+        )
+        return
+    # Bottom to top, as the stacks API expects.
+    desired = [pr.number for pr in reversed(prs) if pr]
+    if len(desired) < 2:
+        # A single pull request is not a stack.
+        return
+
+    hostname = repository.hostname
+    owner = repository.owner
+    name = repository.name
+
+    def warn(err: str) -> None:
+        ui.status_err(
+            _(
+                "warning: failed to sync native GitHub stack: %s\n"
+                "pull requests remain chained and can be linked on a future submit\n"
+            )
+            % err
+        )
+
+    # Query with the bottom pull request first (the most stable member of an
+    # existing stack), then the top, to catch stacks whose bottom was
+    # reordered or replaced locally.
+    result = await _get_stack_for_any(
+        hostname, owner, name, [desired[0], desired[-1]]
+    )
+    if result.is_err():
+        warn(result.unwrap_err())
+        return
+    stack = result.unwrap()
+
+    if stack and stack.is_open:
+        open_members = stack.open_pr_numbers()
+        if open_members == desired:
+            ui.status_err(_("native stack #%d is up-to-date\n") % stack.number)
+            return
+        if open_members == desired[: len(open_members)]:
+            to_add = desired[len(open_members) :]
+            add_result = await gh_submit.add_pull_requests_to_stack(
+                hostname, owner, name, stack.number, to_add
+            )
+            if add_result.is_err():
+                warn(add_result.unwrap_err())
+                return
+            ui.status_err(
+                _("added %d pull request(s) to native stack #%d\n")
+                % (len(to_add), stack.number)
+            )
+            return
+        # Only reconcile stacks we fully own: if the GitHub stack contains
+        # open pull requests that are not part of the local stack (e.g., a
+        # collaborator linked extra PRs with `gh stack link`), dissolving it
+        # would destroy their intentional state.
+        foreign = [n for n in open_members if n not in desired]
+        if foreign:
+            ui.status_err(
+                _(
+                    "warning: not modifying native stack #%d because it contains "
+                    "pull requests not in your local stack: %s\n"
+                )
+                % (stack.number, ", ".join(f"#{n}" for n in foreign))
+            )
+            return
+        # Membership or order changed in a way that cannot be expressed as an
+        # append: dissolve and re-link.
+        unstack_result = await gh_submit.unstack_pull_requests(
+            hostname, owner, name, stack.number, open_members
+        )
+        if unstack_result.is_err():
+            warn(unstack_result.unwrap_err())
+            return
+
+    create_result = await gh_submit.create_pull_request_stack(
+        hostname, owner, name, desired
+    )
+    if create_result.is_err():
+        warn(create_result.unwrap_err())
+        return
+    ui.status_err(
+        _("created native stack #%d with %d pull requests\n")
+        % (create_result.unwrap().number, len(desired))
+    )
 
 
 async def rewrite_pull_request_body(
@@ -326,8 +625,14 @@ async def rewrite_pull_request_body(
     # of this branch. Recall that partitions is ordered from the top of the
     # stack to the bottom.
     partition = partitions[index]
-    base = repository.get_base_branch()
-    if workflow == SubmitWorkflow.SINGLE and index < len(partitions) - 1:
+    base: Optional[str] = repository.get_base_branch()
+    if workflow.use_native_stacks():
+        # Base branches are locked while a pull request is part of a native
+        # stack (GitHub rejects the whole mutation if baseRefName is present,
+        # even unchanged); bases are managed by prepare_native_stack_bases()
+        # and PR creation instead.
+        base = None
+    elif workflow.use_stacked_branches() and index < len(partitions) - 1:
         base = none_throws(partitions[index + 1][0].head_branch_name)
 
     head_commit_data = partition[0]
@@ -347,6 +652,9 @@ async def rewrite_pull_request_body(
         index,
         repository,
         reviewstack=ui.configbool("github", "pull-request-include-reviewstack"),
+        # GitHub renders its own stack map for native stacks, so the footer
+        # would be redundant there.
+        stack_footer=not workflow.use_native_stacks(),
     )
 
     if pr.state != PullRequestState.OPEN:
@@ -373,8 +681,10 @@ class SerialStrategyParams:
     # git push --force any heads that need updating, creating new branch names,
     # if necessary.
     refs_to_update: List[str]
-    # The str in the Tuple is the head branch name for the commit.
-    pull_requests_to_create: List[Tuple[CommitData, str]]
+    # Each entry's commit has head_branch_name set; parent is the commit of
+    # the partition below it in the stack, if any (whether or not that
+    # partition already has a pull request).
+    pull_requests_to_create: List[CommitNeedsPullRequest]
     repository: Optional[Repository]
 
 
@@ -413,11 +723,12 @@ async def create_serial_strategy_params(
     partitions: List[List[CommitData]],
     github_repo: GitHubRepo,
     origin: str,
+    workflow: SubmitWorkflow,
 ) -> SerialStrategyParams:
     # git push --force any heads that need updating, creating new branch names,
     # if necessary.
     refs_to_update = []
-    pull_requests_to_create: List[Tuple[CommitData, str]] = []
+    pull_requests_to_create: List[CommitNeedsPullRequest] = []
 
     # These are set lazily because they require GraphQL calls.
     next_pull_request_number = None
@@ -426,6 +737,7 @@ async def create_serial_strategy_params(
     # Note that `partitions` is ordered from the top of the stack to the bottom,
     # but we want to create PRs from the bottom to the top so the PR numbers are
     # created in ascending order.
+    parent_commit: Optional[CommitData] = None
     for partition in reversed(partitions):
         top = partition[0]
         pr = top.pr
@@ -443,7 +755,9 @@ async def create_serial_strategy_params(
                 repository = await get_repository_for_origin(
                     origin, github_repo.hostname
                 )
-                upstream_owner, upstream_name = repository.get_upstream_owner_and_name()
+                upstream_owner, upstream_name = get_pr_owner_and_name(
+                    workflow, repository
+                )
                 result = await gh_submit.guess_next_pull_request_number(
                     github_repo.hostname, upstream_owner, upstream_name
                 )
@@ -466,7 +780,14 @@ async def create_serial_strategy_params(
             )
             refs_to_update.append(f"{hex(top.node)}:refs/heads/{branch_name}")
             top.head_branch_name = branch_name
-            pull_requests_to_create.append((top, branch_name))
+            # Track the partition below (whether or not it already has a pull
+            # request) so the new PR's base can chain to it: for stacked
+            # workflows a new commit appended on top of already-submitted ones
+            # must be based on the existing PR's head branch, not the trunk.
+            pull_requests_to_create.append(
+                CommitNeedsPullRequest(commit=top, parent=parent_commit)
+            )
+        parent_commit = top
 
     return SerialStrategyParams(refs_to_update, pull_requests_to_create, repository)
 
@@ -487,7 +808,7 @@ def get_pull_request_template(commit: CommitData) -> None | str:
 
 
 async def create_pull_requests_serially(
-    commits: List[Tuple[CommitData, str]],
+    commits: List[CommitNeedsPullRequest],
     workflow: SubmitWorkflow,
     repository: Repository,
     store: PullRequestStore,
@@ -496,20 +817,23 @@ async def create_pull_requests_serially(
 ) -> None:
     """Creates a new pull request for each entry in the `commits` list.
 
-    Each CommitData in `commits` will be updated such that its `.pr` field is
-    set appropriately.
+    Each entry's CommitData will be updated such that its `.pr` field is set
+    appropriately.
     """
-    head_ref_prefix = f"{repository.owner}:" if repository.is_fork else ""
-    owner, name = repository.get_upstream_owner_and_name()
+    owner, name = get_pr_owner_and_name(workflow, repository)
+    is_cross_repo = not workflow.use_native_stacks() and repository.is_fork
+    head_ref_prefix = f"{repository.owner}:" if is_cross_repo else ""
     hostname = repository.hostname
 
     # Create the pull requests in order serially to give us the best chance of
     # the number in the branch name matching that of the actual pull request.
     commits_to_update = []
-    parent = None
-    for commit, branch_name in commits:
-        base = repository.get_base_branch()
-        if workflow == SubmitWorkflow.SINGLE and parent:
+    for commit_needs_pr in commits:
+        commit = commit_needs_pr.commit
+        parent = commit_needs_pr.parent
+        branch_name = none_throws(commit.head_branch_name)
+        base = get_pr_trunk_branch(workflow, repository)
+        if workflow.use_stacked_branches() and parent:
             base = none_throws(parent.head_branch_name)
 
         commit_msg = commit.get_msg()
@@ -545,8 +869,6 @@ async def create_pull_requests_serially(
         store.map_commit_to_pull_request(commit.node, pr_id)
         commits_to_update.append((commit, pr_id))
 
-        parent = commit
-
     # Now that all of the pull requests have been created, update the .pr field
     # on each CommitData. We prioritize the create_pull_request() calls to try
     # to get the pull request numbers to match up.
@@ -571,6 +893,7 @@ async def create_placeholder_strategy_params(
     partitions: List[List[CommitData]],
     github_repo: GitHubRepo,
     origin: str,
+    workflow: SubmitWorkflow,
 ) -> PlaceholderStrategyParams:
     refs_to_update: List[str] = []
     commits_that_need_pull_requests: List[CommitNeedsPullRequest] = []
@@ -609,7 +932,7 @@ async def create_placeholder_strategy_params(
     if commits_that_need_pull_requests:
         repository = await get_repository_for_origin(origin, github_repo.hostname)
         issue_numbers = await _create_placeholder_issues(
-            repository, len(commits_that_need_pull_requests)
+            repository, len(commits_that_need_pull_requests), workflow
         )
         for commit_needs_pr, number in zip(
             commits_that_need_pull_requests, issue_numbers
@@ -646,9 +969,10 @@ async def create_pull_requests_from_placeholder_issues(
     Each entry in `commits` is a (CommitData, branch_name, issue_number). Each
     CommitData will be updated such that its `.pr` field is set appropriately.
     """
-    head_ref_prefix = f"{repository.owner}:" if repository.is_fork else ""
-    owner, name = repository.get_upstream_owner_and_name()
-    base_branch_for_repo = repository.get_base_branch()
+    owner, name = get_pr_owner_and_name(workflow, repository)
+    is_cross_repo = not workflow.use_native_stacks() and repository.is_fork
+    head_ref_prefix = f"{repository.owner}:" if is_cross_repo else ""
+    base_branch_for_repo = get_pr_trunk_branch(workflow, repository)
     hostname = repository.hostname
 
     async def create_pull_request(params: PullRequestParams):
@@ -658,7 +982,7 @@ async def create_pull_requests_from_placeholder_issues(
 
         # Note that "overlapping" pull requests will all share the same base.
         base = base_branch_for_repo
-        if workflow == SubmitWorkflow.SINGLE:
+        if workflow.use_stacked_branches():
             parent = params.parent
             if parent:
                 base = none_throws(parent.head_branch_name)
@@ -709,9 +1033,11 @@ async def create_pull_requests_from_placeholder_issues(
     await asyncio.gather(*[create_pull_request(c) for c in commits])
 
 
-async def _create_placeholder_issues(repository: Repository, num: int) -> List[int]:
+async def _create_placeholder_issues(
+    repository: Repository, num: int, workflow: SubmitWorkflow
+) -> List[int]:
     """create the specified number of placeholder issues in parallel"""
-    upstream_owner, upstream_name = repository.get_upstream_owner_and_name()
+    upstream_owner, upstream_name = get_pr_owner_and_name(workflow, repository)
     issue_number_results = await asyncio.gather(
         *[
             gh_submit.create_pull_request_placeholder_issue(

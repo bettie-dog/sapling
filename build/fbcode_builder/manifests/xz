@@ -12,12 +12,12 @@ xz
 xz-devel
 
 [download]
-url = https://tukaani.org/xz/xz-5.2.5.tar.gz
-sha256 = f6f4910fd033078738bd82bfba4f49219d03b17eb0794eb91efbae419f4aba10
+url = https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz
+sha256 = 3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d546b974a0
 
 [build]
 builder = autoconf
-subdir = xz-5.2.5
+subdir = xz-5.8.3
 
 [autoconf.args]
 --with-pic

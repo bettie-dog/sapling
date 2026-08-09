@@ -8,6 +8,7 @@
 name: Mononoke Linux
 
 on:
+  workflow_dispatch: null
   push:
     branches:
     - main
@@ -22,7 +23,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       SCCACHE_GHA_ENABLED: "on"
     steps:
@@ -57,7 +58,7 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages query-paths --recursive --src-dir=. mononoke  >> "$GITHUB_OUTPUT"
 
     - name: Install Rust 1.91
-      uses: dtolnay/rust-toolchain@1.91
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Fetch ninja
       if: ${{ steps.paths.outputs.ninja_SOURCE }}

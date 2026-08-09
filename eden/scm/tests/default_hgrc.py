@@ -57,7 +57,7 @@ record=False
 
 [hint]
 ack-match-full-traversal=True
-ack = smartlog-default-command commitcloud-update-on-move
+ack = smartlog-default-command commitcloud-update-on-move old-version
 
 [experimental]
 use-rust-changelog=True

@@ -81,6 +81,18 @@ mutation ($pullRequestId: ID!, $title: String!, $body: String!, $base: String!) 
 }
 """
 
+GRAPHQL_UPDATE_PULL_REQUEST_NO_BASE = """
+mutation ($pullRequestId: ID!, $title: String!, $body: String!) {
+  updatePullRequest(
+    input: {pullRequestId: $pullRequestId, title: $title, body: $body}
+  ) {
+    pullRequest {
+      id
+    }
+  }
+}
+"""
+
 GRAPHQL_CREATE_BRANCH = """
 mutation ($repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
   createRef(input: {repositoryId: $repositoryId, name: $name, oid: $oid}) {

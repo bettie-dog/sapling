@@ -11,8 +11,8 @@ the API calls directly so we can (1) avoid spawning so many processes, and
 """
 
 import enum
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Union
 
 from sapling.i18n import _
 from sapling.result import Err, Ok, Result
@@ -22,7 +22,7 @@ from .consts import query
 from .github_gh_cli import JsonDict
 from .pullrequest import PullRequestId
 
-_Params = Union[str, int, bool]
+_Params = Union[str, int, bool, List[int], List[str]]
 
 
 @dataclass
@@ -336,18 +336,31 @@ async def update_pull_request(
     node_id: str,
     title: str,
     body: str,
-    base: str,
+    base: Optional[str],
 ) -> Result[str, str]:
     """Returns an "ID!" for the pull request, which should match the node_id
     that was passed in.
+
+    If base is None, the base branch is left untouched. This is required for
+    pull requests that are part of a native GitHub stack: GitHub rejects the
+    entire updatePullRequest mutation for a stacked pull request if the input
+    includes baseRefName, even when the value matches the current base.
     """
-    params: Dict[str, _Params] = {
-        "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
-        "pullRequestId": node_id,
-        "title": title,
-        "body": body,
-        "base": base,
-    }
+    if base is None:
+        params: Dict[str, _Params] = {
+            "query": query.GRAPHQL_UPDATE_PULL_REQUEST_NO_BASE,
+            "pullRequestId": node_id,
+            "title": title,
+            "body": body,
+        }
+    else:
+        params: Dict[str, _Params] = {
+            "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
+            "pullRequestId": node_id,
+            "title": title,
+            "body": body,
+            "base": base,
+        }
     result = await gh_cli.make_request(params, hostname=hostname)
     if result.is_err():
         return Err(result.unwrap_err())
@@ -393,6 +406,136 @@ async def merge_into_branch(
         return Err(result.unwrap_err())
     else:
         return Ok(result.unwrap()["data"]["mergeBranch"]["mergeCommit"]["oid"])
+
+
+# The GitHub REST API version that includes the stacked pull requests
+# endpoints. As of Aug 2026, stacked pull requests are a public preview
+# feature: https://docs.github.com/en/pull-requests/reference/stacked-pull-requests
+STACKS_API_VERSION = "2026-03-10"
+
+_STACKS_HEADERS = {"X-GitHub-Api-Version": STACKS_API_VERSION}
+
+
+@dataclass
+class PullRequestStackEntry:
+    number: int
+    # "open" or "closed" (a merged pull request is "closed" with merged_at
+    # set); merged/closed pull requests remain members of their stack.
+    state: str
+    merged: bool
+    # The list endpoint (GET /stacks?pull_request=N) returns minimal pull
+    # request objects without a base (and potentially without a head), so
+    # these are best-effort.
+    base_branch_name: Optional[str]
+    head_branch_name: Optional[str]
+
+
+@dataclass
+class PullRequestStack:
+    """A native GitHub stack of pull requests, ordered bottom to top."""
+
+    number: int
+    base_branch_name: str
+    is_open: bool
+    entries: List[PullRequestStackEntry] = field(default_factory=list)
+
+    def open_pr_numbers(self) -> List[int]:
+        """Numbers of the open (unmerged, unclosed) members, bottom to top."""
+        return [e.number for e in self.entries if e.state == "open"]
+
+    def all_pr_numbers(self) -> List[int]:
+        return [e.number for e in self.entries]
+
+
+def _parse_stack(stack: JsonDict) -> PullRequestStack:
+    return PullRequestStack(
+        number=stack["number"],
+        base_branch_name=stack["base"]["ref"],
+        is_open=stack["open"],
+        entries=[
+            PullRequestStackEntry(
+                number=pr["number"],
+                state=pr["state"],
+                merged=pr.get("merged_at") is not None,
+                base_branch_name=(pr.get("base") or {}).get("ref"),
+                head_branch_name=(pr.get("head") or {}).get("ref"),
+            )
+            for pr in stack["pull_requests"]
+        ],
+    )
+
+
+async def get_stack_for_pull_request(
+    hostname: str, owner: str, name: str, number: int
+) -> Result[Optional[PullRequestStack], str]:
+    """Returns the native GitHub stack containing the given pull request, or
+    None if the pull request is not part of a stack.
+    """
+    endpoint = f"repos/{owner}/{name}/stacks"
+    params: Dict[str, _Params] = {"pull_request": number}
+    result = await gh_cli.make_request(
+        params, hostname=hostname, endpoint=endpoint, method="GET",
+        headers=_STACKS_HEADERS,
+    )
+    if result.is_err():
+        return Err(result.unwrap_err())
+    stacks = result.unwrap()
+    if not stacks:
+        return Ok(None)
+    return Ok(_parse_stack(stacks[0]))
+
+
+async def create_pull_request_stack(
+    hostname: str, owner: str, name: str, pull_requests: List[int]
+) -> Result[PullRequestStack, str]:
+    """Links existing pull requests into a new native GitHub stack.
+
+    pull_requests is ordered bottom to top. GitHub validates that each pull
+    request's base branch is the head branch of the previous entry (and the
+    bottom entry's base is the stack's trunk); it does not fix up bases, so
+    the caller must ensure the chain holds before calling this.
+    """
+    endpoint = f"repos/{owner}/{name}/stacks"
+    params: Dict[str, _Params] = {"pull_requests": pull_requests}
+    result = await gh_cli.make_request(
+        params, hostname=hostname, endpoint=endpoint, headers=_STACKS_HEADERS
+    )
+    if result.is_err():
+        return Err(result.unwrap_err())
+    return Ok(_parse_stack(result.unwrap()))
+
+
+async def add_pull_requests_to_stack(
+    hostname: str, owner: str, name: str, stack_number: int, pull_requests: List[int]
+) -> Result[PullRequestStack, str]:
+    """Appends pull requests to the top of an existing stack."""
+    endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/add"
+    params: Dict[str, _Params] = {"pull_requests": pull_requests}
+    result = await gh_cli.make_request(
+        params, hostname=hostname, endpoint=endpoint, headers=_STACKS_HEADERS
+    )
+    if result.is_err():
+        return Err(result.unwrap_err())
+    return Ok(_parse_stack(result.unwrap()))
+
+
+async def unstack_pull_requests(
+    hostname: str, owner: str, name: str, stack_number: int, pull_requests: List[int]
+) -> Result[None, str]:
+    """Removes pull requests from a stack.
+
+    Removing entries cascades: a stack left with fewer than two open members
+    is dissolved entirely (merged members remain as closed-stack history).
+    Once unstacked, a pull request's base branch can be changed again.
+    """
+    endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/unstack"
+    params: Dict[str, _Params] = {"pull_requests": pull_requests}
+    result = await gh_cli.make_request(
+        params, hostname=hostname, endpoint=endpoint, headers=_STACKS_HEADERS
+    )
+    if result.is_err():
+        return Err(result.unwrap_err())
+    return Ok(None)
 
 
 async def get_username(hostname: str) -> Result[str, str]:

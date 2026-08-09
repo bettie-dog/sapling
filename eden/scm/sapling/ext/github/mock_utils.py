@@ -9,9 +9,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from sapling import error
 from sapling.ext.github.consts import query
-from sapling.ext.github.gh_submit import PullRequestState
+from sapling.ext.github.gh_submit import PullRequestState, STACKS_API_VERSION
 from sapling.ext.github.pull_request_body import title_and_body
-from sapling.result import Ok, Result
+from sapling.result import Err, Ok, Result
 
 from .consts import GITHUB_HOSTNAME
 from .github_gh_cli import JsonDict
@@ -28,8 +28,45 @@ REPO_NAME = "test_github_repo"
 REPO_ID = "R_test_github_repo"
 USER_NAME = "facebook_username"
 
-ParamsType = Dict[str, Union[bool, int, str]]
-MakeRequestType = Callable[[ParamsType, str, str, Optional[str]], Result[JsonDict, str]]
+STACKS_HEADERS = {"X-GitHub-Api-Version": STACKS_API_VERSION}
+
+
+def stack_json(
+    number: int,
+    pr_numbers: List[int],
+    base: str = "main",
+    is_open: bool = True,
+    merged: Optional[List[int]] = None,
+) -> JsonDict:
+    """Builds a REST stack object as returned by the stacks endpoints.
+
+    Mirrors the "minimal" shape returned by the list endpoint
+    (GET /stacks?pull_request=N): pull request entries carry number, state,
+    merged_at, and head -- but no base.
+    """
+    merged = merged or []
+    prs = [
+        {
+            "number": n,
+            "state": "closed" if n in merged else "open",
+            "draft": False,
+            "merged_at": "2026-01-01T00:00:00Z" if n in merged else None,
+            "head": {"ref": f"pr{n}"},
+        }
+        for n in pr_numbers
+    ]
+    return {
+        "number": number,
+        "base": {"ref": base},
+        "open": is_open,
+        "pull_requests": prs,
+    }
+
+ParamsType = Dict[str, Union[bool, int, str, List[int], List[str]]]
+HeadersType = Optional[Dict[str, str]]
+MakeRequestType = Callable[
+    [ParamsType, str, str, Optional[str], HeadersType], Result[JsonDict, str]
+]
 RunGitCommandType = Callable[[List[str], str], bytes]
 
 
@@ -83,6 +120,7 @@ class MockGitHubServer:
         hostname: str,
         endpoint: str = "graphql",
         method: Optional[str] = None,
+        headers: HeadersType = None,
     ) -> Result[JsonDict, str]:
         """Wrapper function for `github_gh_cli.make_request`.
 
@@ -92,7 +130,7 @@ class MockGitHubServer:
             f"expected '_make_request', but got '{real_make_request.__name__}'"
         )
 
-        key = create_request_key(params, hostname, endpoint, method)
+        key = create_request_key(params, hostname, endpoint, method, headers)
 
         if key not in self.requests:
             raise MockRequestNotFound(key, self.requests)
@@ -279,11 +317,17 @@ class MockGitHubServer:
         pr_id: str,
         pr_number: int,
         commit_msg: str,
-        base: str = "main",
+        base: Optional[str] = "main",
         owner: str = OWNER,
         name: str = REPO_NAME,
         stack_pr_ids: Optional[List[int]] = None,
     ) -> "UpdatePrRequest":
+        """base=None expects the no-base variant of the mutation, which is what
+        the stack workflow must always use: an expectation with base=None will
+        NOT match a request that includes baseRefName (the request key embeds
+        the full query text), so any code path that reintroduces baseRefName
+        for stacked pull requests fails with MockRequestNotFound.
+        """
         if not stack_pr_ids:
             stack_pr_ids = [pr_number]
         stack_pr_ids = list(reversed(sorted(stack_pr_ids)))
@@ -301,15 +345,86 @@ class MockGitHubServer:
             )
 
         title, body = title_and_body(commit_msg)
-        params: ParamsType = {
-            "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
-            "pullRequestId": pr_id,
-            "title": title,
-            "body": body,
-            "base": base,
-        }
+        if base is None:
+            params: ParamsType = {
+                "query": query.GRAPHQL_UPDATE_PULL_REQUEST_NO_BASE,
+                "pullRequestId": pr_id,
+                "title": title,
+                "body": body,
+            }
+        else:
+            params: ParamsType = {
+                "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
+                "pullRequestId": pr_id,
+                "title": title,
+                "body": body,
+                "base": base,
+            }
         key = create_request_key(params, self.hostname)
         request = UpdatePrRequest(key, pr_id)
+        self._add_request(key, request)
+        return request
+
+    def expect_get_stack_request(
+        self,
+        pr_number: int,
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks"
+        params: ParamsType = {"pull_request": pr_number}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, method="GET",
+            headers=STACKS_HEADERS,
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_create_stack_request(
+        self,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_add_to_stack_request(
+        self,
+        stack_number: int,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/add"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_unstack_request(
+        self,
+        stack_number: int,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/unstack"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
         self._add_request(key, request)
         return request
 
@@ -578,6 +693,31 @@ class MergeIntoBranchRequest(MockRequest):
         return self._response
 
 
+class StackRequest(MockRequest):
+    """Mock for the REST stacks endpoints.
+
+    and_respond takes the raw JSON value the endpoint returns: a list of
+    stack objects for GET, a single stack object for create/add (see
+    stack_json()), or {} for unstack. and_error simulates an API failure
+    (e.g. the stacks API being unavailable, or a 422 validation error).
+    """
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+        self._response: Optional[Result[JsonDict, str]] = None
+
+    def and_respond(self, response: Any) -> None:
+        self._response = Ok(response)
+
+    def and_error(self, message: str) -> None:
+        self._response = Err(message)
+
+    def get_response(self) -> Result[JsonDict, str]:
+        if self._response is None:
+            raise MockResponseNotSet(self._key)
+        return self._response
+
+
 class MockRequestNotFound(error.Abort):
     def __init__(self, key: str, requests: Dict[str, MockRequest]) -> None:
         import textwrap
@@ -621,13 +761,21 @@ def create_request_key(
     hostname: str = GITHUB_HOSTNAME,
     endpoint: str = "graphql",
     method: Optional[str] = None,
+    headers: HeadersType = None,
 ) -> str:
     """Create a string key from the input of `make_request` function.
 
     This will be used to verify the input and find corresponding output.
+
+    Headers are part of the key so expectations assert them (e.g. the
+    X-GitHub-Api-Version header on stacks API calls); when no headers are
+    passed the key format is unchanged.
     """
     s = ",".join(f"{k}={v}" for k, v in sorted(params.items()))
     v = f"{hostname}|{endpoint}|{method}|{s}"
+    if headers:
+        h = ",".join(f"{k}: {v}" for k, v in sorted(headers.items()))
+        v = f"{v}|{h}"
     return v
 
 
