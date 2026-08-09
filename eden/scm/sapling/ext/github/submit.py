@@ -254,6 +254,17 @@ async def update_commits_in_stack(
 
     if not refs_to_update:
         ui.status_err(_("no pull requests to update\n"))
+        if workflow.use_native_stacks():
+            # Even with nothing to push, reconcile the native stack: if
+            # linking failed on a previous submit (API hiccup, crash), simply
+            # re-running `sl pr submit` should heal it without requiring a
+            # content change to force a push.
+            repository = params.repository
+            if not repository:
+                repository = await get_repository_for_origin(
+                    origin, github_repo.hostname
+                )
+            await sync_native_stack(ui, partitions, repository)
         return 0
 
     repository = params.repository
@@ -374,21 +385,39 @@ async def update_commits_in_stack(
     return 0
 
 
+async def _get_stack_for_any(
+    hostname: str, owner: str, name: str, numbers: List[int]
+) -> Result:
+    """Queries the stacks API for each pull request number in turn, returning
+    the first stack found, Ok(None) if none of them is in a stack, or Err on
+    the first API failure.
+    """
+    for number in numbers:
+        result = await gh_submit.get_stack_for_pull_request(
+            hostname, owner, name, number
+        )
+        if result.is_err() or result.unwrap() is not None:
+            return result
+    return Ok(None)
+
+
 async def find_native_stack(
     partitions: List[List[CommitData]], repository: Repository
 ) -> Result:
-    """Returns Ok(PullRequestStack) for the native stack containing the
-    bottom-most existing pull request in `partitions`, Ok(None) if there is no
-    associated pull request or it is not in a stack, or Err on API failure.
+    """Returns Ok(PullRequestStack) for the native stack containing the local
+    stack's pull requests, Ok(None) if there is no associated pull request or
+    none is in a stack, or Err on API failure.
+
+    Queries with the bottom-most existing pull request first (the most stable
+    member of an existing stack), then the top-most, to catch stacks whose
+    bottom was reordered or replaced locally.
     """
     # partitions is ordered from the top of the stack to the bottom.
-    for partition in reversed(partitions):
-        pr = partition[0].pr
-        if pr:
-            return await gh_submit.get_stack_for_pull_request(
-                repository.hostname, repository.owner, repository.name, pr.number
-            )
-    return Ok(None)
+    existing = [p[0].pr.number for p in reversed(partitions) if p[0].pr]
+    candidates = list(dict.fromkeys([existing[0], existing[-1]])) if existing else []
+    return await _get_stack_for_any(
+        repository.hostname, repository.owner, repository.name, candidates
+    )
 
 
 async def prepare_native_stack_bases(
@@ -425,6 +454,29 @@ async def prepare_native_stack_bases(
     else:
         stack = stack_result.unwrap()
         if stack and stack.is_open:
+            local_numbers = [
+                p[0].pr.number
+                for p in partitions
+                if p[0].pr and p[0].pr.state == PullRequestState.OPEN
+            ]
+            foreign = [
+                n for n in stack.open_pr_numbers() if n not in local_numbers
+            ]
+            if foreign:
+                # Same ownership rule as sync_native_stack: never dissolve a
+                # stack containing pull requests that are not ours. But the
+                # bases of our PRs need to change and are locked by the
+                # stack, so pushing now would risk GitHub auto-closing PRs
+                # as merged (see #1275) -- refuse to continue.
+                raise error.Abort(
+                    _(
+                        "cannot update pull request bases: stack #%d contains "
+                        "pull requests not in your local stack (%s); resolve "
+                        "this on GitHub (e.g. with 'gh stack unstack') and "
+                        "re-run"
+                    )
+                    % (stack.number, ", ".join(f"#{n}" for n in foreign))
+                )
             unstack_result = await gh_submit.unstack_pull_requests(
                 repository.hostname,
                 repository.owner,
@@ -497,8 +549,11 @@ async def sync_native_stack(
             % err
         )
 
-    result = await gh_submit.get_stack_for_pull_request(
-        hostname, owner, name, desired[0]
+    # Query with the bottom pull request first (the most stable member of an
+    # existing stack), then the top, to catch stacks whose bottom was
+    # reordered or replaced locally.
+    result = await _get_stack_for_any(
+        hostname, owner, name, [desired[0], desired[-1]]
     )
     if result.is_err():
         warn(result.unwrap_err())
@@ -521,6 +576,20 @@ async def sync_native_stack(
             ui.status_err(
                 _("added %d pull request(s) to native stack #%d\n")
                 % (len(to_add), stack.number)
+            )
+            return
+        # Only reconcile stacks we fully own: if the GitHub stack contains
+        # open pull requests that are not part of the local stack (e.g., a
+        # collaborator linked extra PRs with `gh stack link`), dissolving it
+        # would destroy their intentional state.
+        foreign = [n for n in open_members if n not in desired]
+        if foreign:
+            ui.status_err(
+                _(
+                    "warning: not modifying native stack #%d because it contains "
+                    "pull requests not in your local stack: %s\n"
+                )
+                % (stack.number, ", ".join(f"#{n}" for n in foreign))
             )
             return
         # Membership or order changed in a way that cannot be expressed as an
