@@ -70,6 +70,16 @@ class SubmitWorkflow(Enum):
     """
     OVERLAP = "overlap"
 
+    """Like SINGLE, but additionally links the pull requests into a native
+    GitHub "stacked pull requests" stack so GitHub renders each PR's
+    incremental diff and stack map. Native stacks require all branches to live
+    in the same repository, so pull requests are created against the push
+    remote's repository rather than its upstream. GitHub rejects base-branch
+    changes for a pull request while it is part of a stack, so base updates
+    only happen while PRs are unstacked.
+    """
+    STACK = "stack"
+
     @staticmethod
     def from_config(ui) -> "SubmitWorkflow":
         workflow = ui.config(
@@ -80,12 +90,26 @@ class SubmitWorkflow(Enum):
             return SubmitWorkflow.OVERLAP
         elif workflow == "single":
             return SubmitWorkflow.SINGLE
+        elif workflow == "stack":
+            return SubmitWorkflow.STACK
         else:
             # Note that "classic" is not recognized yet.
             ui.warn(
                 _("unrecognized config for github.pr_workflow: defaulting to 'overlap'")
             )
             return SubmitWorkflow.OVERLAP
+
+    def use_stacked_branches(self) -> bool:
+        """Whether each PR's base is the head branch of the PR below it in the
+        stack (one commit per PR), as opposed to a shared base branch.
+        """
+        return self in (SubmitWorkflow.SINGLE, SubmitWorkflow.STACK)
+
+    def use_native_stacks(self) -> bool:
+        """Whether PRs are linked into a native GitHub stack via the REST
+        stacks API.
+        """
+        return self == SubmitWorkflow.STACK
 
 
 @dataclass
@@ -218,7 +242,7 @@ async def update_commits_in_stack(
     # in its (old) base branch and auto-close the PR as "merged".
     #
     # See https://github.com/facebook/sapling/issues/1275
-    if workflow == SubmitWorkflow.SINGLE:
+    if workflow.use_stacked_branches():
         existing_prs = [
             p for p in partitions if p[0].pr and p[0].pr.state == PullRequestState.OPEN
         ]
@@ -327,7 +351,7 @@ async def rewrite_pull_request_body(
     # stack to the bottom.
     partition = partitions[index]
     base = repository.get_base_branch()
-    if workflow == SubmitWorkflow.SINGLE and index < len(partitions) - 1:
+    if workflow.use_stacked_branches() and index < len(partitions) - 1:
         base = none_throws(partitions[index + 1][0].head_branch_name)
 
     head_commit_data = partition[0]
@@ -509,7 +533,7 @@ async def create_pull_requests_serially(
     parent = None
     for commit, branch_name in commits:
         base = repository.get_base_branch()
-        if workflow == SubmitWorkflow.SINGLE and parent:
+        if workflow.use_stacked_branches() and parent:
             base = none_throws(parent.head_branch_name)
 
         commit_msg = commit.get_msg()
@@ -658,7 +682,7 @@ async def create_pull_requests_from_placeholder_issues(
 
         # Note that "overlapping" pull requests will all share the same base.
         base = base_branch_for_repo
-        if workflow == SubmitWorkflow.SINGLE:
+        if workflow.use_stacked_branches():
             parent = params.parent
             if parent:
                 base = none_throws(parent.head_branch_name)
