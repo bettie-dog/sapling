@@ -9,9 +9,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from sapling import error
 from sapling.ext.github.consts import query
-from sapling.ext.github.gh_submit import PullRequestState
+from sapling.ext.github.gh_submit import PullRequestState, STACKS_API_VERSION
 from sapling.ext.github.pull_request_body import title_and_body
-from sapling.result import Ok, Result
+from sapling.result import Err, Ok, Result
 
 from .consts import GITHUB_HOSTNAME
 from .github_gh_cli import JsonDict
@@ -27,6 +27,40 @@ OWNER_ID = "facebook_id"
 REPO_NAME = "test_github_repo"
 REPO_ID = "R_test_github_repo"
 USER_NAME = "facebook_username"
+
+STACKS_HEADERS = {"X-GitHub-Api-Version": STACKS_API_VERSION}
+
+
+def stack_json(
+    number: int,
+    pr_numbers: List[int],
+    base: str = "main",
+    is_open: bool = True,
+    merged: Optional[List[int]] = None,
+) -> JsonDict:
+    """Builds a REST stack object as returned by the stacks endpoints, with
+    bases chained pr{N}-style bottom to top.
+    """
+    merged = merged or []
+    prs = []
+    prev_head = base
+    for n in pr_numbers:
+        prs.append(
+            {
+                "number": n,
+                "state": "closed" if n in merged else "open",
+                "merged_at": "2026-01-01T00:00:00Z" if n in merged else None,
+                "base": {"ref": prev_head},
+                "head": {"ref": f"pr{n}"},
+            }
+        )
+        prev_head = f"pr{n}"
+    return {
+        "number": number,
+        "base": {"ref": base},
+        "open": is_open,
+        "pull_requests": prs,
+    }
 
 ParamsType = Dict[str, Union[bool, int, str, List[int], List[str]]]
 HeadersType = Optional[Dict[str, str]]
@@ -283,11 +317,17 @@ class MockGitHubServer:
         pr_id: str,
         pr_number: int,
         commit_msg: str,
-        base: str = "main",
+        base: Optional[str] = "main",
         owner: str = OWNER,
         name: str = REPO_NAME,
         stack_pr_ids: Optional[List[int]] = None,
     ) -> "UpdatePrRequest":
+        """base=None expects the no-base variant of the mutation, which is what
+        the stack workflow must always use: an expectation with base=None will
+        NOT match a request that includes baseRefName (the request key embeds
+        the full query text), so any code path that reintroduces baseRefName
+        for stacked pull requests fails with MockRequestNotFound.
+        """
         if not stack_pr_ids:
             stack_pr_ids = [pr_number]
         stack_pr_ids = list(reversed(sorted(stack_pr_ids)))
@@ -305,15 +345,86 @@ class MockGitHubServer:
             )
 
         title, body = title_and_body(commit_msg)
-        params: ParamsType = {
-            "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
-            "pullRequestId": pr_id,
-            "title": title,
-            "body": body,
-            "base": base,
-        }
+        if base is None:
+            params: ParamsType = {
+                "query": query.GRAPHQL_UPDATE_PULL_REQUEST_NO_BASE,
+                "pullRequestId": pr_id,
+                "title": title,
+                "body": body,
+            }
+        else:
+            params: ParamsType = {
+                "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
+                "pullRequestId": pr_id,
+                "title": title,
+                "body": body,
+                "base": base,
+            }
         key = create_request_key(params, self.hostname)
         request = UpdatePrRequest(key, pr_id)
+        self._add_request(key, request)
+        return request
+
+    def expect_get_stack_request(
+        self,
+        pr_number: int,
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks"
+        params: ParamsType = {"pull_request": pr_number}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, method="GET",
+            headers=STACKS_HEADERS,
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_create_stack_request(
+        self,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_add_to_stack_request(
+        self,
+        stack_number: int,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/add"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
+        self._add_request(key, request)
+        return request
+
+    def expect_unstack_request(
+        self,
+        stack_number: int,
+        pull_requests: List[int],
+        owner: str = OWNER,
+        name: str = REPO_NAME,
+    ) -> "StackRequest":
+        endpoint = f"repos/{owner}/{name}/stacks/{stack_number}/unstack"
+        params: ParamsType = {"pull_requests": pull_requests}
+        key = create_request_key(
+            params, self.hostname, endpoint=endpoint, headers=STACKS_HEADERS
+        )
+        request = StackRequest(key)
         self._add_request(key, request)
         return request
 
@@ -575,6 +686,31 @@ class MergeIntoBranchRequest(MockRequest):
         merge_commit_oid = merge_commit_oid or gen_hash_hexdigest(self._head)
         data = {"data": {"mergeBranch": {"mergeCommit": {"oid": merge_commit_oid}}}}
         self._response = Ok(data)
+
+    def get_response(self) -> Result[JsonDict, str]:
+        if self._response is None:
+            raise MockResponseNotSet(self._key)
+        return self._response
+
+
+class StackRequest(MockRequest):
+    """Mock for the REST stacks endpoints.
+
+    and_respond takes the raw JSON value the endpoint returns: a list of
+    stack objects for GET, a single stack object for create/add (see
+    stack_json()), or {} for unstack. and_error simulates an API failure
+    (e.g. the stacks API being unavailable, or a 422 validation error).
+    """
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+        self._response: Optional[Result[JsonDict, str]] = None
+
+    def and_respond(self, response: Any) -> None:
+        self._response = Ok(response)
+
+    def and_error(self, message: str) -> None:
+        self._response = Err(message)
 
     def get_response(self) -> Result[JsonDict, str]:
         if self._response is None:
