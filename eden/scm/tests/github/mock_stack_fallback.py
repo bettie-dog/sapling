@@ -45,7 +45,7 @@ def setup_mock_github_server(ui) -> MockGitHubServer:
         github_server.expect_get_pr_details_request(num).and_respond(pr_id)
 
         github_server.expect_update_pr_request(
-            pr_id, num, msg, base=None, stack_pr_ids=[pr[0] for pr in prs]
+            pr_id, num, msg, base=None
         ).and_respond()
 
     github_server.expect_get_username_request().and_respond()

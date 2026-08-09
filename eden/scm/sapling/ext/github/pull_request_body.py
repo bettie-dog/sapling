@@ -18,6 +18,7 @@ def create_pull_request_title_and_body(
     pr_numbers_index: int,
     repository: Repository,
     reviewstack: bool = True,
+    stack_footer: bool = True,
 ) -> Tuple[str, str]:
     r"""Returns (title, body) for the pull request.
 
@@ -95,6 +96,28 @@ def create_pull_request_title_and_body(
     Foo
     >>> print(body.replace(reviewstack_url, "{reviewstack_url}"))
     Bar
+
+    stack_footer=False suppresses the footer entirely (used by the native
+    stack workflow, where GitHub renders its own stack map), while still
+    stripping any pre-existing footer from the body:
+    >>> body_with_footer = (
+    ...     'Second line of message.\n' +
+    ...     '---\n' +
+    ...     '[//]: # (BEGIN SAPLING FOOTER)\n' +
+    ...     '* #1\n' +
+    ...     '* __->__ #42\n')
+    >>> title, body = create_pull_request_title_and_body(
+    ...     ("A title.", body_with_footer),
+    ...     pr_numbers_and_num_commits,
+    ...     pr_numbers_index,
+    ...     contributor_repo,
+    ...     stack_footer=False,
+    ... )
+    >>> print(title)
+    A title.
+    >>> print(body)
+    Second line of message.
+    <BLANKLINE>
     """
     owner, name = repository.get_upstream_owner_and_name()
     pr = pr_numbers_and_num_commits[pr_numbers_index][0]
@@ -106,7 +129,7 @@ def create_pull_request_title_and_body(
 
     body = _strip_stack_information(body)
     extra = []
-    if len(pr_numbers_and_num_commits) > 1:
+    if stack_footer and len(pr_numbers_and_num_commits) > 1:
         if reviewstack:
             reviewstack_url = f"https://reviewstack.dev/{owner}/{name}/pull/{pr}"
             review_stack_message = f"Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url})."
