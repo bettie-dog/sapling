@@ -8,6 +8,7 @@
 name: Sapling CLI Getdeps Linux
 
 on:
+  workflow_dispatch: null
   push:
     branches:
     - main
@@ -22,7 +23,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       SCCACHE_GHA_ENABLED: "on"
     steps:
