@@ -59,7 +59,10 @@ def setup_mock_github_server(ui) -> MockGitHubServer:
     head = "1a67244b0a776bfcc3be6bf811e98c993d78ce47"
     github_server.expect_merge_into_branch(head).and_respond()
 
+    # Two-point discovery: with no stack found for the bottom PR, the top PR
+    # is also queried before concluding no stack exists.
     github_server.expect_get_stack_request(42).and_respond([])
+    github_server.expect_get_stack_request(43).and_respond([])
     github_server.expect_create_stack_request([42, 43]).and_respond(
         stack_json(44, [42, 43])
     )

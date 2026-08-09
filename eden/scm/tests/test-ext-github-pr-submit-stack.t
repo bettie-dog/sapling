@@ -63,6 +63,37 @@ stack via the /add endpoint
   updated body for https://github.com/facebook/test_github_repo/pull/42
   added 1 pull request(s) to native stack #44
 
+no-op submit still reconciles the stack: with nothing to push, a previously
+failed stack link is retried (two-point discovery queries the bottom and top
+PRs before concluding no stack exists)
+
+  $ sl pr submit --config extensions.pr_submit_stack_linknoop=$TESTDIR/github/mock_stack_linknoop.py
+  #42 is up-to-date
+  #43 is up-to-date
+  #45 is up-to-date
+  no pull requests to update
+  created native stack #46 with 3 pull requests
+
+diverged stack whose members are all ours: automatically dissolved and
+re-linked to match the local stack
+
+  $ sl pr submit --config extensions.pr_submit_stack_restack=$TESTDIR/github/mock_stack_restack.py
+  #42 is up-to-date
+  #43 is up-to-date
+  #45 is up-to-date
+  no pull requests to update
+  created native stack #46 with 3 pull requests
+
+stack containing a pull request that is not ours (#99): never modified, only
+a warning
+
+  $ sl pr submit --config extensions.pr_submit_stack_foreign=$TESTDIR/github/mock_stack_foreign.py
+  #42 is up-to-date
+  #43 is up-to-date
+  #45 is up-to-date
+  no pull requests to update
+  warning: not modifying native stack #44 because it contains pull requests not in your local stack: #99
+
 stacks API unavailable (e.g. preview not enabled): submit still succeeds with
 chained bases and only warns
 
