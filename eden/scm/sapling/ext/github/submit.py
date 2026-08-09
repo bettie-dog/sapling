@@ -612,8 +612,10 @@ class SerialStrategyParams:
     # git push --force any heads that need updating, creating new branch names,
     # if necessary.
     refs_to_update: List[str]
-    # The str in the Tuple is the head branch name for the commit.
-    pull_requests_to_create: List[Tuple[CommitData, str]]
+    # Each entry's commit has head_branch_name set; parent is the commit of
+    # the partition below it in the stack, if any (whether or not that
+    # partition already has a pull request).
+    pull_requests_to_create: List[CommitNeedsPullRequest]
     repository: Optional[Repository]
 
 
@@ -657,7 +659,7 @@ async def create_serial_strategy_params(
     # git push --force any heads that need updating, creating new branch names,
     # if necessary.
     refs_to_update = []
-    pull_requests_to_create: List[Tuple[CommitData, str]] = []
+    pull_requests_to_create: List[CommitNeedsPullRequest] = []
 
     # These are set lazily because they require GraphQL calls.
     next_pull_request_number = None
@@ -666,6 +668,7 @@ async def create_serial_strategy_params(
     # Note that `partitions` is ordered from the top of the stack to the bottom,
     # but we want to create PRs from the bottom to the top so the PR numbers are
     # created in ascending order.
+    parent_commit: Optional[CommitData] = None
     for partition in reversed(partitions):
         top = partition[0]
         pr = top.pr
@@ -708,7 +711,14 @@ async def create_serial_strategy_params(
             )
             refs_to_update.append(f"{hex(top.node)}:refs/heads/{branch_name}")
             top.head_branch_name = branch_name
-            pull_requests_to_create.append((top, branch_name))
+            # Track the partition below (whether or not it already has a pull
+            # request) so the new PR's base can chain to it: for stacked
+            # workflows a new commit appended on top of already-submitted ones
+            # must be based on the existing PR's head branch, not the trunk.
+            pull_requests_to_create.append(
+                CommitNeedsPullRequest(commit=top, parent=parent_commit)
+            )
+        parent_commit = top
 
     return SerialStrategyParams(refs_to_update, pull_requests_to_create, repository)
 
@@ -729,7 +739,7 @@ def get_pull_request_template(commit: CommitData) -> None | str:
 
 
 async def create_pull_requests_serially(
-    commits: List[Tuple[CommitData, str]],
+    commits: List[CommitNeedsPullRequest],
     workflow: SubmitWorkflow,
     repository: Repository,
     store: PullRequestStore,
@@ -738,8 +748,8 @@ async def create_pull_requests_serially(
 ) -> None:
     """Creates a new pull request for each entry in the `commits` list.
 
-    Each CommitData in `commits` will be updated such that its `.pr` field is
-    set appropriately.
+    Each entry's CommitData will be updated such that its `.pr` field is set
+    appropriately.
     """
     owner, name = get_pr_owner_and_name(workflow, repository)
     is_cross_repo = not workflow.use_native_stacks() and repository.is_fork
@@ -749,8 +759,10 @@ async def create_pull_requests_serially(
     # Create the pull requests in order serially to give us the best chance of
     # the number in the branch name matching that of the actual pull request.
     commits_to_update = []
-    parent = None
-    for commit, branch_name in commits:
+    for commit_needs_pr in commits:
+        commit = commit_needs_pr.commit
+        parent = commit_needs_pr.parent
+        branch_name = none_throws(commit.head_branch_name)
         base = get_pr_trunk_branch(workflow, repository)
         if workflow.use_stacked_branches() and parent:
             base = none_throws(parent.head_branch_name)
@@ -787,8 +799,6 @@ async def create_pull_requests_serially(
         pr_id = PullRequestId(hostname=hostname, owner=owner, name=name, number=number)
         store.map_commit_to_pull_request(commit.node, pr_id)
         commits_to_update.append((commit, pr_id))
-
-        parent = commit
 
     # Now that all of the pull requests have been created, update the .pr field
     # on each CommitData. We prioritize the create_pull_request() calls to try

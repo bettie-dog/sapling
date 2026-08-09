@@ -46,6 +46,23 @@ and the existing stack is recognized as up-to-date
   updated body for https://github.com/facebook/test_github_repo/pull/42
   native stack #44 is up-to-date
 
+append a new commit on top: the new PR is created with its base chained to
+the previous PR's head branch (not the trunk) and appended to the existing
+stack via the /add endpoint
+
+  $ echo c > c1
+  $ sl ci -Aqm three
+  $ export PR45_HEAD=`sl log -r '.' -T '{node}'`
+  $ sl pr submit --config extensions.pr_submit_stack_append=$TESTDIR/github/mock_stack_append.py
+  #42 is up-to-date
+  #43 is up-to-date
+  pushing 1 to https://github.com/facebook/test_github_repo.git
+  created new pull request: https://github.com/facebook/test_github_repo/pull/45
+  updated body for https://github.com/facebook/test_github_repo/pull/45
+  updated body for https://github.com/facebook/test_github_repo/pull/43
+  updated body for https://github.com/facebook/test_github_repo/pull/42
+  added 1 pull request(s) to native stack #44
+
 stacks API unavailable (e.g. preview not enabled): submit still succeeds with
 chained bases and only warns
 
