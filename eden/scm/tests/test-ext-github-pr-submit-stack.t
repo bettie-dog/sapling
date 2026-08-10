@@ -84,6 +84,18 @@ re-linked to match the local stack
   no pull requests to update
   created native stack #46 with 3 pull requests
 
+stack whose top member is a closed pull request (#60, e.g. closed and
+re-minted under a new number): the open members are a prefix of the local
+stack, but appending onto a closed top can never pass GitHub's base-ref
+validation -- dissolve and re-link instead
+
+  $ sl pr submit --config extensions.pr_submit_stack_closed_tail=$TESTDIR/github/mock_stack_closed_tail.py
+  #42 is up-to-date
+  #43 is up-to-date
+  #45 is up-to-date
+  no pull requests to update
+  created native stack #46 with 3 pull requests
+
 stack containing a pull request that is not ours (#99): never modified, only
 a warning
 

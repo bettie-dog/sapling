@@ -565,7 +565,15 @@ async def sync_native_stack(
         if open_members == desired:
             ui.status_err(_("native stack #%d is up-to-date\n") % stack.number)
             return
-        if open_members == desired[: len(open_members)]:
+        # Appending is only valid when the new entries chain onto the stack's
+        # ACTUAL top member — GitHub validates each added pull request's base
+        # against the head of the full member list, which includes closed and
+        # merged members. A closed pull request sitting at the stack's tail
+        # (e.g. the top PR of the stack was closed and re-minted under a new
+        # number) makes every append 422 forever; the only correct move then
+        # is dissolve-and-relink below.
+        top_is_open = bool(stack.entries) and stack.entries[-1].state == "open"
+        if top_is_open and open_members == desired[: len(open_members)]:
             to_add = desired[len(open_members) :]
             add_result = await gh_submit.add_pull_requests_to_stack(
                 hostname, owner, name, stack.number, to_add
