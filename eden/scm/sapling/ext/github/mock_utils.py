@@ -37,6 +37,7 @@ def stack_json(
     base: str = "main",
     is_open: bool = True,
     merged: Optional[List[int]] = None,
+    closed: Optional[List[int]] = None,
 ) -> JsonDict:
     """Builds a REST stack object as returned by the stacks endpoints.
 
@@ -45,10 +46,11 @@ def stack_json(
     merged_at, and head -- but no base.
     """
     merged = merged or []
+    closed = closed or []
     prs = [
         {
             "number": n,
-            "state": "closed" if n in merged else "open",
+            "state": "closed" if n in merged or n in closed else "open",
             "draft": False,
             "merged_at": "2026-01-01T00:00:00Z" if n in merged else None,
             "head": {"ref": f"pr{n}"},
