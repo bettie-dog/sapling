@@ -7,12 +7,14 @@
 
 name: Mononoke Linux
 
+# No pull_request trigger: a Mononoke build is a ~4h Rust job whose sccache
+# blobs compete with the release builds' caches (10 GiB repo cap), and PRs
+# here are almost always CLI-extension work it says nothing about. Main
+# pushes still build; run manually via workflow_dispatch when a PR actually
+# touches Mononoke.
 on:
   workflow_dispatch: null
   push:
-    branches:
-    - main
-  pull_request:
     branches:
     - main
 
