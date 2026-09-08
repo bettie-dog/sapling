@@ -935,8 +935,16 @@ ImmediateFuture<string> FileInode::getxattr(
   }
 
   if (name == kXattrBlake3 || name == kXattrDigestHash) {
-    return getBlake3(context).thenValue(
-        [](Hash32 hash) { return hash.toString(); });
+    return ImmediateFuture<string>{
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [](FileInodePtr self,
+               ObjectFetchContextPtr context) -> folly::coro::Task<string> {
+              co_return (co_await self->co_getBlake3(context)).toString();
+            },
+            inodePtrFromThis(),
+            context.copy())
+            .semi()};
   }
 
   return makeImmediateFuture<string>(InodeError(kENOATTR, inodePtrFromThis()));
@@ -956,10 +964,9 @@ AbsolutePath FileInode::getMaterializedFilePath() {
 
 #endif
 
-// DEPRECATED: use co_getSha1 directly. Kept only because
-// VirtualInode::getSHA1, FileInode::isSameAsSlow, FileInode::isSameAs,
-// and FileInode::getxattr still consume ImmediateFuture chains;
-// delete once those paths are migrated to coroutines.
+// DEPRECATED: use co_getSha1 directly. Kept only because FileInode::getxattr
+// and the future FileInode::isSameAs implementations still consume
+// ImmediateFuture chains.
 ImmediateFuture<Hash20> FileInode::getSha1(
     const ObjectFetchContextPtr& fetchContext) {
   auto state = LockedState{this};
@@ -974,30 +981,6 @@ ImmediateFuture<Hash20> FileInode::getSha1(
     case State::MATERIALIZED_IN_OVERLAY:
       return makeImmediateFutureWith(
           [&] { return state->materializedState.getSha1(*this); });
-  }
-
-  XLOGF(FATAL, "FileInode in illegal state: {}", state->tag);
-}
-
-ImmediateFuture<Hash32> FileInode::getBlake3(
-    const ObjectFetchContextPtr& fetchContext) {
-  // DEPRECATED: use co_getBlake3 directly. Kept only because
-  // VirtualInode::getBlake3 and getxattr still consume ImmediateFuture chains;
-  // delete once those paths are migrated to coroutines.
-  auto state = LockedState{this};
-
-  logAccess(*fetchContext);
-  switch (state->tag) {
-    case State::BLOB_NOT_LOADING:
-    case State::BLOB_LOADING:
-      // If a file is not materialized, it should have a id value.
-      return getObjectStore().getBlobBlake3(
-          state->nonMaterializedState.id, fetchContext);
-    case State::MATERIALIZED_IN_OVERLAY:
-      return makeImmediateFutureWith([&] {
-        return state->materializedState.getBlake3(
-            *this, getMount()->getEdenConfig()->blake3Key.getValue());
-      });
   }
 
   XLOGF(FATAL, "FileInode in illegal state: {}", state->tag);
@@ -1756,22 +1739,19 @@ void FileInode::materializeNow(
   // This function should only be called from the BLOB_NOT_LOADING state
   XDCHECK_EQ(state->tag, State::BLOB_NOT_LOADING);
 
-  // If the blob aux data is immediately available, use it to populate the SHA-1
-  // value in the overlay for this file.
+  // If the blob aux data is immediately available, use it to populate the
+  // cached hashes in the overlay for this file.
   // Since this uses state->nonMaterializedState.id we perform this before
   // calling state.setMaterialized().
-  auto blobSha1Future = getObjectStore().getBlobSha1(
-      state->nonMaterializedState.id, fetchContext);
   std::optional<Hash20> blobSha1;
-  if (blobSha1Future.isReady()) {
-    blobSha1 = std::move(blobSha1Future).get();
-  }
-
-  auto blobBlake3Future = getObjectStore().getBlobBlake3(
-      state->nonMaterializedState.id, fetchContext);
   std::optional<Hash32> blobBlake3;
-  if (blobBlake3Future.isReady()) {
-    blobBlake3 = std::move(blobBlake3Future).get();
+  // Preserve a cached SHA-1 even when the entry does not include BLAKE3.
+  if (auto blobAuxData = getObjectStore().getBlobAuxDataFromInMemoryCache(
+          state->nonMaterializedState.id,
+          fetchContext,
+          false /* blake3Required */)) {
+    blobSha1 = blobAuxData->sha1;
+    blobBlake3 = blobAuxData->blake3;
   }
 
   getOverlayFileAccess(state)->createFile(

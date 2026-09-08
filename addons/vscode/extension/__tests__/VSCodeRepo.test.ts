@@ -15,7 +15,7 @@ import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {makeServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
 import {Logger} from 'isl-server/src/logger';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
-import {nextTick} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import * as vscode from 'vscode';
 import {VSCodeReposList} from '../VSCodeRepo';
 
@@ -103,7 +103,9 @@ describe('adding and removing repositories', () => {
     await nextTick();
 
     expect(vscode.scm.createSourceControl).toHaveBeenCalledTimes(1);
+    expect(repositoryCache.numberOfActiveServers()).toBe(1);
     repos.dispose();
+    expect(repositoryCache.numberOfActiveServers()).toBe(0);
   });
 
   it('deduplicates among shared repos', async () => {

@@ -7,11 +7,18 @@
 
 #include "eden/fs/nfs/Nfsd3.h"
 
+#include <algorithm>
+#include <iterator>
 #include <memory>
+#include <string_view>
 #include <type_traits>
 
+#include <fb303/ThreadCachedServiceData.h>
+#include <fmt/format.h>
 #include <folly/String.h>
+#include <folly/Synchronized.h>
 #include <folly/Utility.h>
+#include <folly/container/F14Map.h>
 #include <folly/executors/SerialExecutor.h>
 #include <folly/futures/Future.h>
 #include <folly/portability/Stdlib.h>
@@ -20,6 +27,9 @@
 #include "eden/common/utils/IDGen.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/common/utils/Throw.h"
+#include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/config/ReloadableConfig.h"
+#include "eden/fs/nfs/NfsAccessRateLimiter.h"
 #include "eden/fs/nfs/NfsRequestContext.h"
 #include "eden/fs/nfs/NfsUtils.h"
 #include "eden/fs/nfs/NfsdRpc.h"
@@ -69,6 +79,82 @@ void incrementNfsGcInvalidationCounter(
   stats->increment(counter);
 }
 
+/**
+ * Whether an AUTH_SYS credential carries `gid` as its primary gid or as one
+ * of its auxiliary gids; this is what an nfs:gid-access-modes entry matches.
+ */
+bool credsHaveGid(const authsys_parms& creds, uint32_t gid) {
+  return creds.gid == gid ||
+      std::find(creds.gids.begin(), creds.gids.end(), gid) != creds.gids.end();
+}
+
+/**
+ * Procedures the uid/gid access modes never act on (never counted,
+ * never rejected): NULL is the liveness and mount handshake probe, and
+ * FSSTAT/FSINFO/PATHCONF are per-mount bookkeeping that NFS clients issue
+ * on their own behalf. Rejecting any of these could wedge the mount itself
+ * rather than shed the targeted file I/O.
+ */
+bool isAccessModeExempt(uint32_t proc) {
+  switch (static_cast<nfsv3Procs>(proc)) {
+    case nfsv3Procs::null:
+    case nfsv3Procs::fsstat:
+    case nfsv3Procs::fsinfo:
+    case nfsv3Procs::pathconf:
+      return true;
+    default:
+      return false;
+  }
+}
+
+using AccessRateLimiters =
+    folly::Synchronized<folly::F14FastMap<uint32_t, NfsAccessRateLimiter>>;
+
+/**
+ * Whether one access mode entry rejects a request: Block always does,
+ * RateLimit only once `id`'s budget of `count` per `windowSeconds` is
+ * exhausted, and Log never does.
+ */
+bool accessModeRejects(
+    NfsAccessMode mode,
+    AccessRateLimiters& limiters,
+    uint32_t id,
+    uint32_t count,
+    uint32_t windowSeconds) {
+  switch (mode) {
+    case NfsAccessMode::Log:
+      return false;
+    case NfsAccessMode::Block:
+      return true;
+    case NfsAccessMode::RateLimit: {
+      // Shared lock on the common path; the bucket itself is atomic. Only
+      // the first request for an id takes the exclusive lock to create it.
+      // Bucket references never outlive the lock, so the map is free to
+      // rehash.
+      {
+        auto locked = limiters.rlock();
+        if (auto it = locked->find(id); it != locked->end()) {
+          return !it->second.allow(count, windowSeconds);
+        }
+      }
+      return !limiters.wlock()->try_emplace(id).first->second.allow(
+          count, windowSeconds);
+    }
+  }
+  return false;
+}
+
+/**
+ * Bumps the per-id fb303 stat nfs.<name>.<id> (e.g. nfs.access.uid.0),
+ * exported as .sum, .sum.60, etc.
+ */
+void bumpAccessStat(std::string_view name, uint32_t id) {
+  fmt::memory_buffer buf;
+  fmt::format_to(std::back_inserter(buf), "nfs.{}.{}", name, id);
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      folly::StringPiece(buf.data(), buf.size()), 1, fb303::SUM);
+}
+
 class Nfsd3ServerProcessor final : public RpcServerProcessor {
  public:
   explicit Nfsd3ServerProcessor(
@@ -78,27 +164,31 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
       ErrorLogger& errorLogger,
       AbsolutePath mountPath,
       CaseSensitivity caseSensitive,
-      uint32_t iosize,
+      uint32_t readIoSize,
+      uint32_t writeIoSize,
       folly::Promise<FsStopDataPtr>& stopPromise,
       ProcessAccessLog& processAccessLog,
       std::atomic<size_t>& traceDetailedArguments,
       std::shared_ptr<TraceBus<NfsTraceEvent>>& traceBus,
       std::chrono::nanoseconds longRunningFSRequestThreshold,
-      bool fastPathRPCs)
+      bool fastPathRPCs,
+      std::shared_ptr<ReloadableConfig> config)
       : dispatcher_(std::move(dispatcher)),
         straceLogger_(straceLogger),
         edenFsEventsLogger_(edenFsEventsLogger),
         errorLogger_(errorLogger),
         mountPath_(std::move(mountPath)),
         caseSensitive_(caseSensitive),
-        iosize_(iosize),
+        readIoSize_(readIoSize),
+        writeIoSize_(writeIoSize),
         stopPromise_{stopPromise},
         processAccessLog_{processAccessLog},
         traceDetailedArguments_(traceDetailedArguments),
         metadataSizeMismatchLogged_(false),
         traceBus_(traceBus),
         longRunningFSRequestThreshold_(longRunningFSRequestThreshold),
-        fastPathRPCs_(fastPathRPCs) {}
+        fastPathRPCs_(fastPathRPCs),
+        config_{std::move(config)} {}
 
   Nfsd3ServerProcessor(const Nfsd3ServerProcessor&) = delete;
   Nfsd3ServerProcessor(Nfsd3ServerProcessor&&) = delete;
@@ -111,12 +201,29 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
       uint32_t xid,
       uint32_t progNumber,
       uint32_t progVersion,
-      uint32_t procNumber) override;
+      uint32_t procNumber,
+      const std::optional<authsys_parms>& authSysCreds) override;
+
+  bool shouldParseAuthSysCreds() override;
+
+  auth_stat checkAuthentication(
+      const call_body& callBody,
+      const std::optional<authsys_parms>& authSysCreds) override;
 
   void onShutdown(RpcStopData stopData) override;
   void clientConnected() override;
+  void onExtraConnection() override {
+    dispatcher_->getStats()->increment(&NfsStats::nfsRpcExtraConnection);
+  }
+  void onExtraConnectionRefused() override {
+    dispatcher_->getStats()->increment(&NfsStats::nfsRpcExtraConnectionRefused);
+  }
   bool shouldFastPathRPCs() const override {
     return fastPathRPCs_;
+  }
+  bool acceptsMultipleConnections() const override {
+    return !config_ ||
+        !config_->getEdenConfig()->nfsRefuseExtraClientConnections.getValue();
   }
   bool isUnimplementedProc(uint32_t proc) const override;
 
@@ -233,7 +340,8 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
   ErrorLogger& errorLogger_;
   AbsolutePath mountPath_;
   CaseSensitivity caseSensitive_;
-  uint32_t iosize_;
+  uint32_t readIoSize_;
+  uint32_t writeIoSize_;
   // This promise is owned by the nfs3d. The nfs3d owns an RPC server that owns
   // this server processor. This promise should only be used during the
   // lifetime of  nfs3d. The way we currently enforce this is by waiting for
@@ -253,6 +361,12 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
    */
   std::chrono::nanoseconds longRunningFSRequestThreshold_;
   bool fastPathRPCs_;
+  std::shared_ptr<ReloadableConfig> config_;
+  // Per-id budgets for NfsAccessMode::RateLimit entries, scoped to this
+  // mount's processor. Created on first use and kept for the processor's
+  // lifetime: the id set is small and bounded by config.
+  AccessRateLimiters uidRateLimiters_;
+  AccessRateLimiters gidRateLimiters_;
   std::atomic<size_t> inflightRequests_{0};
   // Used to check rate limiting. Set once in constructor via setFsChannel().
   // Nulled in onShutdown() before Nfsd3 destruction. The backpressure check
@@ -1572,13 +1686,15 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::fsinfo(
         FSINFO3resok{
             // TODO(xavierd): fill the post_op_attr.
             post_op_attr{},
-            /*rtmax=*/iosize_,
-            /*rtpref=*/iosize_,
+            /*rtmax=*/readIoSize_,
+            /*rtpref=*/readIoSize_,
             /*rtmult=*/1,
-            /*wtmax=*/iosize_,
-            /*wtpref=*/iosize_,
+            /*wtmax=*/writeIoSize_,
+            /*wtpref=*/writeIoSize_,
             /*wtmult=*/1,
-            /*dtpref=*/iosize_,
+            // READDIR replies are reads, so they share the read size. The
+            // client's dsize is configured separately via `nfs:dir-read-size`.
+            /*dtpref=*/readIoSize_,
             /*maxfilesize=*/std::numeric_limits<uint64_t>::max(),
             // TODO: support nanosecond granularity on Windows
             /*time_delta*/ folly::kIsWindows ? nfstime3{1, 0} : nfstime3{0, 1},
@@ -2344,13 +2460,77 @@ void Nfsd3ServerProcessor::serializeInlineReject(
   serializeJukeboxError(ser, xid, proc);
 }
 
+bool Nfsd3ServerProcessor::shouldParseAuthSysCreds() {
+  if (!config_) {
+    return false;
+  }
+  // Single decision point for the credential fast path: with no uid or gid
+  // entries configured, requests need no identity and the per-request
+  // AUTH_SYS parse is skipped entirely. Both maps are read off one snapshot.
+  auto config = config_->getEdenConfig();
+  return !config->nfsUidAccessModes.getValue().empty() ||
+      !config->nfsGidAccessModes.getValue().empty();
+}
+
+auth_stat Nfsd3ServerProcessor::checkAuthentication(
+    const call_body& callBody,
+    const std::optional<authsys_parms>& authSysCreds) {
+  // Control-plane procedures are exempt (see isAccessModeExempt), and
+  // requests without a parsable AUTH_SYS credential carry no identity;
+  // neither is ever acted on.
+  if (!config_ || !authSysCreds || isAccessModeExempt(callBody.proc)) {
+    return auth_stat::AUTH_OK;
+  }
+  // Every uid/gid entry the credential matches is evaluated, not just the
+  // first: each one is counted, and any rejecting one rejects the request.
+  auto config = config_->getEdenConfig();
+  const auto count = config->nfsAccessRateLimitCount.getValue();
+  const auto windowSeconds = config->nfsAccessRateLimitWindowSeconds.getValue();
+  bool block = false;
+
+  const auto& uidModes = config->nfsUidAccessModes.getValue();
+  if (auto entry = uidModes.find(authSysCreds->uid); entry != uidModes.end()) {
+    bumpAccessStat("access.uid", authSysCreds->uid);
+    if (accessModeRejects(
+            entry->second,
+            uidRateLimiters_,
+            authSysCreds->uid,
+            count,
+            windowSeconds)) {
+      bumpAccessStat("blocked.uid", authSysCreds->uid);
+      block = true;
+    }
+  }
+  for (const auto& [gid, mode] : config->nfsGidAccessModes.getValue()) {
+    if (!credsHaveGid(*authSysCreds, gid)) {
+      continue;
+    }
+    bumpAccessStat("access.gid", gid);
+    if (accessModeRejects(mode, gidRateLimiters_, gid, count, windowSeconds)) {
+      bumpAccessStat("blocked.gid", gid);
+      block = true;
+    }
+  }
+  if (!block) {
+    return auth_stat::AUTH_OK;
+  }
+  dispatcher_->getStats()->increment(&NfsStats::nfsBlockedAccess);
+  // AUTH_TOOWEAK rather than AUTH_REJECTEDCRED: NFS clients treat TOOWEAK
+  // as terminal and surface a permission error to the caller (the macOS
+  // client maps it to a clean EACCES), while REJECTEDCRED asks the client
+  // to refresh its credential and retry, which would turn every blocked
+  // call into a retry loop.
+  return auth_stat::AUTH_TOOWEAK;
+}
+
 ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
     folly::io::Cursor deser,
     folly::io::QueueAppender ser,
     uint32_t xid,
     uint32_t progNumber,
     uint32_t progVersion,
-    uint32_t procNumber) {
+    uint32_t procNumber,
+    const std::optional<authsys_parms>& authSysCreds) {
   if (progNumber != kNfsdProgNumber) {
     serializeReply(ser, accept_stat::PROG_UNAVAIL, xid);
     return folly::unit;
@@ -2393,7 +2573,8 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
       handlerEntry.name,
       processAccessLog_,
       edenFsEventsLogger_,
-      longRunningFSRequestThreshold_);
+      longRunningFSRequestThreshold_,
+      authSysCreds);
   context->startRequest(
       dispatcher_->getStats().copy(), handlerEntry.duration, nullRequestWatch);
   // The data that contextRef reference to is alive for the duration of the
@@ -2469,12 +2650,14 @@ Nfsd3::Nfsd3(
     folly::Duration /*requestTimeout*/,
     std::shared_ptr<Notifier> /*notifier*/,
     CaseSensitivity caseSensitive,
-    uint32_t iosize,
+    uint32_t readIoSize,
+    uint32_t writeIoSize,
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval,
     std::chrono::nanoseconds longRunningFSRequestThreshold,
     size_t traceBusCapacity,
-    bool fastPathRPCs)
+    bool fastPathRPCs,
+    std::shared_ptr<ReloadableConfig> config)
     : privHelper_{privHelper},
       mountPath_{std::move(mountPath)},
       stats_{dispatcher->getStats().copy()},
@@ -2486,13 +2669,15 @@ Nfsd3::Nfsd3(
             errorLogger,
             mountPath_,
             caseSensitive,
-            iosize,
+            readIoSize,
+            writeIoSize,
             stopPromise_,
             processAccessLog_,
             traceDetailedArguments_,
             traceBus_,
             longRunningFSRequestThreshold,
-            fastPathRPCs);
+            fastPathRPCs,
+            std::move(config));
         proc->setFsChannel(this);
         return RpcServer::create(
             std::move(proc),
@@ -2503,6 +2688,7 @@ Nfsd3::Nfsd3(
             highNfsRequestsLogInterval);
       }()),
       processAccessLog_(std::move(processInfoCache)),
+      edenFsEventsLogger_{edenFsEventsLogger},
       invalidationExecutor_{
           folly::SerialExecutor::create(folly::getGlobalCPUExecutor())},
       traceDetailedArguments_{0},
@@ -2592,7 +2778,8 @@ void Nfsd3::invalidate(
                               mode,
                               onSuccess = std::move(onSuccess),
                               source,
-                              stats = std::move(stats)]() mutable {
+                              stats = std::move(stats),
+                              logger = edenFsEventsLogger_]() mutable {
     XLOGF(DBG9, "Invalidating: {} mode: {}", path.c_str(), mode);
     const auto chmodResult = chmod(path.c_str(), mode);
     const auto error = errno;
@@ -2615,6 +2802,37 @@ void Nfsd3::invalidate(
       // invalidate the NFS client cache.
       XLOGF(
           DBG9, "Finished invalidating (permission denied): {}", path.c_str());
+#ifdef __APPLE__
+    } else if (error == EPERM) {
+      incrementNfsGcInvalidationCounter(
+          stats, source, &NfsStats::nfsInvalidationGcFailure);
+      // On macOS, EPERM is a known operational condition rather than a
+      // programming error: it typically means TCC denied the synthetic chmod
+      // because the daemon's responsible process lacks the
+      // SystemPolicyNetworkVolumes grant. When that happens every GC
+      // invalidation fails identically, so one line per daemon lifetime
+      // carries all the information. On other platforms EPERM stays in the
+      // generic DFATAL branch below: there it is a genuine anomaly.
+      XLOGF_FIRST_N(
+          ERR,
+          1,
+          "Permission denied invalidating path {} to mode {} using chmod. "
+          "This usually means TCC denied SystemPolicyNetworkVolumes "
+          "for the daemon's responsible process. Run `eden doctor`, or "
+          "restart EdenFS with `eden restart` to recover. Further EPERM "
+          "failures will not be logged; see the nfs.invalidation.gc.failure "
+          "counter.",
+          path,
+          mode);
+      // Emit the telemetry event on every EPERM failure so the event table
+      // carries the true failure count; the log line above stays
+      // once-per-daemon to avoid log spam. Per-failure emission is cheap and
+      // non-blocking: XplatLogger enqueues into a bounded queue (dropping,
+      // never blocking, when full) drained by a background Scribe producer.
+      if (logger) {
+        logger->logEvent(TccInvalidationDenied{error, path.asString()});
+      }
+#endif
     } else {
       incrementNfsGcInvalidationCounter(
           stats, source, &NfsStats::nfsInvalidationGcFailure);

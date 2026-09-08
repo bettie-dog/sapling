@@ -14,16 +14,16 @@ name = "revisionstore"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blob = { version = "0.1.0", path = "../blob" }
 byteorder = "1.5"
 flume = "0.11.1"
 fn-error-context = "0.2"
 fs-err = { version = "3.3.1", features = ["tokio"] }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "1.4.2"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+http = "1.5.0"
 lfs_protocol = { version = "0.1.0", path = "../../../mononoke/common/lfs_protocol" }
-moka = { version = "0.12.15", features = ["future", "sync"] }
+moka = { version = "0.12.16", features = ["future", "sync"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 paste = "1.0.14"
 quickcheck = "1.1"
@@ -61,9 +61,9 @@ serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw
 sha1 = "0.10.7"
 sha2 = "0.10.6"
 slex = { version = "0.1.0", path = "../slex" }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 url = "2.5.8"
 

@@ -125,6 +125,20 @@ impl Store {
         self.store_type == StoreType::Permanent
     }
 
+    /// Returns the current disk usage in bytes. Errors if the store could not
+    /// be opened, or if a rotated log's on-disk meta could not be read -
+    /// reporting 0 in either case would look like a healthy, empty cache
+    /// instead of a diagnostic failure.
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.read()?.disk_usage()
+    }
+
+    /// Returns the configured maximum size in bytes. Errors if the store
+    /// could not be opened.
+    pub fn max_bytes(&self) -> Result<u64> {
+        Ok(self.read()?.max_bytes())
+    }
+
     /// Add data to the store.
     pub fn append(&self, data: impl Appendable) -> Result<()> {
         self.write()?.append(data)
@@ -139,6 +153,7 @@ impl Store {
         self.should_compress
     }
 
+    /// Append the selected items and consume the input vector.
     pub fn append_batch<K: AsRef<[u8]> + Copy, V>(
         &self,
         items: &mut Vec<(K, V)>,
@@ -159,6 +174,7 @@ impl Store {
                 }
             }
             if insert_idx == 0 {
+                items.clear();
                 return Ok(());
             }
             items.truncate(insert_idx);
@@ -166,8 +182,8 @@ impl Store {
 
         let mut log = self.write()?;
 
-        for (k, v) in items {
-            log.append(|buf: &mut dyn ExtendWrite| serialize(k, v, buf))?;
+        for (k, v) in items.drain(..) {
+            log.append(|buf: &mut dyn ExtendWrite| serialize(&k, &v, buf))?;
         }
 
         Ok(())
@@ -304,6 +320,23 @@ impl Inner {
         }
     }
 
+    /// Returns the current disk usage in bytes.
+    pub fn disk_usage(&self) -> Result<u64> {
+        match self {
+            Self::Permanent(log) => Ok(log.disk_usage()),
+            Self::Rotated(log) => Ok(log.disk_usage()?),
+        }
+    }
+
+    /// Returns the configured maximum size in bytes.
+    /// For permanent logs, returns u64::MAX since they don't have size limits.
+    pub fn max_bytes(&self) -> u64 {
+        match self {
+            Self::Permanent(_) => u64::MAX,
+            Self::Rotated(log) => log.max_bytes(),
+        }
+    }
+
     pub(crate) fn with_consistent_reads(&mut self) -> Option<ConsistentReadGuard> {
         match self {
             Inner::Permanent(_log) => None,
@@ -410,6 +443,11 @@ impl StoreOpenOptions {
     pub fn auto_sync_threshold(mut self, threshold: u64) -> Self {
         self.auto_sync_threshold = Some(threshold);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auto_sync_threshold_for_test(&self) -> Option<u64> {
+        self.auto_sync_threshold
     }
 
     /// Whether sync should be called on the store if it has changed on disk.
@@ -569,6 +607,7 @@ mod tests {
                 .collect::<Result<Vec<_>>>()?,
             vec![b"aabcd"]
         );
+
         Ok(())
     }
 
@@ -589,6 +628,52 @@ mod tests {
                 .collect::<Result<Vec<_>>>()?,
             vec![b"aabcd"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_batch_consumes_items() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        let store = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
+            .index("hex", |_| vec![IndexOutput::Reference(0..2)])
+            .permanent(&dir)?;
+        let mut items = vec![
+            (b"aa".as_slice(), b"aabcd".to_vec()),
+            (b"ab".as_slice(), b"abbcd".to_vec()),
+        ];
+
+        store.append_batch(
+            &mut items,
+            |_, value, buf| -> Result<()> {
+                buf.write_all(value)?;
+                Ok(())
+            },
+            false,
+        )?;
+
+        assert!(items.is_empty());
+        assert_eq!(
+            store
+                .read()?
+                .lookup(0, b"aa")?
+                .collect::<Result<Vec<_>>>()?,
+            vec![b"aabcd"]
+        );
+
+        items.push((b"aa".as_slice(), b"different".to_vec()));
+        store.append_batch(
+            &mut items,
+            |_, value, buf| -> Result<()> {
+                buf.write_all(value)?;
+                Ok(())
+            },
+            true,
+        )?;
+
+        assert!(items.is_empty());
+        assert_eq!(store.read()?.lookup(0, b"aa")?.count(), 1);
         Ok(())
     }
 

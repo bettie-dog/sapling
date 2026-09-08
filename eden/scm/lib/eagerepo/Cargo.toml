@@ -14,11 +14,11 @@ name = "eagerepo"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blob = { version = "0.1.0", path = "../blob" }
 fail = { version = "0.5.1", features = ["failpoints"] }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "1.4.2"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+http = "1.5.0"
 manifest-augmented-tree = { version = "0.1.0", path = "../manifest-augmented-tree" }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-dag = { version = "0.1.0", path = "../dag" }
@@ -41,9 +41,9 @@ sapling-storemodel = { version = "0.1.0", path = "../storemodel" }
 sapling-win32-8dot3 = { version = "0.1.0", path = "../util/win32-8dot3" }
 sapling-zstore = { version = "0.1.0", path = "../zstore" }
 sha1 = "0.10.7"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }

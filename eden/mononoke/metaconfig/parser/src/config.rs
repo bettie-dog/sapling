@@ -7,6 +7,7 @@
 
 //! Functions to load and parse Mononoke configuration.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -128,10 +129,20 @@ pub fn load_repo_configs_from_manifest(
         .with_context(|| format!("Failed to load tier manifest at {manifest_path}"))?
         .get();
 
+    // NOTE: this loader is fail-fast by design — one bad entry fails the whole
+    // load via the `collect::<Result<..>>()?` below. The server path isolates
+    // per-repo failures via batch_load_repo_configs_checked instead. The
+    // repo_id dedup runs before the RepoSpec fetch/parse, so duplicates
+    // short-circuit without any I/O.
+    let mut seen_repo_ids: HashSet<RepositoryId> = HashSet::new();
     let repos = manifest
         .repos
         .iter()
         .map(|entry| {
+            let manifest_repo_id = RepositoryId::new(entry.repo_id);
+            if !seen_repo_ids.insert(manifest_repo_id) {
+                return Err(ConfigurationError::DuplicatedRepoId(manifest_repo_id).into());
+            }
             let repo_spec = configerator_repo_spec_handle(&entry.config_path, config_store)
                 .with_context(|| {
                     format!(
@@ -144,14 +155,38 @@ pub fn load_repo_configs_from_manifest(
                 .with_context(|| {
                     format!("Failed to parse RepoSpec for repo {}", entry.repo_name)
                 })?;
+            if repo_config.repoid != manifest_repo_id {
+                return Err(ConfigurationError::RepoIdMismatch {
+                    repo_name: entry.repo_name.clone(),
+                    manifest_repo_id,
+                    spec_repo_id: repo_config.repoid,
+                }
+                .into());
+            }
             Ok((entry.repo_name.clone(), repo_config))
         })
         .collect::<Result<HashMap<String, RepoConfig>>>()?;
 
-    let common = parse_common_config(manifest.common.clone(), &manifest.storage)
-        .context("Failed to parse common config from tier manifest")?;
+    let (common, _storage) = parse_manifest_common_and_storage(&manifest)?;
 
     Ok(RepoConfigs::new(repos, common))
+}
+
+/// A `TierManifest`'s `common`/`storage`, equivalent to the blob's same two sections.
+pub fn parse_manifest_common_and_storage(
+    manifest: &TierManifest,
+) -> Result<(CommonConfig, StorageConfigs)> {
+    let common = parse_common_config(manifest.common.clone(), &manifest.storage)
+        .context("Failed to parse common config from tier manifest")?;
+    let storage = manifest
+        .storage
+        .clone()
+        .into_iter()
+        .map(|(name, config)| Ok((name, config.convert()?)))
+        .collect::<Result<_>>()
+        .context("Failed to parse storage configs from tier manifest")?;
+
+    Ok((common, StorageConfigs { storage }))
 }
 
 /// Empty repo configs useful for testing purposes
@@ -606,6 +641,9 @@ fn build_repo_config(
         restricted_paths_config,
         remote_diff_config,
         commit_rate_limit_config,
+        // Populated by the versioned ConfigHandle load path, never at parse time.
+        config_version: None,
+        config_mutation_id: None,
     })
 }
 
@@ -689,6 +727,12 @@ fn parse_common_config(
     };
 
     let rl_land_service_repo_prefix = common.rl_land_service_repo_prefix.filter(|p| !p.is_empty());
+    let multi_repo_land_manifest_repos: BTreeMap<String, String> = common
+        .multi_repo_land_manifest_repos
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(marker, repo)| !marker.is_empty() && !repo.is_empty())
+        .collect();
 
     Ok(CommonConfig {
         trusted_parties_hipster_tier,
@@ -703,6 +747,7 @@ fn parse_common_config(
         edenapi_dumper_scuba_table,
         async_requests_config,
         rl_land_service_repo_prefix,
+        multi_repo_land_manifest_repos,
     })
 }
 
@@ -1804,6 +1849,8 @@ mod test {
                 restricted_paths_config: RestrictedPathsConfig::default(),
                 remote_diff_config: None,
                 commit_rate_limit_config: None,
+                config_version: None,
+                config_mutation_id: None,
             },
         );
 
@@ -1892,6 +1939,8 @@ mod test {
                 restricted_paths_config: RestrictedPathsConfig::default(),
                 remote_diff_config: None,
                 commit_rate_limit_config: None,
+                config_version: None,
+                config_mutation_id: None,
             },
         );
         assert_eq!(
@@ -1924,6 +1973,7 @@ mod test {
                     blobstore: None
                 },
                 rl_land_service_repo_prefix: None,
+                multi_repo_land_manifest_repos: BTreeMap::new(),
             }
         );
 
@@ -2616,6 +2666,198 @@ mod test {
             repo.phabricator_callsign,
             Some("OVERRIDE".to_string()),
             "tier_overrides for the requested tier should be applied"
+        );
+    }
+
+    /// Builds a `ConfigStore` for `load_repo_configs_from_manifest` tests: a
+    /// manifest at `scm/mononoke/repos/tiers/test_tier_manifest` containing the
+    /// given JSON entries, plus per-repo RepoSpec configs at the given paths.
+    fn manifest_test_config_store(
+        manifest_entries_json: &str,
+        repo_specs: &[(&str, &str)],
+    ) -> ConfigStore {
+        use cached_config::ModificationTime;
+
+        let manifest_json = format!(
+            r#"{{
+            "repos": [{manifest_entries_json}],
+            "common": {{
+                "internal_identity": {{
+                    "identity_type": "SERVICE_IDENTITY",
+                    "identity_data": "internal"
+                }},
+                "redaction_config": {{
+                    "blobstore": "test_storage",
+                    "redaction_sets_location": "loc"
+                }}
+            }},
+            "storage": {{
+                "test_storage": {{
+                    "metadata": {{"local": {{"local_db_path": "/tmp/test_db"}}}},
+                    "blobstore": {{"disabled": {{}}}},
+                    "mutable_blobstore": {{"disabled": {{}}}}
+                }}
+            }}
+        }}"#
+        );
+
+        let test_source = Arc::new(TestSource::new());
+        test_source.insert_config(
+            "scm/mononoke/repos/tiers/test_tier_manifest",
+            &manifest_json,
+            ModificationTime::UnixTimestamp(1),
+        );
+        for (path, spec_json) in repo_specs {
+            test_source.insert_config(path, spec_json, ModificationTime::UnixTimestamp(1));
+        }
+        ConfigStore::new(test_source, None, None)
+    }
+
+    /// A minimal valid RepoSpec JSON whose storage resolves against the
+    /// `test_storage` entry provided by [`manifest_test_config_store`].
+    fn manifest_test_repo_spec_json(repo_id: i32, repo_name: &str, storage_config: &str) -> String {
+        format!(
+            r#"{{
+            "repo_id": {repo_id},
+            "repo_name": "{repo_name}",
+            "hipster_acl": "acl.test.repo",
+            "enabled": true,
+            "readonly": false,
+            "default_commit_identity_scheme": 3,
+            "repo_config": {{"storage_config": "{storage_config}"}}
+        }}"#
+        )
+    }
+
+    #[mononoke::test]
+    fn test_load_repo_configs_from_manifest_duplicate_repo_id() {
+        // Two manifest entries with distinct names but the same repo_id must
+        // be rejected: RepoConfigs keys repos by name, so both would silently
+        // coexist while repos_by_id can only point at one of them.
+        let entries = r#"
+            {"repo_name": "repo_a", "repo_id": 1, "config_path": "scm/mononoke/repos/git/aa/repo_a", "is_deep_sharded": false},
+            {"repo_name": "repo_b", "repo_id": 1, "config_path": "scm/mononoke/repos/git/bb/repo_b", "is_deep_sharded": false}
+        "#;
+        let config_store = manifest_test_config_store(
+            entries,
+            &[
+                (
+                    "scm/mononoke/repos/git/aa/repo_a",
+                    &manifest_test_repo_spec_json(1, "repo_a", "test_storage"),
+                ),
+                (
+                    "scm/mononoke/repos/git/bb/repo_b",
+                    &manifest_test_repo_spec_json(1, "repo_b", "test_storage"),
+                ),
+            ],
+        );
+
+        let err = load_repo_configs_from_manifest("test_tier", &config_store)
+            .expect_err("two manifest entries sharing repo_id 1 must fail the load");
+        match err.downcast_ref::<ConfigurationError>() {
+            Some(ConfigurationError::DuplicatedRepoId(id)) => assert_eq!(
+                *id,
+                RepositoryId::new(1),
+                "error should carry the duplicated repo id"
+            ),
+            other => panic!("expected DuplicatedRepoId, got {other:?} (full error: {err:#})"),
+        }
+    }
+
+    #[mononoke::test]
+    fn test_load_repo_configs_from_manifest_repo_id_mismatch() {
+        // The manifest claims repo_id 1 for repo_a, but the RepoSpec its
+        // config_path points at says repo_id 2. Trusting either side silently
+        // would corrupt the repos_by_id index, so the load must fail.
+        let entries = r#"{"repo_name": "repo_a", "repo_id": 1, "config_path": "scm/mononoke/repos/git/aa/repo_a", "is_deep_sharded": false}"#;
+        let config_store = manifest_test_config_store(
+            entries,
+            &[(
+                "scm/mononoke/repos/git/aa/repo_a",
+                &manifest_test_repo_spec_json(2, "repo_a", "test_storage"),
+            )],
+        );
+
+        let err = load_repo_configs_from_manifest("test_tier", &config_store)
+            .expect_err("manifest repo_id 1 vs RepoSpec repo_id 2 must fail the load");
+        match err.downcast_ref::<ConfigurationError>() {
+            Some(ConfigurationError::RepoIdMismatch {
+                repo_name,
+                manifest_repo_id,
+                spec_repo_id,
+            }) => {
+                assert_eq!(repo_name, "repo_a", "error should name the repo");
+                assert_eq!(
+                    *manifest_repo_id,
+                    RepositoryId::new(1),
+                    "error should carry the manifest's repo id"
+                );
+                assert_eq!(
+                    *spec_repo_id,
+                    RepositoryId::new(2),
+                    "error should carry the RepoSpec's repo id"
+                );
+            }
+            other => panic!("expected RepoIdMismatch, got {other:?} (full error: {err:#})"),
+        }
+    }
+
+    #[mononoke::test]
+    fn test_load_repo_configs_from_manifest_missing_repo_spec() {
+        // A manifest entry whose config_path resolves to nothing must fail
+        // with an error naming the repo and the dangling path, so the broken
+        // entry can be found among thousands.
+        let entries = r#"{"repo_name": "repo_a", "repo_id": 1, "config_path": "scm/mononoke/repos/git/aa/repo_a", "is_deep_sharded": false}"#;
+        // No RepoSpec inserted for the config_path.
+        let config_store = manifest_test_config_store(entries, &[]);
+
+        let err = load_repo_configs_from_manifest("test_tier", &config_store)
+            .expect_err("a dangling config_path must fail the load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repo_a"),
+            "error should name the repo, got: {msg}"
+        );
+        assert!(
+            msg.contains("scm/mononoke/repos/git/aa/repo_a"),
+            "error should name the dangling config_path, got: {msg}"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_load_repo_configs_from_manifest_is_fail_fast() {
+        // Documents the EXISTING all-or-nothing behavior of the bulk loader:
+        // one bad RepoSpec among N fails the entire load, via the
+        // `collect::<Result<..>>()?` in load_repo_configs_from_manifest. This
+        // is by design — the server path isolates per-repo failures via
+        // batch_load_repo_configs_checked, while this bulk loader stays
+        // fail-fast so a broken repo cannot silently vanish from the tier.
+        let entries = r#"
+            {"repo_name": "repo_a", "repo_id": 1, "config_path": "scm/mononoke/repos/git/aa/repo_a", "is_deep_sharded": false},
+            {"repo_name": "repo_b", "repo_id": 2, "config_path": "scm/mononoke/repos/git/bb/repo_b", "is_deep_sharded": false}
+        "#;
+        let config_store = manifest_test_config_store(
+            entries,
+            &[
+                (
+                    "scm/mononoke/repos/git/aa/repo_a",
+                    &manifest_test_repo_spec_json(1, "repo_a", "test_storage"),
+                ),
+                // repo_b's RepoSpec references a storage config that does not
+                // exist in the manifest, so parsing it must fail.
+                (
+                    "scm/mononoke/repos/git/bb/repo_b",
+                    &manifest_test_repo_spec_json(2, "repo_b", "no_such_storage"),
+                ),
+            ],
+        );
+
+        let err = load_repo_configs_from_manifest("test_tier", &config_store)
+            .expect_err("one bad RepoSpec among N must fail the whole load (fail-fast by design)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repo_b"),
+            "error should point at the broken repo, got: {msg}"
         );
     }
 

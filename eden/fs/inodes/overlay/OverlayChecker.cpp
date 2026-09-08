@@ -1029,6 +1029,8 @@ void OverlayChecker::scanForErrors(
   impl_->scanIncludedWalChildren = includeWalChildren;
   errors_.clear();
   pathCache_.clear();
+  contentlessOrphanFiles_.clear();
+  contentlessOrphanDirs_.clear();
   maxInodeNumber_ = kRootNodeId.get();
 
   reportProgress(progressCallback, Progress::Phase::Scanning, 0);
@@ -1068,6 +1070,7 @@ optional<OverlayChecker::RepairResult> OverlayChecker::repairErrors(
   reportProgress(progressCallback, Progress::Phase::RecoveringWal);
   recoverWalFiles();
   scanForErrors(progressCallback);
+  reclaimContentlessOrphans();
 
   if (errors_.empty()) {
     reportProgress(progressCallback, Progress::Phase::Complete, 10);
@@ -1665,8 +1668,10 @@ void OverlayChecker::linkInodeChildrenMemoryEfficient() {
               std::vector<std::pair<InodeInfo*, mode_t>> parentRelationships;
               std::vector<std::unique_ptr<Error>> parentErrors;
               auto maxChildInodeNumber = scannedMaxInodeNumber;
+              uint64_t entryCount = 0;
               auto processEntry = [&](const std::string& childName,
                                       const overlay::OverlayEntry& child) {
+                ++entryCount;
                 auto childRawInode = *child.inodeNumber();
                 if (childRawInode == 0) {
                   return;
@@ -1751,6 +1756,10 @@ void OverlayChecker::linkInodeChildrenMemoryEfficient() {
                 std::lock_guard lock{inodeLock};
                 parentInfo.type = loadedInfo->type;
                 parentInfo.errorMsg = std::move(loadedInfo->errorMsg);
+                if (parsedAllEntries && loadedInfo->type == InodeType::Dir) {
+                  parentInfo.dirEntryCount = entryCount;
+                  parentInfo.dirEntryCountKnown = true;
+                }
               }
               if (inodeError) {
                 errors.wlock()->push_back(std::move(inodeError));
@@ -1800,12 +1809,96 @@ void OverlayChecker::scanForParentErrors() {
   for (const auto& [inodeNumber, inodeInfo] : impl_->inodes) {
     if (inodeInfo.parents.empty()) {
       if (inodeNumber != kRootNodeId) {
-        addError<OrphanInode>(inodeInfo);
+        if (isContentlessOrphanFile(inodeInfo)) {
+          // Nothing to recover (e.g. an unclaimed preallocated overlay
+          // file, or a create that crashed before writing any data):
+          // reclaim it quietly instead of reporting an error.
+          contentlessOrphanFiles_.push_back(inodeNumber);
+        } else if (isContentlessOrphanDir(inodeInfo)) {
+          contentlessOrphanDirs_.push_back(inodeNumber);
+        } else {
+          addError<OrphanInode>(inodeInfo);
+        }
       }
     } else if (inodeInfo.parents.size() != 1) {
       addError<HardLinkedInode>(inodeInfo);
     }
   }
+}
+
+bool OverlayChecker::isContentlessOrphanFile(const fsck::InodeInfo& info) {
+  if (info.type != InodeType::File) {
+    return false;
+  }
+  try {
+    auto opened = impl_->fcs->openFileNoVerify(info.number);
+    auto* file = std::get_if<folly::File>(&opened);
+    if (!file) {
+      return false;
+    }
+    struct stat st{};
+    folly::checkUnixError(
+        fstat(file->fd(), &st), "failed to fstat orphan overlay file");
+    return st.st_size <= static_cast<off_t>(FsFileContentStore::kHeaderLength);
+  } catch (const std::exception&) {
+    // Let the normal orphan handling report unreadable files.
+    return false;
+  }
+}
+
+bool OverlayChecker::isContentlessOrphanDir(const fsck::InodeInfo& info) {
+  // Only a record that was positively parsed and is empty counts: missing
+  // or unparsable dir data must still be reported. Check for a WAL file
+  // on disk rather than consulting walBackedDirs, which is only populated
+  // when the scan includes WAL children (repairErrors scans without
+  // them): an empty base record whose WAL failed to replay still has
+  // children pending replay and must not be reclaimed.
+  if (info.type != InodeType::Dir || impl_->fcs->hasWal(info.number)) {
+    return false;
+  }
+  if (info.children) {
+    return info.children->entries()->empty();
+  }
+  return info.dirEntryCountKnown && info.dirEntryCount == 0;
+}
+
+void OverlayChecker::reclaimContentlessOrphans() {
+  if (contentlessOrphanFiles_.empty() && contentlessOrphanDirs_.empty()) {
+    return;
+  }
+  size_t reclaimed = 0;
+  for (auto number : contentlessOrphanFiles_) {
+    try {
+      impl_->fcs->removeOverlayFile(number);
+      ++reclaimed;
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "fsck:{}: failed to reclaim contentless orphan inode {}: {}",
+          impl_->fcs->getLocalDir(),
+          number,
+          ex.what());
+    }
+  }
+  for (auto number : contentlessOrphanDirs_) {
+    try {
+      impl_->inodeCatalog->removeOverlayDir(number);
+      ++reclaimed;
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "fsck:{}: failed to reclaim empty orphan dir record {}: {}",
+          impl_->fcs->getLocalDir(),
+          number,
+          ex.what());
+    }
+  }
+  XLOGF(
+      INFO,
+      "fsck:{}: reclaimed {} contentless orphan inode(s) left behind by an "
+      "unclean shutdown",
+      impl_->fcs->getLocalDir(),
+      reclaimed);
 }
 
 void OverlayChecker::checkNextInodeNumber() {

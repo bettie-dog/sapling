@@ -2,6 +2,8 @@
 
   $ eagerepo
   $ enable sparse
+  $ setconfig checkout.obsolete-mode=ignore
+  $ setconfig commit.modify-obsolete-mode=ignore
 
 Creating a commit on Windows should replace backslashes with forward slashes on symlinks
 

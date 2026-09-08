@@ -31,7 +31,7 @@ pub mod convert;
 pub mod monitor;
 pub mod rate_limit;
 #[cfg(fbcode_build)]
-pub mod rim_shadow;
+pub mod rim_rate_limiter;
 
 pub use cbor::cbor_mime;
 pub use cbor::cbor_stream_filtered_errors;
@@ -54,7 +54,6 @@ pub async fn get_repo<R: MononokeRepo>(
     throttle_metric: impl Into<Option<Metric>>,
 ) -> Result<HgRepoContext<R>, HttpError> {
     let mut scuba = rctx.ctx.scuba().clone();
-    rctx.ctx.session().check_load_shed(&mut scuba)?;
 
     if let Some(throttle_metric) = throttle_metric.into() {
         rctx.ctx

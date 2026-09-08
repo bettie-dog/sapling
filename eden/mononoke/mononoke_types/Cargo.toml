@@ -11,9 +11,9 @@ license = "GPLv2+"
 anyhow = "1.0.104"
 ascii = "1.1.0"
 async-recursion = "1.1.1"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bincode = { version = "2", features = ["serde"] }
-bit-set = "0.9"
+bit-set = "0.11.1"
 blake2 = "0.10"
 blobstore = { version = "0.1.0", path = "../blobstore" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -25,11 +25,11 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
 derivative = "2.2"
 derived_data_type_if = { version = "0.1.0", path = "../derived_data/if" }
-either = "1.16.0"
+either = "1.17.0"
 faster-hex = "0.6.1"
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 fn-error-context = "0.2"
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_watchdog = { version = "0.1.0", path = "../common/futures_watchdog" }
 gix-date = "0.15.6"
 gix-hash = { version = "0.25.1", features = ["sha1"] }
@@ -53,7 +53,7 @@ smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 thrift_convert = { version = "0.1.0", path = "../common/thrift_convert" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 vec_map = "0.8"
@@ -67,4 +67,4 @@ paste = "1.0.14"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 rand = "0.10.2"
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }

@@ -20,8 +20,6 @@
 #include <memory>
 #include <optional>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
-#include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -34,7 +32,7 @@
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/test/CapturingScribeLogger.h"
+#include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/HgRepo.h"
 #include "eden/fs/testharness/TestConfigSource.h"
 #include "eden/scm/lib/backingstore/include/SaplingBackingStoreError.h"
@@ -79,14 +77,8 @@ std::vector<PathComponent> getTreeNames(
   return names;
 }
 
-std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger(
-    const std::shared_ptr<ReloadableConfig>& edenConfig,
-    const EdenStatsPtr& stats) {
-  return std::make_shared<EdenFsEventsLogger>(
-      std::make_shared<NullStructuredLogger>(),
-      /*xplatLogger=*/nullptr,
-      edenConfig,
-      stats.copy());
+std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger() {
+  return std::make_shared<EdenFsEventsLogger>(nullptr);
 }
 
 RootId addRestrictedTreeCommit(TestRepo& testRepo) {
@@ -117,7 +109,7 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
   // Use CPUThreadPoolExecutor — InlineExecutor is forbidden for coro::Task
   // (DCHECK on InlineExecutor at Task.h). getRootTree is now coroutine-backed.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
   auto backingStore = std::make_shared<SaplingBackingStore>(
       testRepo.repo.path(),
       testRepo.repo.path(),
@@ -127,7 +119,7 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
       &executor,
       edenConfig,
       std::make_unique<SaplingBackingStoreOptions>(),
-      makeTestEdenFsEventsLogger(edenConfig, stats),
+      makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       std::make_unique<BackingStoreLogger>(),
       &faultInjector);
@@ -170,7 +162,7 @@ struct SaplingBackingStoreNoFaultInjectorTest : SaplingBackingStoreTestBase {
   // Use a real executor so coroutine tests don't trip the coro::Task
   // DCHECK on InlineExecutor (Task.h:470). See D98178331.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -182,7 +174,7 @@ struct SaplingBackingStoreNoFaultInjectorTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -195,7 +187,7 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
   // Use a real executor so coroutine tests don't trip the coro::Task
   // DCHECK on InlineExecutor (Task.h:470).
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -207,7 +199,7 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -221,7 +213,7 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
   // Use CPUThreadPoolExecutor — InlineExecutor is forbidden for coro::Task
   // (DCHECK on InlineExecutor at Task.h:470). See D98178331.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -233,7 +225,7 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -603,47 +595,7 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getTreeBatch) {
       ::testing::ElementsAre(PathComponent{"foo"}, PathComponent{"src"}));
 }
 
-TEST_F(
-    SaplingBackingStoreNoFaultInjectorTest,
-    prefetchBlobsWithDuplicatesNoOptimizations) {
-  testEdenConfig->ignorePrefetchResult.setValue(
-      false, ConfigSourceType::UserConfig);
-  testEdenConfig->prefetchOptimizations.setValue(
-      false, ConfigSourceType::UserConfig);
-
-  auto tree = folly::coro::blockingWait(
-      folly::coro::timeout(
-          queuedBackingStore->co_getRootTree(
-              commit1, ObjectFetchContext::getNullContext()),
-          kTestTimeout));
-
-  std::vector<ObjectId> blobIds;
-  for (auto& [name, entry] : *tree.tree) {
-    if (!entry.isTree()) {
-      blobIds.push_back(entry.getObjectId());
-      blobIds.push_back(entry.getObjectId());
-    }
-  }
-
-  ASSERT_FALSE(blobIds.empty());
-
-  auto prefetchResult =
-      queuedBackingStore
-          ->prefetchBlobs(
-              folly::range(blobIds), ObjectFetchContext::getNullContext())
-          .get(kTestTimeout);
-
-  EXPECT_EQ(prefetchResult, folly::unit);
-}
-
-TEST_F(
-    SaplingBackingStoreNoFaultInjectorTest,
-    prefetchBlobsWithDuplicatesWithOptimizations) {
-  testEdenConfig->ignorePrefetchResult.setValue(
-      true, ConfigSourceType::UserConfig);
-  testEdenConfig->prefetchOptimizations.setValue(
-      true, ConfigSourceType::UserConfig);
-
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, prefetchBlobsWithDuplicates) {
   auto tree = folly::coro::blockingWait(
       folly::coro::timeout(
           queuedBackingStore->co_getRootTree(
@@ -945,11 +897,10 @@ TEST_F(
 struct SaplingBackingStoreErrorLoggingTest : SaplingBackingStoreTestBase {
   FaultInjector faultInjector{/*enabled=*/false};
   folly::InlineExecutor executor = folly::InlineExecutor::instance();
-  std::shared_ptr<CapturingScribeLogger> scribe =
-      std::make_shared<CapturingScribeLogger>();
+  CapturingXplatLogger xplatLogger;
   std::shared_ptr<ReloadableConfig> errorLoggerConfig{
       std::make_shared<ReloadableConfig>(testEdenConfig)};
-  ErrorLogger errorLogger{scribe, SessionInfo{}, errorLoggerConfig};
+  ErrorLogger errorLogger{errorLoggerConfig, &xplatLogger};
 
   SaplingBackingStoreErrorLoggingTest() {
     testEdenConfig->enableErrorLogging.setValue(
@@ -966,7 +917,7 @@ struct SaplingBackingStoreErrorLoggingTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/errorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -978,12 +929,10 @@ TEST_F(SaplingBackingStoreErrorLoggingTest, manifestResolutionFailureIsLogged) {
   auto result = queuedBackingStore->getManifestNode(bogusCommit);
   EXPECT_FALSE(result.has_value());
 
-  ASSERT_EQ(scribe->messages().size(), 1);
-  const auto& msg = scribe->messages()[0];
-  EXPECT_NE(msg.find("backing_store"), std::string::npos)
-      << "Should contain component, got: " << msg;
-  EXPECT_NE(msg.find("manifest_resolution_failure"), std::string::npos)
-      << "Should contain error_type, got: " << msg;
+  ASSERT_EQ(xplatLogger.events().size(), 1);
+  const auto& strings = xplatLogger.events()[0].event.getStringMap();
+  EXPECT_EQ(strings.at("component"), "backing_store");
+  EXPECT_EQ(strings.at("error_type"), "manifest_resolution_failure");
 }
 
 } // namespace facebook::eden

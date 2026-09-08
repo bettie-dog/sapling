@@ -12,6 +12,7 @@
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/AclState.h"
 #include "eden/fs/inodes/ChildEntryAttributes.h"
+#include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeError.h"
 #include "eden/fs/inodes/TreeInode.h"
@@ -218,55 +219,6 @@ VirtualInode::ContainedType VirtualInode::testGetContainedType() const {
       [](const TreeEntry&) { return ContainedType::TreeEntry; });
 }
 
-ImmediateFuture<Hash32> VirtualInode::getBlake3(
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  // DEPRECATED: use co_getBlake3 directly. Kept only because
-  // EdenServiceHandler and getDigestHash still call this via
-  // ImmediateFuture chains; delete once those paths are migrated
-  // to coroutines.
-
-  // Ensure this is a regular file.
-  // We intentionally want to refuse to compute the blake3 of symlinks
-  switch (getDtype()) {
-    case dtype_t::Dir:
-      return makeImmediateFuture<Hash32>(PathError(EISDIR, path));
-    case dtype_t::Symlink:
-      return makeImmediateFuture<Hash32>(
-          PathError(EINVAL, path, std::string_view{"file is a symlink"}));
-    case dtype_t::Regular:
-      break;
-    default:
-      return makeImmediateFuture<Hash32>(PathError(
-          EINVAL, path, std::string_view{"variant is of unhandled type"}));
-  }
-
-  // This is now guaranteed to be a dtype_t::Regular file. This means there's no
-  // need for a Tree case, as Trees are always directories.
-
-  return match(
-      variant_,
-      [&](const InodePtr& inode) {
-        return inode.asFilePtr()->getBlake3(fetchContext);
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry& entry) {
-        return objectStore->getBlobBlake3(entry.getObjectId(), fetchContext);
-      },
-      [&](const TreePtr&) {
-        return makeImmediateFuture<Hash32>(PathError(EISDIR, path));
-      },
-      [&](const TreeEntry& entry) {
-        const auto& hash = entry.getContentBlake3();
-        // If available, use the TreeEntry's ContentsSha1
-        if (hash.has_value()) {
-          return ImmediateFuture<Hash32>(hash.value());
-        }
-        // Revert to querying the objectStore for the file's metadata
-        return objectStore->getBlobBlake3(entry.getObjectId(), fetchContext);
-      });
-}
-
 folly::coro::now_task<Hash32> VirtualInode::co_getBlake3(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
@@ -312,58 +264,6 @@ folly::coro::now_task<Hash32> VirtualInode::co_getBlake3(
     // TreePtr - directories cannot have blake3
     co_yield folly::coro::co_error(PathError(EISDIR, path));
   }
-}
-
-ImmediateFuture<std::optional<Hash32>> VirtualInode::getDigestHash(
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  // Ensure this is a regular file or directory.
-  // We intentionally want to refuse to compute the digestHash of symlinks
-  switch (getDtype()) {
-    case dtype_t::Symlink:
-      return makeImmediateFuture<std::optional<Hash32>>(
-          PathError(EINVAL, path, std::string_view{"file is a symlink"}));
-    case dtype_t::Dir:
-      break;
-    case dtype_t::Regular:
-      // The DigestHash of a file is the same as the Blake3 hash for that file
-      return getBlake3(path, objectStore, fetchContext)
-          .thenValue([](auto&& blake3) {
-            return std::optional<Hash32>{std::move(blake3)};
-          });
-    default:
-      return makeImmediateFuture<std::optional<Hash32>>(PathError(
-          EINVAL, path, std::string_view{"variant is of unhandled type"}));
-  }
-
-  // A restricted directory is an ACL-denied placeholder that still carries the
-  // real ObjectId, so dispatching below would fetch the backing store's tree
-  // aux data and leak a digest of contents the server refused to serve. Report
-  // "no digest" instead.
-  if (FOLLY_UNLIKELY(isRestricted())) {
-    return std::optional<Hash32>{std::nullopt};
-  }
-
-  // This is now guaranteed to be a dtype_t::Dir. This means there's no
-  // need to handle any file case
-  return match(
-      variant_,
-      [&](const InodePtr& inode) {
-        return inode.asTreePtr()->getDigestHash(fetchContext);
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry& entry) {
-        return objectStore->getTreeDigestHash(
-            entry.getObjectId(), fetchContext);
-      },
-      [&](const TreePtr& tree) {
-        return objectStore->getTreeDigestHash(
-            tree->getObjectId(), fetchContext);
-      },
-      [&](const TreeEntry& entry) {
-        return objectStore->getTreeDigestHash(
-            entry.getObjectId(), fetchContext);
-      });
 }
 
 folly::coro::now_task<std::optional<Hash32>> VirtualInode::co_getDigestHash(
@@ -418,50 +318,6 @@ folly::coro::now_task<std::optional<Hash32>> VirtualInode::co_getDigestHash(
     co_yield folly::coro::co_error(PathError(
         EINVAL, path, std::string_view{"variant is of unhandled type"}));
   }
-}
-
-ImmediateFuture<Hash20> VirtualInode::getSHA1(
-    RelativePathPiece path,
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  // Ensure this is a regular file.
-  // We intentionally want to refuse to compute the SHA1 of symlinks
-  switch (getDtype()) {
-    case dtype_t::Dir:
-      return makeImmediateFuture<Hash20>(PathError(EISDIR, path));
-    case dtype_t::Symlink:
-      return makeImmediateFuture<Hash20>(
-          PathError(EINVAL, path, std::string_view{"file is a symlink"}));
-    case dtype_t::Regular:
-      break;
-    default:
-      return makeImmediateFuture<Hash20>(PathError(
-          EINVAL, path, std::string_view{"variant is of unhandled type"}));
-  }
-
-  // This is now guaranteed to be a dtype_t::Regular file. This means there's no
-  // need for a Tree case, as Trees are always directories.
-
-  return match(
-      variant_,
-      [&](const InodePtr& inode) {
-        return inode.asFilePtr()->getSha1(fetchContext);
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry& entry) {
-        return objectStore->getBlobSha1(entry.getObjectId(), fetchContext);
-      },
-      [&](const TreePtr&) {
-        return makeImmediateFuture<Hash20>(PathError(EISDIR, path));
-      },
-      [&](const TreeEntry& entry) {
-        const auto& hash = entry.getContentSha1();
-        // If available, use the TreeEntry's ContentsSha1
-        if (hash.has_value()) {
-          return ImmediateFuture<Hash20>(hash.value());
-        }
-        // Revert to querying the objectStore for the file's metadata
-        return objectStore->getBlobSha1(entry.getObjectId(), fetchContext);
-      });
 }
 
 folly::coro::now_task<Hash20> VirtualInode::co_getSHA1(
@@ -1499,7 +1355,7 @@ folly::Try<VirtualInode> applyAncestorAcl(
 
 folly::coro::now_task<
     std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
-co_getChildrenHelper(
+getChildrenHelper(
     const TreePtr& tree,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) {
@@ -1510,7 +1366,8 @@ co_getChildrenHelper(
   std::vector<folly::coro::Task<VirtualInode>> tasks;
   std::vector<size_t> taskIdx;
 
-  for (auto& child : *tree) {
+  for (auto& child :
+       visibleEntries(*tree, objectStore->getRestrictedContentMode())) {
     const auto* treeEntry = &child.second;
     if (treeEntry->isTree()) {
       if (treeEntry->isRestricted()) {
@@ -1564,7 +1421,7 @@ co_getChildrenHelper(
 
 folly::coro::now_task<
     std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
-VirtualInode::co_getChildren(
+VirtualInode::getChildren(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) {
@@ -1574,9 +1431,9 @@ VirtualInode::co_getChildren(
 
   static_assert(
       std::variant_size_v<detail::VariantVirtualInode> == 4,
-      "New variant type added to VariantVirtualInode - update co_getChildren");
+      "New variant type added to VariantVirtualInode - update getChildren");
   if (auto* inode = std::get_if<InodePtr>(&variant_)) {
-    auto children = co_await inode->asTreePtr()->co_getChildren(
+    auto children = co_await inode->asTreePtr()->getChildren(
         fetchContext, /*loadInodes=*/false);
     for (auto& child : children) {
       child.second = applyAncestorAcl(std::move(child.second), isUnderAcl());
@@ -1588,7 +1445,7 @@ VirtualInode::co_getChildren(
       co_yield folly::coro::co_error(PathError(EACCES, path));
     }
     auto children =
-        co_await co_getChildrenHelper(*tree, objectStore, fetchContext);
+        co_await getChildrenHelper(*tree, objectStore, fetchContext);
     for (auto& child : children) {
       child.second = applyAncestorAcl(std::move(child.second), isUnderAcl());
     }
@@ -1643,7 +1500,8 @@ VirtualInode::co_getChildrenAttributes(
   names.reserve((*tree)->size());
   tasks.reserve((*tree)->size());
 
-  for (auto& child : **tree) {
+  for (auto& child :
+       visibleEntries(**tree, objectStore->getRestrictedContentMode())) {
     auto subPath = path + child.first;
     names.push_back(child.first);
     const auto& treeEntry = child.second;
@@ -1791,31 +1649,6 @@ folly::coro::now_task<VirtualInode> VirtualInode::co_getOrFindChild(
     co_yield folly::coro::co_error(PathError(
         ENOTDIR, path, std::string_view{"variant is of unhandled type"}));
   }
-}
-
-ImmediateFuture<std::string> VirtualInode::getBlob(
-    const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
-  return match(
-      variant_,
-      [&](const InodePtr& inode) {
-        auto content = inode.asFilePtr()->readAll(fetchContext);
-        return ImmediateFuture<std::string>(std::move(content));
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry& entry) {
-        const auto& objectId = entry.getObjectId();
-        return objectStore->getBlob(objectId, fetchContext)
-            .thenValue([](auto&& blob) { return blob->asString(); });
-      },
-      [&](const TreeEntry& treeEntry) {
-        const auto& objectId = treeEntry.getObjectId();
-        return objectStore->getBlob(objectId, fetchContext)
-            .thenValue([](auto&& blob) { return blob->asString(); });
-      },
-      [&](const TreePtr&) {
-        return makeImmediateFuture<std::string>(
-            std::system_error(EISDIR, std::generic_category()));
-      });
 }
 
 folly::coro::now_task<std::string> VirtualInode::co_getBlob(

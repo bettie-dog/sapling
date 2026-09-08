@@ -7,9 +7,11 @@ cpp_library(
     srcs = ["PrivHelper.cpp"],
     headers = ["PrivHelper.h"],
     deps = [
+        "//folly:conv",
         "//folly:file",
         "//folly/futures:core",
         "//folly/io/async:async_base",
+        "//folly/logging:logging",
     ],
     exported_deps = [
         "//folly:network_address",
@@ -70,12 +72,15 @@ cpp_library(
     srcs = [
         "PrivHelperServer.cpp",
         "PrivHelperServerSanityCheck.cpp",
+        "RestartSentinel.cpp",
     ],
     headers = [
         "PrivHelperServer.h",
+        "RestartSentinel.h",
     ],
     deps = [
         ":nfs_rpc",
+        ":pin_scan",
         ":rollback",
         "//eden/common/utils:errno_utils",
         "//eden/common/utils:fsdetect",
@@ -93,6 +98,8 @@ cpp_library(
         "//folly/init:init",
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
+        "//folly/io/async:async_signal_handler",
+        "//folly/json:dynamic",
         "//folly/logging:init",
         "//folly/logging:logging",
         "//folly/portability:unistd",
@@ -106,6 +113,7 @@ cpp_library(
     }),
     exported_deps = [
         ":conn",
+        ":interface",
         "//eden/common/utils:io",
         "//eden/common/utils:process",
         "//folly:file",
@@ -135,7 +143,6 @@ cpp_library(
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:eden_error",
         "//folly:exception",
-        "//folly:expected",
         "//folly:file",
         "//folly:file_util",
         "//folly:network_address",
@@ -144,6 +151,7 @@ cpp_library(
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
         "//folly/logging:logging",
+        "//folly/portability:fcntl",
         "//folly/portability:sys_types",
         "//folly/portability:unistd",
     ],
@@ -161,5 +169,21 @@ cpp_library(
     headers = ["NfsMountRpc.h"],
     exported_deps = [
         "//eden/fs/nfs/xdr:xdr",
+    ],
+)
+
+cpp_library(
+    name = "pin_scan",
+    srcs = ["PinScan.cpp"],
+    headers = ["PinScan.h"],
+    deps = [
+        "//eden/common/utils:fsdetect",
+        "//eden/fs/utils:mount_info_table",
+        "//folly:conv",
+        "//folly:string",
+    ],
+    exported_deps = [
+        "//folly:expected",
+        "//folly/container:f14_hash",
     ],
 )

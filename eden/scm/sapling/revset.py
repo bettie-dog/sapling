@@ -13,7 +13,6 @@
 
 import re
 import sys
-import time
 
 from . import (
     autopull,
@@ -146,7 +145,7 @@ def parseage(age):
 
 
 def parseagerange(agerange):
-    now = time.time()
+    now = util.parsedate("now")[0]
     if agerange.startswith("<"):
         start = now - parseage(agerange[1:])
         end = None
@@ -2451,6 +2450,17 @@ def remotebookmarkrevset(repo, subset, x):
             _("no remote bookmarks exist that match '%s'") % bookmarkname
         )
     return subset & smartset.baseset(sorted(remoterevs), repo=repo)
+
+
+@predicate("_interestingdraft()", takeorder=True)
+def _interestingdraft(repo, subset, x, order):
+    """Subset of draft() used by the `titles` namespace."""
+    getargs(x, 0, 0, "_interestingdraft takes no arguments")
+    revs = repo.revs("limit(reverse(draft()) & age('<30d'), 1000)")
+    if order == followorder:
+        return subset & revs
+    else:
+        return revs & subset
 
 
 def _getremoterevs(repo, namespacename, matchpattern=None):

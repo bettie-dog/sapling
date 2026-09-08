@@ -23,10 +23,21 @@ Config::
     graphqlonly = True
     # Automatically pull Dxxx.
     autopull = True
+    # Prompt humans and abort agents when a diff has multiple visible local
+    # successors; when false, silently select the newest revision.
+    prompt-ambiguous-successors = true
 
     [fbcodereview]
     # Whether to automatically hide landed draft commits after "pull".
     hide-landed-commits = true
+    # How invalid diff IDs are handled for agents: abort, prompt, or warn.
+    # Other values ignore the guard.
+    bad-diff-id-agent-mode = abort
+    # How invalid diff IDs are handled for humans: abort, prompt, or warn.
+    # Other values ignore the guard.
+    bad-diff-id-human-mode = prompt
+    # Remove Differential Revision lines when agents copy commits.
+    unlink-copied-diff-revisions = true
 """
 
 import http.client
@@ -35,6 +46,7 @@ import re
 import socket
 import ssl
 import sys
+from collections import Counter
 from typing import Any, List, Optional, Pattern, Set, Sized
 
 from bindings import agentdetect
@@ -51,6 +63,7 @@ from sapling import (
     node,
     registrar,
     revset,
+    rewriteutil,
     scmutil,
     smartset,
     templatekw,
@@ -75,10 +88,8 @@ templatekeyword = registrar.templatekeyword()
 autopullpredicate = registrar.autopullpredicate()
 
 
-DIFFERENTIAL_REGEX: Pattern[str] = re.compile(
-    "Differential Revision: http.+?/"  # Line start, URL
-    "D(?P<id>[0-9]+)"  # Differential ID, just numeric part
-)
+_COPY_DIFF_APPROVALS = "fbcodereview.copy-diff-approved-revisions"
+_MESSAGE_PRECHECK_APPROVALS = "fbcodereview.message-precheck-approvals"
 
 DESCRIPTION_REGEX: Pattern[str] = re.compile(
     "Commit r"  # Prefix
@@ -104,39 +115,385 @@ svnrevre: Pattern[str] = re.compile(r"^r[A-Z]+(\d+)$")
 phabhashre: Pattern[str] = re.compile(r"^r([A-Z]+)([0-9a-f]{12,40})$")
 
 
-def validate_message_change(repo, old_desc, new_desc):
-    """Abort or prompt if new commit message drops a Differential Revision line present in old.
+def _bad_diff_id_mode(repo):
+    if agentdetect.is_agent():
+        mode = repo.ui.config("fbcodereview", "bad-diff-id-agent-mode", "abort")
+    else:
+        mode = repo.ui.config("fbcodereview", "bad-diff-id-human-mode", "prompt")
+    # Unrecognized values (e.g. "off") disable the guard so emergency
+    # rollback configs fail open.
+    return mode if mode in ("abort", "warn", "prompt") else "ignore"
 
-    - If running as an agent, abort unconditionally.
-    - Otherwise, prompt the user to confirm whether to proceed.
-    """
-    if repo.ui.configbool("fbcodereview", "allow-diff-revision-drop"):
-        return
+
+_BADDIFFID_PREFIX = "commit.baddiffid."
+
+
+def _warn_message_change(repo, message, hint):
+    repo.ui.warn(_("warning: %s\n(%s)\n") % (message, hint))
+
+
+def _confirm_message_change(repo, message, hint=None):
     if repo.ui.plain():
-        # should not block automation like `jf unlink`
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "automation_allowed", 1)
         return
-    if not new_desc:
+    if repo.ui.configbool("fbcodereview", "allow-diff-revision-drop"):
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "config_allowed", 1)
         return
-    old_rev = diffprops.parserevfromcommitmsg(old_desc)
-    new_rev = diffprops.parserevfromcommitmsg(new_desc)
-    if old_rev and not new_rev:
-        if agentdetect.is_agent():
-            raise error.Abort(
-                _("commit message drops phabricator diff number 'D%s'") % old_rev,
-                hint=_(
-                    "use `jf template` to modify commit message fields or use 'jf unlink' to remove the associated phabricator diff"
-                ),
+
+    if hint is None:
+        hint = _(
+            "use `jf template` to modify commit message fields or use 'jf unlink' to remove the associated phabricator diff"
+        )
+    mode = _bad_diff_id_mode(repo)
+    if mode == "ignore":
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "mode_ignored", 1)
+        return
+    if mode == "warn":
+        repo.ui.metrics.inc(rewriteutil.actormetric(_BADDIFFID_PREFIX, "warned"), 1)
+        _warn_message_change(repo, message, hint)
+        return
+    if mode == "abort":
+        repo.ui.metrics.inc(rewriteutil.actormetric(_BADDIFFID_PREFIX, "rejected"), 1)
+        raise error.Abort(message, hint=hint)
+
+    # Default to proceeding so scripted or non-interactive human invocations
+    # keep working; the prompt is a speed bump, not a wall.
+    choice = repo.ui.promptchoice(
+        _("%s, proceed (Yn)? $$ &Yes $$ &No") % message,
+        default=0,
+    )
+    if choice != 0:
+        repo.ui.metrics.inc(rewriteutil.actormetric(_BADDIFFID_PREFIX, "prompt_no"), 1)
+        raise error.Abort(_("aborted by user"))
+    repo.ui.metrics.inc(rewriteutil.actormetric(_BADDIFFID_PREFIX, "prompt_yes"), 1)
+    _warn_message_change(repo, message, hint)
+
+
+def _format_diff_numbers(revisions):
+    return ", ".join("'D%s'" % revision for revision in sorted(revisions, key=int))
+
+
+def _format_diff_link_guidance(revisions):
+    if len(revisions) == 1:
+        return _("run 'jf link --diff D%s'") % min(revisions, key=int)
+    return _(
+        "run 'jf link --diff D<number>' from each successor commit that should be linked"
+    )
+
+
+def _commit_revisions(ctx):
+    return diffprops.diffrevisionregex.findall(ctx.description())
+
+
+def _message_revisions(message):
+    return diffprops.diffrevisionregex.findall(message)
+
+
+def _remove_diff_revision_lines(message):
+    stripped = diffprops.diffrevisionlineregex.sub("", message)
+    # Removing a line that had blank lines on both sides leaves a double
+    # blank line behind; collapse it. If the message was nothing but binding
+    # lines, keep it rather than produce an empty commit message.
+    return re.sub(r"\n{3,}", "\n\n", stripped).rstrip() or message.rstrip()
+
+
+def _warn_unlinked_copy(repo, operation, revisions):
+    diff_numbers = _format_diff_numbers(revisions)
+    description = (
+        _n(
+            "phabricator diff number %s",
+            "phabricator diff numbers %s",
+            len(revisions),
+        )
+        % diff_numbers
+    )
+    repo.ui.warn(
+        _(
+            "note: removed %s from the commit copied by %s; the new commit is "
+            "not linked to a phabricator diff\n"
+        )
+        % (description, operation)
+    )
+
+
+def _warn_copied_diff_association(repo, operation, revisions):
+    repo.ui.warn(
+        _(
+            "warning: copying this commit with %s associates multiple commits "
+            "with %s\n(run 'jf unlink' from the new commit to remove the "
+            "duplicate association)\n"
+        )
+        % (operation, _format_diff_numbers(revisions))
+    )
+
+
+def _approve_copied_diff_revisions(repo, revisions):
+    # Commit validation consumes this approval after the hook returns.
+    if _COPY_DIFF_APPROVALS not in repo.volatile_state:
+        repo.ui.atexit(lambda: repo.volatile_state.pop(_COPY_DIFF_APPROVALS, None))
+    repo.volatile_state[_COPY_DIFF_APPROVALS] = revisions
+
+
+def _is_recovery_copy(repo, source, revisions):
+    """Whether copying ``source`` re-binds diff numbers no visible draft holds.
+
+    Copying a hidden or obsolete commit is how lost work is recovered. The
+    copied binding is only a duplicate when the source itself remains visible
+    or some other visible draft still carries one of the diff numbers.
+    """
+    if source.repo() is not repo:
+        # Cross-repo graft sources cannot be resolved against this repo's
+        # visibility or mutation data.
+        return False
+    hidden = next(iter(repo.nodes("%n & hidden()", source.node())), None) is not None
+    if not (hidden or source.obsolete()):
+        return False
+    # The draft set is small, and the copy hook never runs in plain mode, so
+    # automation does not pay for this scan.
+    for rev in repo.revs("draft() - %n", source.node()):
+        if set(_commit_revisions(repo[rev])) & revisions:
+            return False
+    return True
+
+
+def copycommitmessage(orig, repo, message, operation, source):
+    message = orig(repo, message, operation, source)
+    revisions = set(_message_revisions(message))
+    if not revisions or repo.ui.plain():
+        return message
+
+    mode = _bad_diff_id_mode(repo)
+    if mode == "ignore" or not repo.ui.configbool(
+        "fbcodereview", "unlink-copied-diff-revisions", True
+    ):
+        # Rolled back or disabled: restore the old copy behavior entirely,
+        # including exempting the copy from the untracked-introduction check.
+        _approve_copied_diff_revisions(repo, revisions)
+        return message
+
+    if _is_recovery_copy(repo, source, revisions):
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_recovery_kept", 1)
+        _approve_copied_diff_revisions(repo, revisions)
+        return message
+
+    if mode == "warn":
+        repo.ui.metrics.inc(
+            rewriteutil.actormetric(_BADDIFFID_PREFIX + "copy_", "warned"), 1
+        )
+        _warn_copied_diff_association(repo, operation, revisions)
+        _approve_copied_diff_revisions(repo, revisions)
+        return message
+
+    if agentdetect.is_agent():
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_agent_unlinked", 1)
+        _warn_unlinked_copy(repo, operation, revisions)
+        return _remove_diff_revision_lines(message)
+
+    if mode == "abort":
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_human_rejected", 1)
+        raise error.Abort(
+            _("copying this commit with %s would associate multiple commits with %s")
+            % (operation, _format_diff_numbers(revisions)),
+            hint=_(
+                "run 'jf unlink' on the source commit first, or set "
+                "'fbcodereview.bad-diff-id-human-mode=prompt' to choose interactively"
+            ),
+        )
+
+    choice = repo.ui.promptchoice(
+        _(
+            "copying this commit would associate multiple commits with %s; "
+            "[r]emove the diff number from the new commit, [p]roceed with "
+            "the duplicate association, or [c]ancel?"
+            " $$ &Remove $$ &Proceed $$ &Cancel"
+        )
+        % _format_diff_numbers(revisions),
+        default=1,
+    )
+    if choice == 0:
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_human_unlinked", 1)
+        _warn_unlinked_copy(repo, operation, revisions)
+        return _remove_diff_revision_lines(message)
+    if choice == 1:
+        repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_human_proceeded", 1)
+        _warn_copied_diff_association(repo, operation, revisions)
+        _approve_copied_diff_revisions(repo, revisions)
+        return message
+
+    repo.ui.metrics.inc(_BADDIFFID_PREFIX + "copy_human_cancelled", 1)
+    raise error.Abort(_("aborted by user"))
+
+
+def _validate_commit_set(repo, successor_messages, predecessor_messages):
+    # Consume any pending copy approval regardless of which branch validates
+    # this commit, so a stale approval cannot leak to a later commit.
+    approved_copy_revisions = repo.volatile_state.pop(_COPY_DIFF_APPROVALS, set())
+    successor_revisions = []
+    multiple_revisions = set()
+    for successor_message in successor_messages:
+        revisions = _message_revisions(successor_message)
+        if len(revisions) > 1:
+            multiple_revisions.update(revisions)
+        successor_revisions.extend(revisions)
+    if multiple_revisions:
+        _confirm_message_change(
+            repo,
+            _("commit message contains multiple phabricator diff numbers %s")
+            % _format_diff_numbers(multiple_revisions),
+            _(
+                "keep exactly one Differential Revision line in the commit message; "
+                "to change the association, run 'jf unlink' before the rewrite and "
+                "'jf link --diff D<number>' afterward"
+            ),
+        )
+        return
+
+    predecessor_revisions = {
+        revision
+        for predecessor_message in predecessor_messages
+        for revision in _message_revisions(predecessor_message)
+    }
+    successor_revision_set = set(successor_revisions)
+    duplicates = {
+        revision
+        for revision, count in Counter(successor_revisions).items()
+        if count > 1
+    }
+    if not predecessor_revisions:
+        if successor_revision_set and successor_revision_set != approved_copy_revisions:
+            _confirm_message_change(
+                repo,
+                _("commit introduces phabricator diff number(s) %s")
+                % _format_diff_numbers(successor_revision_set),
+                _(
+                    "create the commit without a Differential Revision line, then "
+                    "%s to associate it intentionally"
+                )
+                % _format_diff_link_guidance(successor_revision_set),
+            )
+        return
+
+    unexpected = successor_revision_set - predecessor_revisions
+    if unexpected:
+        if duplicates:
+            message = _(
+                "commit rewrite introduces unexpected phabricator diff number(s) %s "
+                "and duplicates %s across successor commits; predecessor diff "
+                "number(s): %s"
+            ) % (
+                _format_diff_numbers(unexpected),
+                _format_diff_numbers(duplicates),
+                _format_diff_numbers(predecessor_revisions),
             )
         else:
-            choice = repo.ui.promptchoice(
-                _(
-                    "commit message drops phabricator diff number 'D%s', proceed (Yn)? $$ &Yes $$ &No"
-                )
-                % old_rev,
-                default=0,
+            message = _(
+                "commit rewrite introduces unexpected phabricator diff number(s) %s; "
+                "predecessor diff number(s): %s"
+            ) % (
+                _format_diff_numbers(unexpected),
+                _format_diff_numbers(predecessor_revisions),
             )
-            if choice != 0:
-                raise error.Abort(_("aborted by user"))
+        _confirm_message_change(
+            repo,
+            message,
+            _(
+                "run 'jf unlink' before the rewrite, then %s afterward to change "
+                "the association intentionally"
+            )
+            % _format_diff_link_guidance(unexpected),
+        )
+        return
+
+    if successor_revision_set:
+        if duplicates:
+            _confirm_message_change(
+                repo,
+                _("commit rewrite creates duplicate phabricator diff number(s) %s")
+                % _format_diff_numbers(duplicates),
+                _(
+                    "keep the Differential Revision line on exactly one successor "
+                    "and remove it from the other successor commit messages"
+                ),
+            )
+        return
+
+    if len(predecessor_revisions) == 1:
+        message = _("commit message drops phabricator diff number %s") % (
+            _format_diff_numbers(predecessor_revisions)
+        )
+    else:
+        message = _("commit rewrite loses phabricator diff number(s) %s") % (
+            _format_diff_numbers(predecessor_revisions)
+        )
+    hint = None
+    if len(predecessor_messages) > 1 or len(predecessor_revisions) > 1:
+        hint = _(
+            "choose one of the predecessor diff numbers (%s) for the final commit; "
+            "to keep no diff number after folding, collapsing, or editing history, "
+            "run 'jf unlink' before the rewrite"
+        ) % _format_diff_numbers(predecessor_revisions)
+    else:
+        hint = _(
+            "run 'jf unlink' to intentionally remove the associated diff; use "
+            "'jf template' to edit other commit message fields"
+        )
+    _confirm_message_change(repo, message, hint=hint)
+
+
+def _message_approval_key(successor_messages, predecessor_messages):
+    return (
+        frozenset(
+            revision
+            for message in successor_messages
+            for revision in _message_revisions(message)
+        ),
+        frozenset(
+            revision
+            for message in predecessor_messages
+            for revision in _message_revisions(message)
+        ),
+    )
+
+
+def precheckmessage(orig, repo, predecessors, message):
+    """Validate a rewrite's final message before any commit is rewritten."""
+    orig(repo, predecessors, message)
+    predecessor_messages = [predecessor.description() for predecessor in predecessors]
+    _validate_commit_set(repo, [message], predecessor_messages)
+    # Do not re-prompt for the same outcome when the rewrite commits. A key
+    # with no diff numbers at all is not worth recording: validating such a
+    # rewrite is a no-op anyway.
+    key = _message_approval_key([message], predecessor_messages)
+    if not any(key):
+        return
+    if _MESSAGE_PRECHECK_APPROVALS not in repo.volatile_state:
+        repo.volatile_state[_MESSAGE_PRECHECK_APPROVALS] = set()
+        repo.ui.atexit(
+            lambda: repo.volatile_state.pop(_MESSAGE_PRECHECK_APPROVALS, None)
+        )
+    repo.volatile_state[_MESSAGE_PRECHECK_APPROVALS].add(key)
+
+
+def validate_commit(orig, repo, ctx):
+    """Enforce Differential Revision invariants for a commit being written."""
+    predecessors, split_successors = orig(repo, ctx)
+    if rewriteutil.issplitting(repo) and not predecessors:
+        return predecessors, split_successors
+
+    successor_messages = [
+        successor.description() for successor in [*split_successors, ctx]
+    ]
+    predecessor_messages = [predecessor.description() for predecessor in predecessors]
+    if predecessors:
+        approvals = repo.volatile_state.get(_MESSAGE_PRECHECK_APPROVALS, set())
+        key = _message_approval_key(successor_messages, predecessor_messages)
+        if key in approvals:
+            approvals.discard(key)
+            # Keep the copy-approval invariant: consumed on every validation.
+            repo.volatile_state.pop(_COPY_DIFF_APPROVALS, None)
+            return predecessors, split_successors
+    _validate_commit_set(repo, successor_messages, predecessor_messages)
+    return predecessors, split_successors
 
 
 @templatekeyword("phabdiff")
@@ -217,6 +574,9 @@ def makegraftmessage(orig, repo, ctx, opts, from_paths, to_paths, from_repo):
 def extsetup(ui) -> None:
     extensions.wrapfunction(commands, "_makebackoutmessage", makebackoutmessage)
     extensions.wrapfunction(commands, "_makegraftmessage", makegraftmessage)
+    extensions.wrapfunction(rewriteutil, "commitcheck", validate_commit)
+    extensions.wrapfunction(rewriteutil, "precheckmessage", precheckmessage)
+    extensions.wrapfunction(rewriteutil, "copycommitmessage", copycommitmessage)
 
     smartset.prefetchtemplatekw.update(
         {
@@ -1055,6 +1415,14 @@ def debuginternusername(ui, **opts):
 def graphqlgetdiff(repo, diffid, version=None):
     """Resolves a phabricator Diff number to a commit hash of it's latest version"""
     if util.istest():
+        hexnode = repo.ui.config("phrevset", "mock-local-D%s" % diffid)
+        if hexnode:
+            return {
+                "source_control_system": "hg",
+                "description": None,
+                "commit_hash_best_effort": hexnode,
+                "commits": {},
+            }
         hexnode = repo.ui.config("phrevset", "mock-D%s" % diffid)
         if hexnode:
             return {
@@ -1097,10 +1465,7 @@ def localgetdiff(repo, diffid):
 
     def check(repo, rev, diffid):
         changectx = repo[rev]
-        desc = changectx.description()
-        match = DIFFERENTIAL_REGEX.search(desc)
-
-        if match and match.group("id") == diffid:
+        if diffprops.parserevfromcommitmsg(changectx.description()) == diffid:
             return changectx.node()
         else:
             return None
@@ -1200,6 +1565,58 @@ def _gitrevtohgnode(repo, rev) -> Optional[List[bytes]]:
     except Exception as e:
         repo.ui.warn(_x("could not translate rev %s as git hash: %s\n") % (rev, e))
     return None
+
+
+def _select_ambiguous_successor(repo, diffid, successors):
+    prompt = not repo.ui.plain() and repo.ui.configbool(
+        "phrevset", "prompt-ambiguous-successors", True
+    )
+    repo.ui.metrics.inc("phrevset.ambiguous_successors", 1)
+    repo.ui.log(
+        "phrevset_ambiguous_successors",
+        diffid=diffid,
+        successor_count=len(successors),
+        prompt=prompt,
+    )
+    if not prompt:
+        repo.ui.metrics.inc("phrevset.ambiguous_successors.auto_selected", 1)
+        return successors[0]
+
+    repo.ui.warn(_("D%s resolves ambiguously to multiple local commits:\n") % diffid)
+    for index, successor in enumerate(successors, 1):
+        ctx = repo[successor]
+        title = next(iter(ctx.description().splitlines()), "")
+        date = util.datestr(ctx.date(), "%Y-%m-%d %H:%M:%S %1%2")
+        repo.ui.warn("  %d: %s %s %s\n" % (index, short(successor), date, title))
+
+    if agentdetect.is_agent():
+        repo.ui.metrics.inc("phrevset.ambiguous_successors.agent_rejected", 1)
+        raise error.Abort(
+            _("ambiguous commit for D%s") % diffid,
+            hint=_(
+                "specify one of the commit hashes directly, or set "
+                "'phrevset.prompt-ambiguous-successors=false' to select the "
+                "newest revision automatically"
+            ),
+        )
+
+    count = len(successors)
+    choices = " $$ &" + " $$ &".join(map(str, range(1, count + 1)))
+    choices = " [1-%d/(c)ancel]? $$ &cancel%s" % (count, choices)
+    choice = repo.ui.promptchoice(_("which commit to select%s") % choices, default=1)
+    if choice == 0:
+        repo.ui.metrics.inc("phrevset.ambiguous_successors.cancelled", 1)
+        raise error.Abort(
+            _("ambiguous commit for D%s") % diffid,
+            hint=_(
+                "set 'phrevset.prompt-ambiguous-successors=false' to restore automatic selection"
+            ),
+        )
+
+    selected = successors[choice - 1]
+    repo.ui.metrics.inc("phrevset.ambiguous_successors.selected", 1)
+    repo.ui.warn(_("warning: selected %s for D%s\n") % (short(selected), diffid))
+    return selected
 
 
 @util.lrucachefunc
@@ -1326,12 +1743,20 @@ def diffidtonode(repo, diffid, localreponame=None, version=None):
                 # successors() skips hidden commits. We don't subtract obsolete() because we want to
                 # return obsolete-but-visible commits (if that happens to be the newest local
                 # version of a diff).
-                for successor in unfi.nodes("sort(successors(%n)-%n,-rev)", node, node):
+                successors = [
+                    successor
+                    for successor in unfi.nodes(
+                        "sort(successors(%n)-%n,-rev)", node, node
+                    )
                     if (
                         diffprops.parserevfromcommitmsg(repo[successor].description())
                         == diffid
-                    ):
-                        return successor
+                    )
+                ]
+                if len(successors) == 1:
+                    return successors[0]
+                if len(successors) > 1:
+                    return _select_ambiguous_successor(repo, diffid, successors)
             if (
                 vcs == "git"
                 and repo.ui.configbool("phrevset", "abort-if-git-diff-unavailable")

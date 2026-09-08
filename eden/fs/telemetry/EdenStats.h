@@ -227,6 +227,9 @@ struct FuseStats : StatsGroup<FuseStats> {
   Duration rename{"fuse.rename_us"};
   Counter renameSuccessful{"fuse.rename_successful"};
   Counter renameFailure{"fuse.rename_failure"};
+  Duration rename2{"fuse.rename2_us"};
+  Counter rename2Successful{"fuse.rename2_successful"};
+  Counter rename2Failure{"fuse.rename2_failure"};
   Duration link{"fuse.link_us"};
   Counter linkSuccessful{"fuse.link_successful"};
   Counter linkFailure{"fuse.link_failure"};
@@ -312,6 +315,12 @@ struct FuseStats : StatsGroup<FuseStats> {
 
   Counter ioUringReplySameThread{"fuse.io_uring_reply_same_thread"};
   Counter ioUringReplyCrossThread{"fuse.io_uring_reply_cross_thread"};
+  Counter ioUringPreCreateQueuesSuccess{
+      "fuse.io_uring_pre_create_queues_success"};
+  Counter ioUringPreCreateQueuesFailure{
+      "fuse.io_uring_pre_create_queues_failure"};
+  Counter invalidationQueueThrottleWait{
+      "fuse.invalidation.queue_throttle_wait"};
 };
 
 struct NfsStats : StatsGroup<NfsStats> {
@@ -382,9 +391,16 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsCommitSuccessful{"nfs.commit_successful"};
   Counter nfsCommitFailure{"nfs.commit_failure"};
 
+  Counter nfsRpcExtraConnection{"nfs.rpc.extra_connection"};
+  Counter nfsRpcExtraConnectionRefused{"nfs.rpc.extra_connection_refused"};
+
   // Backpressure
   Counter nfsBackpressureJukebox{"nfs.backpressure_jukebox"};
   Counter nfsInflightAtRequest{"nfs.inflight_at_request"};
+
+  // Requests rejected by a "block" or over-budget "rate_limit" entry in
+  // nfs:uid-access-modes / nfs:gid-access-modes.
+  Counter nfsBlockedAccess{"nfs.blocked_access"};
 
   // NFS GC invalidation counters
   Counter nfsInvalidationGcAttempt{"nfs.invalidation.gc.attempt"};
@@ -671,6 +687,12 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   Duration removeChildren{"overlay.remove_children_us"};
   Duration renameChild{"overlay.rename_child_us"};
   Duration materializeChild{"overlay.materialize_child_us"};
+  // Whether the fd from creating a new overlay file was handed to the
+  // open-file cache, or dropped because a concurrent by-number request
+  // already opened the file.
+  Counter createdFdCached{"overlay.created_fd_cached"};
+  Counter createdFdAlreadyOpen{"overlay.created_fd_already_open"};
+
   Counter loadOverlayDirSuccessful{"overlay.load_overlay_dir_successful"};
   Counter loadOverlayDirFailure{"overlay.load_overlay_dir_failure"};
   Counter saveOverlayDirSuccessful{"overlay.save_overlay_dir_successful"};
@@ -713,6 +735,17 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   // because compaction runs on the FUSE/NFS dispatch thread under the
   // parent contents lock.
   Duration walCompactionInline{"overlay.wal_compaction_inline_us"};
+
+  // Preallocated overlay file pool (overlay:file-prealloc-pool-size gate).
+  Counter preallocFileClaimed{"overlay.prealloc_file_claimed"};
+  Counter preallocFileMissed{"overlay.prealloc_file_missed"};
+  // A pool entry was popped but writing the initial contents failed.
+  Counter preallocFileClaimFailed{"overlay.prealloc_file_claim_failed"};
+
+  // Preallocated empty overlay dir records
+  // (overlay:dir-prealloc-pool-size gate).
+  Counter preallocDirClaimed{"overlay.prealloc_dir_claimed"};
+  Counter preallocDirMissed{"overlay.prealloc_dir_missed"};
 };
 
 struct InodeMapStats : StatsGroup<InodeMapStats> {

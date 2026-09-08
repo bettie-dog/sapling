@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -340,7 +341,11 @@ TEST_F(EdenServerTest, TakeoverSendFailureRecoversDuringCleanup) {
   auto originalHandler = server.getHandler();
   ASSERT_NO_FATAL_FAILURE(
       driveTakeoverSendFailureToCleanup(testServer(), server));
-  EXPECT_FALSE(server.performCleanup());
+  ASSERT_FALSE(server.performCleanup());
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
   EXPECT_NE(originalHandler, server.getHandler());
 }
 
@@ -353,6 +358,11 @@ TEST_F(EdenServerTest, TakeoverSendFailureRecoveryReinitializesMountd) {
   ASSERT_NO_FATAL_FAILURE(
       driveTakeoverSendFailureToCleanup(nfsTestServer, server));
   ASSERT_FALSE(server.performCleanup());
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
 
   std::thread recoveryEventBaseThread(
       [&server] { server.getMainEventBase()->loop(); });
@@ -453,13 +463,36 @@ TEST_F(EdenServerTest, RepeatedTakeoverFailuresDoNotBreakShutdownFuture) {
 }
 #endif
 
+#ifdef __linux__
+TEST_F(EdenServerTest, GarbageCollectionReportsBusyWhileInhibited) {
+  auto& server = testServer().getServer();
+  TestMount mount{FakeTreeBuilder{}};
+  auto inhibitor = mount.getEdenMount()->stealInodeGCLease();
+
+  auto gc = server.garbageCollectInodes(
+      *mount.getEdenMount(),
+      mount.getRootInode(),
+      std::chrono::system_clock::now(),
+      ObjectFetchContext::getNullContext(),
+      /*pressureBased=*/false);
+  try {
+    std::move(gc).get(10s);
+    FAIL() << "expected inode GC admission to fail";
+  } catch (const EdenError& error) {
+    EXPECT_EQ(EBUSY, *error.errorCode());
+  }
+}
+#endif
+
 TEST_F(EdenServerTest, StopAllGarbageCollectionsDoesNotPoisonFutureGC) {
   auto& server = testServer().getServer();
 #ifdef __linux__
   FakeTreeBuilder builder;
   builder.setFile("hello", "world");
   TestMount mount{builder};
-  mount.updateEdenConfig({{"experimental:enable-pressure-based-gc", "true"}});
+  // The function argument is the snapshot for this GC run, even if reloadable
+  // config has changed since the run was scheduled.
+  mount.updateEdenConfig({{"experimental:enable-pressure-based-gc", "false"}});
 
   auto fuse = std::make_shared<FakeFuse>();
   mount.startFuseAndWait(fuse);
@@ -475,7 +508,7 @@ TEST_F(EdenServerTest, StopAllGarbageCollectionsDoesNotPoisonFutureGC) {
       /*maxRetries=*/0, /*retryInterval=*/std::chrono::seconds{0}));
 
   auto numInvalidated = server
-                            .garbageCollectWorkingCopy(
+                            .garbageCollectInodes(
                                 *mount.getEdenMount(),
                                 mount.getRootInode(),
                                 std::chrono::system_clock::now() + 1h,

@@ -11,8 +11,8 @@ license = "GPLv2+"
 anyhow = "1.0.104"
 ascii = "1.1.0"
 async-stream = "0.3"
-async-trait = "0.1.91"
-base64 = { version = "0.22.1", features = ["alloc"] }
+async-trait = "0.1.92"
+base64 = { version = "0.23.1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
 blake3 = { version = "=1.8.6", features = ["mmap", "rayon", "traits-preview"] }
@@ -22,7 +22,7 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_watchdog = { version = "0.1.0", path = "../../common/futures_watchdog" }
 itertools = "0.15.0"
@@ -44,8 +44,8 @@ smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }

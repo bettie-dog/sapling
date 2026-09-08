@@ -444,3 +444,35 @@ TEST_F(ConfigSettingTest, setUnorderedSet) {
       std::unordered_set<std::string>{"1", "2", "3", "4"},
       "[\"1\", \"2\", \"3\", \"4\"]");
 }
+
+TEST_F(ConfigSettingTest, setUnorderedMap) {
+  using Modes = std::unordered_map<uint32_t, NfsAccessMode>;
+  ConfigSetting<Modes> setting{"test:value", Modes{}, nullptr};
+  checkSet(
+      setting,
+      Modes{
+          {0, NfsAccessMode::Log},
+          {89, NfsAccessMode::Block},
+          {501, NfsAccessMode::RateLimit}},
+      "[\"0:log\", \"89:block\", \"501:rate_limit\"]");
+  EXPECT_EQ("0:log, 89:block, 501:rate_limit", setting.getStringValue());
+  checkSet(setting, Modes{}, "[]");
+  checkSetError(setting, "expected 'key:value', got '0log'", "[\"0log\"]");
+  checkSetError(setting, "Non-digit character found: \"abc\"", "[\"abc:log\"]");
+  checkSetError(
+      setting,
+      "Failed to convert value 'nope' to an NfsAccessMode.",
+      "[\"0:nope\"]");
+  checkSetError(setting, "duplicate key '0'", "[\"0:log\", \"0:block\"]");
+}
+
+TEST_F(ConfigSettingTest, setNfsAccessMode) {
+  ConfigSetting<NfsAccessMode> setting{
+      "test:value", NfsAccessMode::Log, nullptr};
+  checkSet(setting, NfsAccessMode::Block, "block");
+  checkSet(setting, NfsAccessMode::RateLimit, "rate_limit");
+  checkSet(setting, NfsAccessMode::Log, "log");
+  checkSet(setting, NfsAccessMode::Block, "BLOCK");
+  checkSetError(
+      setting, "Failed to convert value 'true' to an NfsAccessMode.", "true");
+}

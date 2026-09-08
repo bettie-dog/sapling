@@ -22,7 +22,7 @@ dbbookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/db
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_source_of_truth = { version = "0.1.0", path = "../../../repo_attributes/git_source_of_truth" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
@@ -41,8 +41,8 @@ repo_update_logger = { version = "0.1.0", path = "../../repo_update_logger" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 sql_ext = { version = "0.1.0", path = "../../../common/rust/sql_ext" }
 sql_query_config = { version = "0.1.0", path = "../../../repo_attributes/sql_query_config" }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 wireproto_handler = { version = "0.1.0", path = "../../../servers/slapi/wireproto_handler" }
 

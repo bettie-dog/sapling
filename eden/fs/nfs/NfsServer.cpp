@@ -92,9 +92,11 @@ NfsServer::NfsMountInfo NfsServer::registerMount(
     folly::Duration requestTimeout,
     std::shared_ptr<Notifier> notifier,
     CaseSensitivity caseSensitive,
-    uint32_t iosize,
+    uint32_t readIoSize,
+    uint32_t writeIoSize,
     size_t traceBusCapacity,
-    bool fastPathRPCs) {
+    bool fastPathRPCs,
+    std::shared_ptr<ReloadableConfig> config) {
   auto nfsd = std::unique_ptr<Nfsd3, FsChannelDeleter>{new Nfsd3{
       privHelper_,
       AbsolutePath{path},
@@ -109,12 +111,14 @@ NfsServer::NfsMountInfo NfsServer::registerMount(
       requestTimeout,
       std::move(notifier),
       caseSensitive,
-      iosize,
+      readIoSize,
+      writeIoSize,
       maximumInFlightRequests_,
       highNfsRequestsLogInterval_,
       longRunningFSRequestThreshold_,
       traceBusCapacity,
-      fastPathRPCs}};
+      fastPathRPCs,
+      std::move(config)}};
   mountd_.registerMount(path, rootIno);
 
   return {std::move(nfsd), mountd_.getAddr()};

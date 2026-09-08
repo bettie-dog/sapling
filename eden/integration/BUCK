@@ -226,6 +226,27 @@ python_integration_test(
 )
 
 python_integration_test(
+    name = "privhelper",
+    srcs = ["privhelper_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/cli:lib",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "flush_cache",
+    srcs = ["flush_cache_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
     name = "pressure_gc",
     srcs = ["pressure_gc_test.py"],
     env = artifacts["env"],

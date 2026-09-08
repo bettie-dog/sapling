@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <folly/CancellationToken.h>
 #include <optional>
 #include <string_view>
@@ -104,11 +106,17 @@ class ObjectFetchContext : public RefCounted {
     Unknown = 0,
     /** The request originated from a Thrift prefetch endpoint */
     Prefetch = 1,
+    /** The request originated from a Thrift glob endpoint */
+    Glob = 2,
     /** The request originated from a Thrift endpoint */
-    Thrift = 2,
+    Thrift = 3,
     /** Highest Priority - The request originated from FUSE/NFS/PrjFS */
-    Fs = 3,
+    Fs = 4,
   };
+
+  static constexpr bool shouldTriggerWalkDetection(Cause cause) {
+    return cause != Cause::Prefetch && cause != Cause::Glob;
+  }
 
   ObjectFetchContext() = default;
 
@@ -122,6 +130,20 @@ class ObjectFetchContext : public RefCounted {
   }
 
   virtual OptionalProcessId getClientPid() const {
+    return std::nullopt;
+  }
+
+  /**
+   * The uid/gid claimed by the client that triggered this request, when
+   * known. Currently only populated for NFS requests, from the AUTH_SYS
+   * credential; note that AUTH_SYS credentials are client-asserted and
+   * spoofable, so these are suitable for telemetry and coarse policy only.
+   */
+  virtual std::optional<uint32_t> getClientUid() const {
+    return std::nullopt;
+  }
+
+  virtual std::optional<uint32_t> getClientGid() const {
     return std::nullopt;
   }
 
@@ -172,15 +194,15 @@ class ObjectFetchContext : public RefCounted {
       ObjectType type,
       EdenStatsPtr stats) {
     // There is no stat increment for FetchedSource::Unknown
-    if (saplingStatsMap_.find({fetchedSource, type}) !=
-        saplingStatsMap_.end()) {
-      stats->increment(saplingStatsMap_[{fetchedSource, type}]);
+    const auto counterIt = saplingStatsMap_.find({fetchedSource, type});
+    if (counterIt != saplingStatsMap_.end()) {
+      stats->increment(counterIt->second);
     }
-    fetchedSource_ = fetchedSource;
+    fetchedSource_.store(fetchedSource, std::memory_order_relaxed);
   }
 
   FetchedSource getFetchedSource() const {
-    return fetchedSource_;
+    return fetchedSource_.load(std::memory_order_relaxed);
   }
 
   // RequestInfo keys used by ReCasBackingStore
@@ -283,7 +305,7 @@ class ObjectFetchContext : public RefCounted {
   ObjectFetchContext(const ObjectFetchContext&) = delete;
   ObjectFetchContext& operator=(const ObjectFetchContext&) = delete;
 
-  FetchedSource fetchedSource_{FetchedSource::Unknown};
+  std::atomic<FetchedSource> fetchedSource_{FetchedSource::Unknown};
 
   // Time tracer for instrumentation (may be nullptr)
   std::shared_ptr<MiniTracer> timeTracer_{nullptr};

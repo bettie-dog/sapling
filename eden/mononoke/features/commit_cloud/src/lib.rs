@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -61,6 +62,7 @@ use sql::versions_ops::UpdateVersionArgs;
 use crate::ctx::CommitCloudContext;
 use crate::references::cast_references_data;
 use crate::references::fetch_references;
+use crate::references::resolve_write_head_author_dates;
 use crate::references::update_references_data;
 use crate::references::versions::WorkspaceVersion;
 use crate::sql::ops::Delete;
@@ -220,10 +222,17 @@ impl CommitCloud {
             });
         }
 
+        // Always-on, O(1) phase timing for the (non-no-op) read path. The early
+        // `base_version == latest_version` return above emits nothing so that
+        // fast path stays free. See references::log_get_references_timing.
+        let total_start = Instant::now();
+
         let raw_references_data = fetch_references(&self.ctx, cc_ctx, &self.storage)
             .await
             .map_err(CommitCloudInternalError::Error)?;
+        let fetch_ms = total_start.elapsed().as_millis() as i64;
 
+        let cast_start = Instant::now();
         let references_data = cast_references_data(
             raw_references_data,
             latest_version,
@@ -236,6 +245,10 @@ impl CommitCloud {
         )
         .await
         .map_err(CommitCloudInternalError::Error)?;
+        let cast_ms = cast_start.elapsed().as_millis() as i64;
+
+        let total_ms = total_start.elapsed().as_millis() as i64;
+        references::log_get_references_timing(fetch_ms, cast_ms, total_ms);
 
         Ok(references_data)
     }
@@ -279,6 +292,18 @@ impl CommitCloud {
             .map_err(CommitCloudError::internal_error);
         }
 
+        // Resolved before the transaction opens: deriving inside it would hold a
+        // never-retried XDB transaction across N blobstore round trips.
+        let head_author_dates = resolve_write_head_author_dates(
+            &self.ctx,
+            cc_ctx,
+            self.bonsai_hg_mapping.clone(),
+            self.bonsai_git_mapping.clone(),
+            &self.repo_derived_data,
+            &params.new_heads,
+        )
+        .await;
+
         let mut txn = self
             .storage
             .connections
@@ -296,13 +321,20 @@ impl CommitCloud {
                 .is_none_or(|x| x.is_empty());
 
         if !initiate_workspace {
-            txn = update_references_data(&self.storage, txn, &self.ctx, params.clone(), cc_ctx)
-                .await
-                .context(format!(
-                    "Failed to update references for request {:?}",
-                    params.clone()
-                ))
-                .map_err(CommitCloudInternalError::Error)?;
+            txn = update_references_data(
+                &self.storage,
+                txn,
+                &self.ctx,
+                params.clone(),
+                cc_ctx,
+                &head_author_dates,
+            )
+            .await
+            .context(format!(
+                "Failed to update references for request {:?}",
+                params.clone()
+            ))
+            .map_err(CommitCloudInternalError::Error)?;
         }
 
         let new_version_timestamp = Timestamp::now();
@@ -463,7 +495,7 @@ impl CommitCloud {
                 acl_name: acl_name.clone(),
                 sharing_message: format!(
                     "'share_workspace' succeeded: workspace {} has been already shared under the acl {} {}",
-                    ctx.workspace, &acl_name, &link
+                    ctx.workspace, acl_name, link
                 ),
             });
         }
@@ -501,7 +533,7 @@ impl CommitCloud {
                 acl_name: acl_name.clone(),
                 sharing_message: format!(
                     "'share_workspace' succeeded: workspace {} is now marked for sharing through the ACL {} [{}]",
-                    ctx.workspace, &acl_name, &link
+                    ctx.workspace, acl_name, link
                 ),
             }),
         }
@@ -642,7 +674,7 @@ impl CommitCloud {
             .is_some(),
             format!(
                 "'get_historical_versions' failed: workspace {} does not exist",
-                &cc_ctx.workspace
+                cc_ctx.workspace
             ),
         );
 

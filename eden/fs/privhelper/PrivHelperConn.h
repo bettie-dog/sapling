@@ -59,6 +59,8 @@ class PrivHelperConn {
     REQ_SET_MEMORY_PRIORITY_FOR_PROCESS = 16,
     REQ_GET_NAMESPACE_INFO = 17,
     REQ_SET_FUSE_READ_AHEAD = 18,
+    REQ_SET_RESTART_ARGS = 19,
+    REQ_NOTIFY_CLEAN_SHUTDOWN = 20,
   };
 
   // This structure should never change. If fields need to be added to the
@@ -230,6 +232,26 @@ class PrivHelperConn {
       std::string& mountPath,
       uint32_t& readAheadKb);
 
+  static UnixSocket::Message serializeSetRestartArgsRequest(
+      uint32_t xid,
+      const EdenFsRestartArgs& args);
+  static void parseSetRestartArgsRequest(
+      folly::io::Cursor& cursor,
+      EdenFsRestartArgs& args);
+
+  static UnixSocket::Message serializeNotifyCleanShutdownRequest(
+      uint32_t xid,
+      folly::StringPiece reason);
+  static void parseNotifyCleanShutdownRequest(
+      folly::io::Cursor& cursor,
+      std::string& reason);
+
+  /**
+   * Whether a request type is sent without a registered transaction ID, and so
+   * must not be replied to.
+   */
+  static bool isOneWayRequest(MsgType type);
+
   static void serializeSanityCheckResult(
       folly::io::Appender& appender,
       const SanityCheckResult& result);
@@ -349,6 +371,12 @@ struct formatter<facebook::eden::PrivHelperConn::MsgType>
         break;
       case facebook::eden::PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
         name = "REQ_SET_FUSE_READ_AHEAD";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_SET_RESTART_ARGS:
+        name = "REQ_SET_RESTART_ARGS";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:
+        name = "REQ_NOTIFY_CLEAN_SHUTDOWN";
         break;
       default:
         name = "Unknown PrivHelperConn::MsgType";

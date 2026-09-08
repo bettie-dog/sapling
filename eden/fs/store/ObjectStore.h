@@ -20,6 +20,7 @@
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/RefPtr.h"
 #include "eden/fs/config/ReloadableConfig.h"
+#include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/model/BlobAuxData.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/RootId.h"
@@ -252,15 +253,6 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  /**
-   * Returns the DigestHash hash of the contents of the tree with the given ID.
-   *
-   * DEPRECATED: Use co_getTreeDigestHash instead.
-   */
-  ImmediateFuture<std::optional<Hash32>> getTreeDigestHash(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) const;
-
   folly::coro::now_task<std::optional<Hash32>> co_getTreeDigestHash(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
@@ -358,17 +350,11 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  /**
-   * Returns the Blake3 hash of the contents of the blob with the given ID.
-   */
-  ImmediateFuture<Hash32> getBlobBlake3(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) const;
-
   folly::coro::now_task<Hash20> co_getBlobSha1(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
+  /** Returns the Blake3 hash of the contents of the blob. */
   folly::coro::now_task<Hash32> co_getBlobBlake3(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
@@ -426,6 +412,10 @@ class ObjectStore : public IObjectStore,
    */
   folly::ReadMostlySharedPtr<const EdenConfig> getEdenConfig() const {
     return edenConfig_->getEdenConfig();
+  }
+
+  RestrictedContentMode getRestrictedContentMode() const {
+    return restrictedContentMode_;
   }
 
   /**
@@ -503,11 +493,6 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const BackingStore::GetTreeResult& treeResult) const;
 
-  folly::SemiFuture<BackingStore::GetTreeAuxResult> getTreeAuxDataImpl(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context,
-      folly::stop_watch<std::chrono::milliseconds> watch) const;
-
   folly::coro::now_task<BackingStore::GetTreeAuxResult> co_getTreeAuxDataImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context,
@@ -521,12 +506,7 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  folly::SemiFuture<BackingStore::GetBlobAuxResult> getBlobAuxDataImpl(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context,
-      folly::stop_watch<std::chrono::milliseconds> watch) const;
-
-  folly::coro::now_task<BackingStore::GetBlobAuxResult> co_getBlobAuxDataImpl(
+  folly::coro::now_task<BackingStore::GetBlobAuxResult> getBlobAuxDataImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context,
       folly::stop_watch<std::chrono::milliseconds> watch) const;
@@ -593,6 +573,10 @@ class ObjectStore : public IObjectStore,
   // Is this ObjectStore case sensitive? This only matters for methods returning
   // Tree.
   CaseSensitivity caseSensitive_;
+
+  // Read once at construction: a live mount's listing policy must not flip
+  // under the kernel's caches.
+  const RestrictedContentMode restrictedContentMode_;
 };
 
 } // namespace facebook::eden

@@ -28,6 +28,9 @@ mergemarkers=detailed
 promptecho=True
 ignore.test=$RUNTESTDIR/gitignore
 
+[agent]
+ignore-quiet=False
+
 [devel]
 all-warnings=True
 default-date=0 0
@@ -39,6 +42,12 @@ ipv6={use_ipv6}
 [commands]
 status.relative=True
 update.check=noconflict
+
+[checkout]
+show-destination=false
+
+[commit]
+show-status=false
 
 [config]
 use-rust=True
@@ -92,9 +101,6 @@ min-path-depth=2
 
 [pull]
 buffer-commit-count = 5
-
-[grep]
-use-rust=true
 """
     if use_watchman:
         content += """

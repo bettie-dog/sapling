@@ -8,6 +8,8 @@
 import {Set as ImSet} from 'immutable';
 import type {Repository} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
+import type {RepositoryContext} from 'isl-server/src/serverTypes';
+import type {RunnableOperation, WorktreeInfo} from 'isl/src/types';
 import fs from 'node:fs';
 import {ComparisonType, type Comparison} from 'shared/Comparison';
 import * as vscode from 'vscode';
@@ -15,6 +17,7 @@ import {vscodeCommands} from '../commands';
 import {shouldOpenBeside} from '../config';
 import {encodeDeletedFileUri} from '../DeletedFileContentProvider';
 import {encodeSaplingDiffUri} from '../DiffContentProvider';
+import {Internal} from '../Internal';
 
 // Mock vscode command
 jest.mock('vscode', () => {
@@ -43,6 +46,20 @@ jest.mock('../config', () => ({
   shouldOpenBeside: jest.fn(),
 }));
 const mockShouldOpenBeside = shouldOpenBeside as jest.MockedFunction<typeof shouldOpenBeside>;
+
+// Mock Internal (fb-only) API used for Basecamp tile detection.
+jest.mock('../Internal', () => ({
+  Internal: {
+    isBasecamp: jest.fn(),
+    basecampOpenFolderAsNewTile: jest.fn(),
+  },
+}));
+const mockIsBasecamp = Internal.isBasecamp as jest.MockedFunction<
+  NonNullable<typeof Internal.isBasecamp>
+>;
+const mockBasecampOpenFolderAsNewTile = Internal.basecampOpenFolderAsNewTile as jest.MockedFunction<
+  NonNullable<typeof Internal.basecampOpenFolderAsNewTile>
+>;
 
 describe('open-file-diff', () => {
   const openDiffView = vscodeCommands['sapling.open-file-diff'];
@@ -334,5 +351,459 @@ describe('multi-diff editor resource open commands', () => {
 
       expect(mockShowTextDocument).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('worktree commands', () => {
+  const repoRoot = '/repo/root';
+  const mainWorktree = {path: repoRoot, role: 'main' as const};
+  const siblingWorktree = {
+    path: '/repo/root.worktrees/root_2',
+    role: 'linked' as const,
+    label: 'sibling',
+  };
+  const worktreeInfoFixture: WorktreeInfo = {
+    sharedRoot: repoRoot,
+    worktrees: [mainWorktree, siblingWorktree],
+  };
+
+  const mockRepo = {
+    info: {
+      repoRoot,
+      isEdenFs: true,
+      codeReviewSystem: {type: 'phabricator'},
+    },
+    refreshWorktreeInfo: jest.fn().mockResolvedValue(undefined),
+    getWorktreeInfo: jest.fn().mockReturnValue(worktreeInfoFixture),
+    // Simulate a successful command exit by default, matching what
+    // `Repository.runOrQueueOperation` reports for a real, successful run.
+    runOrQueueOperation: jest.fn(
+      (
+        _ctx: RepositoryContext,
+        operation: RunnableOperation,
+        onProgress: (progress: {
+          id: string;
+          kind: 'exit';
+          exitCode: number;
+          timestamp: number;
+        }) => void,
+      ) => {
+        onProgress({id: operation.id, kind: 'exit', exitCode: 0, timestamp: Date.now()});
+        return Promise.resolve('ran' as const);
+      },
+    ),
+  } as unknown as jest.Mocked<Repository>;
+
+  const mockShowQuickPick = vscode.window.showQuickPick as jest.MockedFunction<
+    typeof vscode.window.showQuickPick
+  >;
+  const mockShowInputBox = vscode.window.showInputBox as jest.MockedFunction<
+    typeof vscode.window.showInputBox
+  >;
+  const mockShowWarningMessage = vscode.window.showWarningMessage as jest.MockedFunction<
+    typeof vscode.window.showWarningMessage
+  >;
+  const mockShowErrorMessage = vscode.window.showErrorMessage as jest.MockedFunction<
+    typeof vscode.window.showErrorMessage
+  >;
+  const mockWithProgress = vscode.window.withProgress as jest.MockedFunction<
+    typeof vscode.window.withProgress
+  >;
+  const ctx = {} as never;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([mockRepo]);
+    mockRepo.getWorktreeInfo.mockReturnValue(worktreeInfoFixture);
+    // Default to "nothing exists on disk" so default destination path computation
+    // in sapling.worktree.add isn't affected unless a test overrides this.
+    mockFsAccess.mockRejectedValue(new Error('ENOENT'));
+    mockIsBasecamp.mockReturnValue(false);
+  });
+
+  describe('sapling.worktree.switch', () => {
+    const switchCommand = vscodeCommands['sapling.worktree.switch'];
+
+    it('opens the selected worktree in a new window', async () => {
+      mockShowQuickPick
+        .mockResolvedValueOnce({
+          label: 'sibling',
+          description: siblingWorktree.path,
+          worktree: siblingWorktree,
+        } as never)
+        .mockResolvedValueOnce({label: 'Open in New Window', forceNewWindow: true} as never);
+
+      await switchCommand.apply(ctx);
+
+      expect(mockExecuteVSCodeCommand).toHaveBeenCalledWith(
+        'vscode.openFolder',
+        vscode.Uri.file(siblingWorktree.path),
+        {forceNewWindow: true},
+      );
+    });
+
+    it('does nothing when the worktree picker is cancelled', async () => {
+      mockShowQuickPick.mockResolvedValueOnce(undefined);
+
+      await switchCommand.apply(ctx);
+
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('opens the selected worktree as a new tile inside Basecamp without asking which window', async () => {
+      mockIsBasecamp.mockReturnValue(true);
+      mockBasecampOpenFolderAsNewTile.mockResolvedValue(true);
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+
+      await switchCommand.apply(ctx);
+
+      // Only the worktree picker is shown; there's no "current window" choice in Basecamp.
+      expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
+      expect(mockBasecampOpenFolderAsNewTile).toHaveBeenCalledWith(
+        siblingWorktree.path,
+        siblingWorktree.label,
+      );
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('shows an error and does not fall back to a new window when Basecamp tile creation fails', async () => {
+      mockIsBasecamp.mockReturnValue(true);
+      mockBasecampOpenFolderAsNewTile.mockResolvedValue(false);
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+
+      await switchCommand.apply(ctx);
+
+      expect(mockBasecampOpenFolderAsNewTile).toHaveBeenCalledWith(
+        siblingWorktree.path,
+        siblingWorktree.label,
+      );
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining(siblingWorktree.path),
+      );
+    });
+  });
+
+  describe('sapling.worktree.add', () => {
+    const addCommand = vscodeCommands['sapling.worktree.add'];
+
+    it('runs AddWorktreeOperation with the expected args', async () => {
+      mockShowInputBox
+        .mockResolvedValueOnce('my-label')
+        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+      mockShowQuickPick.mockResolvedValueOnce(undefined);
+
+      await addCommand.apply(ctx);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: [
+            {type: 'config', key: 'worktree.enabled', value: 'true'},
+            'worktree',
+            'add',
+            '/repo/root.worktrees/root_3',
+            '--label',
+            'my-label',
+          ],
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('skips a default destination that already exists on disk', async () => {
+      mockShowInputBox.mockResolvedValueOnce('my-label').mockResolvedValueOnce(undefined);
+      mockFsAccess.mockImplementation(p =>
+        p === '/repo/root.worktrees/root_3'
+          ? Promise.resolve()
+          : Promise.reject(new Error('ENOENT')),
+      );
+
+      await addCommand.apply(ctx);
+
+      expect(mockShowInputBox).toHaveBeenLastCalledWith(
+        expect.objectContaining({value: '/repo/root.worktrees/root_4'}),
+      );
+    });
+
+    it('shows a progress notification while the worktree is being created', async () => {
+      mockShowInputBox
+        .mockResolvedValueOnce('my-label')
+        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+      mockShowQuickPick.mockResolvedValueOnce(undefined);
+
+      await addCommand.apply(ctx);
+
+      expect(mockWithProgress).toHaveBeenCalledWith(
+        expect.objectContaining({title: 'Creating worktree...'}),
+        expect.anything(),
+      );
+    });
+
+    it('does not prompt to open the worktree when creation fails', async () => {
+      mockShowInputBox
+        .mockResolvedValueOnce('my-label')
+        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+      mockRepo.runOrQueueOperation.mockImplementationOnce(
+        (_ctx: RepositoryContext, operation: RunnableOperation, onProgress) => {
+          onProgress({id: operation.id, kind: 'exit', exitCode: 1, timestamp: Date.now()});
+          return Promise.resolve('ran' as const);
+        },
+      );
+
+      await expect(addCommand.apply(ctx)).rejects.toThrow();
+
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('opens the new worktree as a new tile inside Basecamp, without offering current window', async () => {
+      mockIsBasecamp.mockReturnValue(true);
+      mockBasecampOpenFolderAsNewTile.mockResolvedValue(true);
+      mockShowInputBox
+        .mockResolvedValueOnce('my-label')
+        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'Open in New Tile',
+        action: 'open',
+        forceNewWindow: true,
+      } as never);
+
+      await addCommand.apply(ctx);
+
+      expect(mockShowQuickPick.mock.calls[0][0]).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({label: 'Open in Current Window'})]),
+      );
+      expect(mockBasecampOpenFolderAsNewTile).toHaveBeenCalledWith(
+        '/repo/root.worktrees/root_3',
+        'my-label',
+      );
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('shows an error and does not fall back to a new window when Basecamp tile creation is unavailable', async () => {
+      mockIsBasecamp.mockReturnValue(true);
+      mockBasecampOpenFolderAsNewTile.mockResolvedValue(false);
+      mockShowInputBox
+        .mockResolvedValueOnce('my-label')
+        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'Open in New Tile',
+        action: 'open',
+        forceNewWindow: true,
+      } as never);
+
+      await addCommand.apply(ctx);
+
+      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining('/repo/root.worktrees/root_3'),
+      );
+    });
+  });
+
+  describe('sapling.worktree.remove', () => {
+    const removeCommand = vscodeCommands['sapling.worktree.remove'];
+
+    it('excludes the main worktree from the picker and requires confirmation', async () => {
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+      mockShowWarningMessage.mockResolvedValueOnce('Remove' as never);
+
+      await removeCommand.apply(ctx);
+
+      expect(mockShowQuickPick.mock.calls[0][0]).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({worktree: mainWorktree})]),
+      );
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: [
+            {type: 'config', key: 'worktree.enabled', value: 'true'},
+            'worktree',
+            'remove',
+            siblingWorktree.path,
+          ],
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('shows a progress notification while the worktree is being removed', async () => {
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+      mockShowWarningMessage.mockResolvedValueOnce('Remove' as never);
+
+      await removeCommand.apply(ctx);
+
+      expect(mockWithProgress).toHaveBeenCalledWith(
+        expect.objectContaining({title: 'Removing worktree...'}),
+        expect.anything(),
+      );
+    });
+
+    it('does not remove when the confirmation is declined', async () => {
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+      mockShowWarningMessage.mockResolvedValueOnce('Cancel' as never);
+
+      await removeCommand.apply(ctx);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sapling.worktree.rename', () => {
+    const renameCommand = vscodeCommands['sapling.worktree.rename'];
+
+    it('removes the label when an empty label is submitted', async () => {
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+      mockShowInputBox.mockResolvedValueOnce('');
+
+      await renameCommand.apply(ctx);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: [
+            {type: 'config', key: 'worktree.enabled', value: 'true'},
+            'worktree',
+            'label',
+            siblingWorktree.path,
+            '--remove',
+          ],
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('shows a progress notification while the worktree is being renamed', async () => {
+      mockShowQuickPick.mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never);
+      mockShowInputBox.mockResolvedValueOnce('');
+
+      await renameCommand.apply(ctx);
+
+      expect(mockWithProgress).toHaveBeenCalledWith(
+        expect.objectContaining({title: 'Renaming worktree...'}),
+        expect.anything(),
+      );
+    });
+  });
+
+  it('shows an error for non-EdenFS repos', async () => {
+    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([
+      {
+        ...mockRepo,
+        info: {...mockRepo.info, isEdenFs: false},
+      } as unknown as Repository,
+    ]);
+
+    await vscodeCommands['sapling.worktree.switch'].apply(ctx);
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      'Worktrees require EdenFS. This repository is not backed by EdenFS',
+    );
+    expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+  });
+
+  it('shows an error when worktree info is unavailable (GK off)', async () => {
+    mockRepo.getWorktreeInfo.mockReturnValueOnce(undefined);
+
+    await vscodeCommands['sapling.worktree.switch'].apply(ctx);
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      'Worktrees are not available for this repository',
+    );
+    expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+  });
+
+  it('shows an error when no repositories are known', async () => {
+    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([]);
+
+    await vscodeCommands['sapling.worktree.switch'].apply(ctx);
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      'No Sapling repository found in the current workspace',
+    );
+    expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+  });
+
+  it('prompts to pick a repository when more than one is known', async () => {
+    const otherRepo = {
+      ...mockRepo,
+      info: {...mockRepo.info, repoRoot: '/other/repo'},
+    } as unknown as Repository;
+    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([mockRepo, otherRepo]);
+    mockShowQuickPick
+      .mockResolvedValueOnce({label: 'root', description: repoRoot, repo: mockRepo} as never)
+      .mockResolvedValueOnce({
+        label: 'sibling',
+        description: siblingWorktree.path,
+        worktree: siblingWorktree,
+      } as never)
+      .mockResolvedValueOnce({label: 'Open in New Window', forceNewWindow: true} as never);
+
+    await vscodeCommands['sapling.worktree.switch'].apply(ctx);
+
+    expect(mockShowQuickPick.mock.calls[0][0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({repo: mockRepo}),
+        expect.objectContaining({repo: otherRepo}),
+      ]),
+    );
+    expect(mockExecuteVSCodeCommand).toHaveBeenCalledWith(
+      'vscode.openFolder',
+      vscode.Uri.file(siblingWorktree.path),
+      {forceNewWindow: true},
+    );
   });
 });

@@ -1,9 +1,26 @@
 # Changelog
 
-## 0.1.70
+## Unreleased
 
 - Reduced fetching frequency for better performance
 - Go to time in download commit menu
+- Remember the last selected ISL workspace folder within a window session
+- Fix ISL showing `cwd webview-panel/... does not exist` when opened from the editor title bar while a webview tab was active
+- Fix the cwd quick-switch dropdown on Windows and Linux
+- Label Enter and other special keys properly in keyboard shortcut hints
+- Improve performance by skipping re-renders when refetched data is unchanged
+- Don't dismiss tooltips on scroll while focus is inside them
+- Improve performance of the CI signal count on diff badges
+  - Only fetch a count for diffs whose badge can display one
+  - Batch every badge's count into a single query, and cache it per diff version
+  - Query InternGraph in-process instead of spawning a subprocess per query
+- Re-filter the commit graph once typing stops, rather than on every keystroke
+- Debounce typeahead suggestion fetches, so typing a reviewer or tag no longer fetches per keystroke
+- Fix a diff's review status going stale after selecting a different commit
+- Add command palette entries for worktree operations
+- Show the Devmate "Fix signals" button for diffs with only warning-level signals, not just failures
+- Fix background polling accumulating after changing workspace folders
+- Select the existing query when the commit filter opens, so typing replaces it
 
 ## 0.1.69
 

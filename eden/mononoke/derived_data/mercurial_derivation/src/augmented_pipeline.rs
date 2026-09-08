@@ -13,6 +13,7 @@ use anyhow::Error;
 use anyhow::Result;
 use anyhow::anyhow;
 use async_trait::async_trait;
+use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use context::CoreContext;
 use derived_data::prefetch_content_metadata;
@@ -33,6 +34,7 @@ use mercurial_types::sharded_augmented_manifest::HgAugmentedFileLeafNode;
 use mononoke_types::BlobstoreBytes;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::FileChange;
 use mononoke_types::PipelineDerivableVariant;
 use mononoke_types::ThriftConvert;
 use mononoke_types::acl_manifest::AclManifest;
@@ -40,27 +42,151 @@ use mononoke_types::acl_manifest::AclManifestRestriction;
 use mononoke_types::path::MPath;
 use mononoke_types::typed_hash::AclManifestId;
 
+use crate::augmented_manifest_v2::RootHgAugmentedManifestV2Id;
+use crate::augmented_manifest_v2::fetch_augmented_roots_with_fallback;
+use crate::derive_hg_augmented_manifest::build_augmented_subtree_replacements;
+use crate::derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai;
 use crate::derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents_staged;
+use crate::derive_hg_augmented_manifest::finalize_augmented_manifest_root;
+use crate::derive_hg_augmented_manifest::subtree_copy_source_changesets;
 use crate::mapping::MappedHgChangesetId;
 use crate::mapping::RootHgAugmentedManifestId;
 use crate::mapping::format_key;
 
-fn stage_blobstore_key(stage_path: &MPath, key_prefix: &str, cs_id: ChangesetId) -> String {
+#[derive(Clone, Copy)]
+enum AugmentedManifestPipelineKind {
+    V1,
+    V2,
+}
+
+impl AugmentedManifestPipelineKind {
+    fn stage_blobstore_prefix(self) -> &'static str {
+        match self {
+            Self::V1 => "derived_hgaugmentedmanifest_stage",
+            Self::V2 => "derived_hgaugmentedmanifest_v2_stage",
+        }
+    }
+
+    fn derivation_name(self) -> &'static str {
+        match self {
+            Self::V1 => "hg_augmented_manifests",
+            Self::V2 => "hg_augmented_manifests_v2",
+        }
+    }
+}
+
+fn stage_blobstore_key(
+    pipeline_kind: AugmentedManifestPipelineKind,
+    stage_path: &MPath,
+    key_prefix: &str,
+    cs_id: ChangesetId,
+) -> String {
     format!(
-        "derived_hgaugmentedmanifest_stage.{}.{}{}",
+        "{}.{}.{}{}",
+        pipeline_kind.stage_blobstore_prefix(),
         stage_path.get_path_hash().to_hex(),
         key_prefix,
         cs_id,
     )
 }
 
-fn use_normal_mapping(stage_path: &MPath) -> bool {
+fn use_normal_mapping(pipeline_kind: AugmentedManifestPipelineKind, stage_path: &MPath) -> bool {
     stage_path.is_root()
         && justknobs::eval(
             "scm/mononoke:derived_data_pipeline_terminal_stage_prod_mapping",
             None,
-            Some("hg_augmented_manifests"),
+            Some(pipeline_kind.derivation_name()),
         )
+}
+
+async fn fetch_v2_source_augmented_roots(
+    ctx: &CoreContext,
+    derivation: &DerivationContext,
+    source_csids: HashSet<ChangesetId>,
+) -> Result<HashMap<ChangesetId, HgAugmentedManifestId>> {
+    if source_csids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let source_csids: Vec<_> = source_csids.into_iter().collect();
+    let pipeline_outputs = RootHgAugmentedManifestV2Id::fetch_stage_outputs(
+        ctx,
+        derivation,
+        &StageId::Manifest(MPath::ROOT),
+        source_csids.clone(),
+    )
+    .await?;
+    let roots = pipeline_outputs
+        .into_iter()
+        .map(|(csid, output)| match output {
+            Some(HgAugmentedManifestEntry::DirectoryNode(dir)) => {
+                Ok((csid, HgAugmentedManifestId::new(dir.treenode)))
+            }
+            output => Err(anyhow!(
+                "V2 terminal stage output for copy source {csid} should be a directory, got {output:?}",
+            )),
+        })
+        .collect::<Result<_>>()?;
+    fetch_augmented_roots_with_fallback(ctx, derivation, source_csids, roots, "V2 copy source")
+        .await
+}
+
+async fn store_intermediate_stage_output(
+    ctx: &CoreContext,
+    blobstore: &dyn KeyedBlobstore,
+    pipeline_kind: AugmentedManifestPipelineKind,
+    stage_path: &MPath,
+    key_prefix: &str,
+    cs_id: ChangesetId,
+    output: Option<HgAugmentedManifestEntry>,
+) -> Result<()> {
+    let key = stage_blobstore_key(pipeline_kind, stage_path, key_prefix, cs_id);
+    let thrift_output = match output {
+        Some(HgAugmentedManifestEntry::DirectoryNode(dir)) => {
+            mercurial_thrift::HgAugmentedManifestStageOutput::directory(dir.into_thrift())
+        }
+        Some(HgAugmentedManifestEntry::FileNode(leaf)) => {
+            mercurial_thrift::HgAugmentedManifestStageOutput::file(leaf.into_thrift())
+        }
+        None => mercurial_thrift::HgAugmentedManifestStageOutput::empty(
+            mercurial_thrift::HgAugmentedManifestStageOutputEmpty {},
+        ),
+    };
+    let bytes = compact_protocol::serialize(&thrift_output);
+    blobstore
+        .put(ctx, key, BlobstoreBytes::from_bytes(bytes))
+        .await
+}
+
+async fn fetch_intermediate_stage_output(
+    ctx: &CoreContext,
+    blobstore: &dyn KeyedBlobstore,
+    pipeline_kind: AugmentedManifestPipelineKind,
+    stage_path: &MPath,
+    key_prefix: &str,
+    cs_id: ChangesetId,
+) -> Result<Option<Option<HgAugmentedManifestEntry>>> {
+    let key = stage_blobstore_key(pipeline_kind, stage_path, key_prefix, cs_id);
+    let Some(blob_data) = blobstore.get(ctx, &key).await? else {
+        return Ok(None);
+    };
+    let thrift_output: mercurial_thrift::HgAugmentedManifestStageOutput =
+        compact_protocol::deserialize(blob_data.into_raw_bytes())?;
+    let output = match thrift_output {
+        mercurial_thrift::HgAugmentedManifestStageOutput::directory(dir) => Some(
+            HgAugmentedManifestEntry::DirectoryNode(HgAugmentedDirectoryNode::from_thrift(dir)?),
+        ),
+        mercurial_thrift::HgAugmentedManifestStageOutput::file(leaf) => Some(
+            HgAugmentedManifestEntry::FileNode(HgAugmentedFileLeafNode::from_thrift(leaf)?),
+        ),
+        mercurial_thrift::HgAugmentedManifestStageOutput::empty(_) => None,
+        mercurial_thrift::HgAugmentedManifestStageOutput::UnknownField(x) => {
+            return Err(anyhow!(
+                "unknown HgAugmentedManifestStageOutput variant {x} for {cs_id}"
+            ));
+        }
+    };
+    Ok(Some(output))
 }
 
 /// Recover the augmented subtree id from a parent's stage output. A parent stage
@@ -292,7 +418,8 @@ impl PipelineDerivable for RootHgAugmentedManifestId {
         let StageId::Manifest(stage_path) = stage else {
             anyhow::bail!("{} has no finalize stage", Self::NAME);
         };
-        let use_normal_mapping = use_normal_mapping(stage_path);
+        let pipeline_kind = AugmentedManifestPipelineKind::V1;
+        let use_normal_mapping = use_normal_mapping(pipeline_kind, stage_path);
         let key_prefix = derivation.mapping_key_prefix::<RootHgAugmentedManifestId>();
 
         stream::iter(outputs.into_iter().map(|(cs_id, output)| async move {
@@ -313,25 +440,16 @@ impl PipelineDerivable for RootHgAugmentedManifestId {
                     )
                     .await
             } else {
-                let key = stage_blobstore_key(stage_path, key_prefix, cs_id);
-                let thrift_output = match output {
-                    Some(HgAugmentedManifestEntry::DirectoryNode(dir)) => {
-                        mercurial_thrift::HgAugmentedManifestStageOutput::directory(
-                            dir.into_thrift(),
-                        )
-                    }
-                    Some(HgAugmentedManifestEntry::FileNode(leaf)) => {
-                        mercurial_thrift::HgAugmentedManifestStageOutput::file(leaf.into_thrift())
-                    }
-                    None => mercurial_thrift::HgAugmentedManifestStageOutput::empty(
-                        mercurial_thrift::HgAugmentedManifestStageOutputEmpty {},
-                    ),
-                };
-                let bytes = compact_protocol::serialize(&thrift_output);
-                derivation
-                    .blobstore()
-                    .put(ctx, key, BlobstoreBytes::from_bytes(bytes))
-                    .await
+                store_intermediate_stage_output(
+                    ctx,
+                    derivation.blobstore().as_ref(),
+                    pipeline_kind,
+                    stage_path,
+                    key_prefix,
+                    cs_id,
+                    output,
+                )
+                .await
             }
         }))
         .buffer_unordered(100)
@@ -349,7 +467,8 @@ impl PipelineDerivable for RootHgAugmentedManifestId {
         let StageId::Manifest(stage_path) = stage else {
             anyhow::bail!("{} has no finalize stage", Self::NAME);
         };
-        let use_normal_mapping = use_normal_mapping(stage_path);
+        let pipeline_kind = AugmentedManifestPipelineKind::V1;
+        let use_normal_mapping = use_normal_mapping(pipeline_kind, stage_path);
         let key_prefix = derivation.mapping_key_prefix::<RootHgAugmentedManifestId>();
 
         let results = stream::iter(cs_ids.into_iter().map(|cs_id| async move {
@@ -368,29 +487,17 @@ impl PipelineDerivable for RootHgAugmentedManifestId {
                 .await?;
                 Ok(Some((cs_id, entry)))
             } else {
-                let key = stage_blobstore_key(stage_path, key_prefix, cs_id);
-                let Some(blob_data) = derivation.blobstore().get(ctx, &key).await? else {
-                    return Ok::<_, Error>(None);
-                };
-                let thrift_output: mercurial_thrift::HgAugmentedManifestStageOutput =
-                    compact_protocol::deserialize(blob_data.into_raw_bytes())?;
-                let output = match thrift_output {
-                    mercurial_thrift::HgAugmentedManifestStageOutput::directory(dir) => {
-                        Some(HgAugmentedManifestEntry::DirectoryNode(
-                            HgAugmentedDirectoryNode::from_thrift(dir)?,
-                        ))
-                    }
-                    mercurial_thrift::HgAugmentedManifestStageOutput::file(leaf) => {
-                        Some(HgAugmentedManifestEntry::FileNode(
-                            HgAugmentedFileLeafNode::from_thrift(leaf)?,
-                        ))
-                    }
-                    mercurial_thrift::HgAugmentedManifestStageOutput::empty(_) => None,
-                    mercurial_thrift::HgAugmentedManifestStageOutput::UnknownField(x) => {
-                        return Err(anyhow!(
-                            "unknown HgAugmentedManifestStageOutput variant {x} for {cs_id}"
-                        ));
-                    }
+                let Some(output) = fetch_intermediate_stage_output(
+                    ctx,
+                    derivation.blobstore().as_ref(),
+                    pipeline_kind,
+                    stage_path,
+                    key_prefix,
+                    cs_id,
+                )
+                .await?
+                else {
+                    return Ok(None);
                 };
                 Ok(Some((cs_id, output)))
             }
@@ -400,5 +507,444 @@ impl PipelineDerivable for RootHgAugmentedManifestId {
         .try_collect::<HashMap<_, _>>()
         .await?;
         Ok(results)
+    }
+}
+
+#[async_trait]
+impl PipelineDerivable for RootHgAugmentedManifestV2Id {
+    const PIPELINE_DERIVABLE_VARIANT: PipelineDerivableVariant =
+        PipelineDerivableVariant::HgAugmentedManifestsV2;
+
+    const HAS_FINALIZE: bool = false;
+
+    type StageOutput = Option<HgAugmentedManifestEntry>;
+
+    async fn derive_stage_batch(
+        ctx: &CoreContext,
+        derivation: &DerivationContext,
+        bonsais: Vec<BonsaiChangeset>,
+        payload: &DerivationStagePayload,
+        parents: HashMap<ChangesetId, Self::StageOutput>,
+        dependency_outputs: HashMap<ChangesetId, HashMap<MPath, Self::StageOutput>>,
+    ) -> Result<HashMap<ChangesetId, Self::StageOutput>> {
+        let DerivationStagePayload::Manifest(payload) = payload else {
+            anyhow::bail!("{} has no finalize derive", Self::NAME);
+        };
+        let stage_path = &payload.path;
+
+        let csids = bonsais
+            .iter()
+            .map(BonsaiChangeset::get_changeset_id)
+            .collect();
+
+        let acl_outputs = RootAclManifestId::fetch_stage_outputs(
+            ctx,
+            derivation,
+            &StageId::Manifest(stage_path.clone()),
+            csids,
+        )
+        .await?;
+
+        let mut results: HashMap<ChangesetId, Self::StageOutput> = HashMap::new();
+        for bonsai in &bonsais {
+            let cs_id = bonsai.get_changeset_id();
+
+            let parent_entries = bonsai
+                .parents()
+                .map(|parent_csid| {
+                    results
+                        .get(&parent_csid)
+                        .or_else(|| parents.get(&parent_csid))
+                        .cloned()
+                        .ok_or_else(|| anyhow!("missing stage output for parent {parent_csid}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let root_parent_entries = stage_path.is_root().then(|| parent_entries.clone());
+
+            let known_entries = dependency_outputs.get(&cs_id).cloned().unwrap_or_default();
+            let acl_overlay = normalize_acl_stage(acl_outputs.get(&cs_id), cs_id, stage_path)?;
+
+            let file_changes = bonsai
+                .file_changes()
+                .filter(|(path, _)| stage_path.is_prefix_of(*path))
+                .map(|(path, file_change)| {
+                    Ok((
+                        path.clone(),
+                        match file_change {
+                            FileChange::Change(change) => Some(change.clone()),
+                            FileChange::Deletion => None,
+                            FileChange::UntrackedChange(_) | FileChange::UntrackedDeletion => {
+                                anyhow::bail!("Can't derive manifest for snapshot")
+                            }
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let content_ids = file_changes
+                .iter()
+                .filter_map(|(_, change)| change.as_ref().map(|change| change.content_id()))
+                .collect::<HashSet<_>>();
+
+            let content_metadata_fut =
+                prefetch_content_metadata(ctx, derivation.blobstore(), content_ids);
+            let mut parent_csids = bonsai.parents();
+            let parent_bonsai_csids = (parent_csids.next(), parent_csids.next());
+            let is_hg_parent = |copy_csid: &ChangesetId| {
+                parent_bonsai_csids.0.as_ref() == Some(copy_csid)
+                    || parent_bonsai_csids.1.as_ref() == Some(copy_csid)
+            };
+            let source_csids: HashSet<_> = file_changes
+                .iter()
+                .filter_map(|(_, change)| change.as_ref()?.copy_from())
+                .filter(|(copy_path, copy_csid)| {
+                    !stage_path.is_prefix_of(copy_path) && is_hg_parent(copy_csid)
+                })
+                .map(|(_, copy_csid)| *copy_csid)
+                .chain(subtree_copy_source_changesets(bonsai, stage_path))
+                .collect();
+            let source_aug_roots =
+                fetch_v2_source_augmented_roots(ctx, derivation, source_csids).await?;
+            let subtree_replacements_fut = build_augmented_subtree_replacements(
+                ctx,
+                derivation.blobstore(),
+                bonsai,
+                stage_path,
+                &source_aug_roots,
+            );
+            let (content_metadata, subtree_replacements) =
+                futures::future::try_join(content_metadata_fut, subtree_replacements_fut).await?;
+
+            let output = derive_augmented_manifest_entry_from_bonsai(
+                ctx,
+                derivation.blobstore(),
+                stage_path.clone(),
+                parent_entries,
+                known_entries,
+                file_changes,
+                subtree_replacements,
+                parent_bonsai_csids,
+                &source_aug_roots,
+                &content_metadata,
+                &derivation.restricted_paths(),
+                acl_overlay,
+            )
+            .await?;
+            let output = match root_parent_entries {
+                Some(root_parent_entries) => Some(HgAugmentedManifestEntry::DirectoryNode(
+                    finalize_augmented_manifest_root(
+                        ctx,
+                        derivation.blobstore(),
+                        output,
+                        root_parent_entries,
+                        &derivation.restricted_paths(),
+                        acl_overlay,
+                    )
+                    .await?,
+                )),
+                None => output,
+            };
+            results.insert(cs_id, output);
+        }
+
+        Ok(results)
+    }
+
+    async fn extract_stage_output_from_derived(
+        ctx: &CoreContext,
+        derivation: &DerivationContext,
+        derived: &RootHgAugmentedManifestV2Id,
+        stage: &StageId,
+    ) -> Result<Self::StageOutput> {
+        let StageId::Manifest(stage_path) = stage else {
+            anyhow::bail!("{} has no finalize stage", Self::NAME);
+        };
+        extract_stage_entry(
+            ctx,
+            derivation,
+            derived.hg_augmented_manifest_id(),
+            stage_path,
+        )
+        .await
+    }
+
+    async fn store_stage_outputs(
+        ctx: &CoreContext,
+        derivation: &DerivationContext,
+        stage: &StageId,
+        outputs: HashMap<ChangesetId, Self::StageOutput>,
+    ) -> Result<()> {
+        let StageId::Manifest(stage_path) = stage else {
+            anyhow::bail!("{} has no finalize stage", Self::NAME);
+        };
+        let pipeline_kind = AugmentedManifestPipelineKind::V2;
+        let use_normal_mapping = use_normal_mapping(pipeline_kind, stage_path);
+        let key_prefix = derivation.mapping_key_prefix::<RootHgAugmentedManifestV2Id>();
+
+        stream::iter(outputs.into_iter().map(|(cs_id, output)| async move {
+            if use_normal_mapping {
+                let Some(HgAugmentedManifestEntry::DirectoryNode(dir)) = output else {
+                    return Err(anyhow!(
+                        "terminal stage output for {cs_id} should be a directory, got {output:?}",
+                    ));
+                };
+                derivation
+                    .blobstore()
+                    .put(
+                        ctx,
+                        format_key(derivation, cs_id),
+                        RootHgAugmentedManifestId::new(HgAugmentedManifestId::new(dir.treenode))
+                            .into(),
+                    )
+                    .await
+            } else {
+                store_intermediate_stage_output(
+                    ctx,
+                    derivation.blobstore().as_ref(),
+                    pipeline_kind,
+                    stage_path,
+                    key_prefix,
+                    cs_id,
+                    output,
+                )
+                .await
+            }
+        }))
+        .buffer_unordered(100)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(())
+    }
+
+    async fn fetch_stage_outputs(
+        ctx: &CoreContext,
+        derivation: &DerivationContext,
+        stage: &StageId,
+        cs_ids: Vec<ChangesetId>,
+    ) -> Result<HashMap<ChangesetId, Self::StageOutput>> {
+        let StageId::Manifest(stage_path) = stage else {
+            anyhow::bail!("{} has no finalize stage", Self::NAME);
+        };
+        let pipeline_kind = AugmentedManifestPipelineKind::V2;
+        let use_normal_mapping = use_normal_mapping(pipeline_kind, stage_path);
+        let key_prefix = derivation.mapping_key_prefix::<RootHgAugmentedManifestV2Id>();
+
+        stream::iter(cs_ids.into_iter().map(|cs_id| async move {
+            if use_normal_mapping {
+                let Some(blob_data) = derivation
+                    .blobstore()
+                    .get(ctx, &format_key(derivation, cs_id))
+                    .await?
+                else {
+                    return Ok::<_, Error>(None);
+                };
+                let root: RootHgAugmentedManifestId = blob_data.try_into()?;
+                let entry = extract_stage_entry(
+                    ctx,
+                    derivation,
+                    root.hg_augmented_manifest_id(),
+                    stage_path,
+                )
+                .await?;
+                Ok(Some((cs_id, entry)))
+            } else {
+                let Some(output) = fetch_intermediate_stage_output(
+                    ctx,
+                    derivation.blobstore().as_ref(),
+                    pipeline_kind,
+                    stage_path,
+                    key_prefix,
+                    cs_id,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((cs_id, output)))
+            }
+        }))
+        .buffer_unordered(100)
+        .try_filter_map(|output| async move { Ok(output) })
+        .try_collect()
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use fbinit::FacebookInit;
+    use mercurial_types::HgNodeHash;
+    use mononoke_macros::mononoke;
+    use mononoke_types::FileType;
+    use mononoke_types::hash::Blake2;
+    use mononoke_types::hash::Blake3;
+    use mononoke_types::hash::Sha1 as ContentSha1;
+    use mononoke_types::sha1_hash::Sha1 as NodeSha1;
+    use repo_blobstore::RepoBlobstore;
+    use repo_blobstore::RepoBlobstoreRef;
+
+    use super::*;
+
+    #[facet::container]
+    #[derive(Clone)]
+    struct TestRepo(RepoBlobstore);
+
+    fn directory_output(byte: u8) -> Option<HgAugmentedManifestEntry> {
+        Some(HgAugmentedManifestEntry::DirectoryNode(
+            HgAugmentedDirectoryNode {
+                treenode: HgNodeHash::new(NodeSha1::from_byte_array([byte; 20])),
+                augmented_manifest_id: Blake3::from_byte_array([byte; 32]),
+                augmented_manifest_size: u64::from(byte),
+                acl_manifest_directory_id: None,
+            },
+        ))
+    }
+
+    fn file_output(byte: u8) -> Option<HgAugmentedManifestEntry> {
+        Some(HgAugmentedManifestEntry::FileNode(
+            HgAugmentedFileLeafNode {
+                file_type: FileType::Regular,
+                filenode: HgNodeHash::new(NodeSha1::from_byte_array([byte; 20])),
+                content_blake3: Blake3::from_byte_array([byte; 32]),
+                content_sha1: ContentSha1::from_byte_array([byte; 20]),
+                total_size: u64::from(byte),
+                file_header_metadata: None,
+            },
+        ))
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_augmented_manifest_stage_storage_separates_v1_and_v2(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        // Given: V1 and V2 produce directory, file, and absent outputs for the
+        // same stage paths and changesets.
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let stage_path = MPath::new("src")?;
+        let key_prefix = "test-prefix.";
+        let cases = [
+            (
+                ChangesetId::new(Blake2::from_byte_array([1; 32])),
+                directory_output(1),
+                file_output(2),
+            ),
+            (
+                ChangesetId::new(Blake2::from_byte_array([2; 32])),
+                file_output(3),
+                None,
+            ),
+            (
+                ChangesetId::new(Blake2::from_byte_array([3; 32])),
+                None,
+                directory_output(4),
+            ),
+        ];
+
+        // When: both versions store their outputs under the same path and
+        // changeset identities.
+        for (cs_id, v1_output, v2_output) in &cases {
+            store_intermediate_stage_output(
+                &ctx,
+                repo.repo_blobstore(),
+                AugmentedManifestPipelineKind::V1,
+                &stage_path,
+                key_prefix,
+                *cs_id,
+                v1_output.clone(),
+            )
+            .await?;
+            store_intermediate_stage_output(
+                &ctx,
+                repo.repo_blobstore(),
+                AugmentedManifestPipelineKind::V2,
+                &stage_path,
+                key_prefix,
+                *cs_id,
+                v2_output.clone(),
+            )
+            .await?;
+        }
+
+        // Then: each version reads only its own output, including stored
+        // absence, and the V1 key remains byte-for-byte compatible.
+        for (cs_id, expected_v1, expected_v2) in &cases {
+            let actual_v1 = fetch_intermediate_stage_output(
+                &ctx,
+                repo.repo_blobstore(),
+                AugmentedManifestPipelineKind::V1,
+                &stage_path,
+                key_prefix,
+                *cs_id,
+            )
+            .await?
+            .context("V1 stage output should be stored")?;
+            let actual_v2 = fetch_intermediate_stage_output(
+                &ctx,
+                repo.repo_blobstore(),
+                AugmentedManifestPipelineKind::V2,
+                &stage_path,
+                key_prefix,
+                *cs_id,
+            )
+            .await?
+            .context("V2 stage output should be stored")?;
+            assert_eq!(&actual_v1, expected_v1);
+            assert_eq!(&actual_v2, expected_v2);
+        }
+        assert_eq!(
+            stage_blobstore_key(
+                AugmentedManifestPipelineKind::V1,
+                &stage_path,
+                key_prefix,
+                cases[0].0,
+            ),
+            format!(
+                "derived_hgaugmentedmanifest_stage.{}.{}{}",
+                stage_path.get_path_hash().to_hex(),
+                key_prefix,
+                cases[0].0,
+            ),
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_v1_augmented_manifest_stage_output_does_not_satisfy_v2_fetch(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        // Given: only V1 has stored an output for this stage and changeset.
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+        let stage_path = MPath::new("src")?;
+        let key_prefix = "test-prefix.";
+        let cs_id = ChangesetId::new(Blake2::from_byte_array([5; 32]));
+        store_intermediate_stage_output(
+            &ctx,
+            repo.repo_blobstore(),
+            AugmentedManifestPipelineKind::V1,
+            &stage_path,
+            key_prefix,
+            cs_id,
+            directory_output(5),
+        )
+        .await?;
+
+        // When: V2 looks for its checkpoint at the same stage and changeset.
+        let v2_output = fetch_intermediate_stage_output(
+            &ctx,
+            repo.repo_blobstore(),
+            AugmentedManifestPipelineKind::V2,
+            &stage_path,
+            key_prefix,
+            cs_id,
+        )
+        .await?;
+
+        // Then: the V1 checkpoint does not satisfy the V2 fetch.
+        assert_eq!(v2_output, None);
+
+        Ok(())
     }
 }

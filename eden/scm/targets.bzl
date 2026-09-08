@@ -20,7 +20,6 @@ _RUST_DEP_OVERRIDES = {
         "features": [],
         "git": None,
         "rev": None,
-        "version": "0.23.3",
     },
 }
 
@@ -69,28 +68,6 @@ def _apply_autocargo_dep_overrides(autocargo, dep_kind, overrides):
     for crate, override in overrides.items():
         _set_autocargo_dep_override(autocargo, dep_kind, crate, override)
 
-    if "termwiz" in overrides:
-        # D105187099 switched fbsource termwiz to the wezterm git workspace.
-        # Buck's wezterm-dynamic target enables std, but autocargo does not inherit that:
-        #
-        #     error[E0599]: no associated function or constant named `from_dynamic`
-        #     found for struct `HashMap<K, V, S, A>` in the current scope
-        #     --> termwiz-0.23.3/src/hyperlink.rs:19:39
-        #
-        # The missing HashMap impl is gated behind wezterm-dynamic/std. Work around it for now.
-        # Revisit if fbsource monorepo switches to published termwiz.
-        _set_autocargo_dep_override(
-            autocargo,
-            dep_kind,
-            "wezterm-dynamic",
-            {
-                "default-features": False,
-                "features": ["std"],
-                "version": "0.2.1",
-            },
-        )
-        _add_extra_buck_dependency(autocargo, dep_kind, "fbsource//third-party/rust/vendor/wezterm-dynamic:0.2")
-
 def _set_autocargo_dep_override(autocargo, dep_kind, crate, override):
     dep = _set_default(
         autocargo,
@@ -102,12 +79,6 @@ def _set_autocargo_dep_override(autocargo, dep_kind, crate, override):
     for key, value in override.items():
         dep.setdefault(key, value)
 
-def _add_extra_buck_dependency(autocargo, dep_kind, dep):
-    extra = _set_default(autocargo, "cargo_toml_config", "extra_buck_dependencies")
-    deps = extra.get(dep_kind, [])
-    if dep not in deps:
-        extra[dep_kind] = deps + [dep]
-
 def sl_rust_library(**kwargs):
     autocargo = _autocargo_overrides(**kwargs)
     if autocargo != None:
@@ -116,11 +87,22 @@ def sl_rust_library(**kwargs):
     kwargs["rustc_flags"] = (kwargs.get("rustc_flags") or []) + ["-Funstable-features"]
     return rust_library(**kwargs)
 
-def sl_rust_binary(**kwargs):
+def sl_rust_binary(embeds_python = False, **kwargs):
     autocargo = _autocargo_overrides(**kwargs)
     if autocargo != None:
         kwargs["autocargo"] = autocargo
+    if embeds_python:
+        kwargs["deps"] = _with_libpython(kwargs.get("deps"))
     return rust_binary(**kwargs)
+
+# An embedder starts its own interpreter, so unlike an extension module it has no
+# host to borrow the Python C API from and needs the real libpython. The
+# `python3-sys` fixup deliberately supplies only `:python`, which on macOS resolves
+# the C API at extension-load time; embedders opt in to the real dylib here.
+# Concatenate rather than `list()`: `deps` may be a `select()`.
+def _with_libpython(deps):
+    libpython = ["fbsource//third-party/python:python-for-embedding"]
+    return libpython if deps == None else deps + libpython
 
 def exec_compatible_with_target():
     """Intended to be used by genrule's exec_compatible_with to force
@@ -182,6 +164,13 @@ def rust_python_library(deps = None, include_python_sys = False, include_cpython
     if pyo3:
         deps3.append("fbsource//third-party/rust:pyo3")
 
+    # The generated `-unittest` binary runs standalone, with no interpreter to
+    # borrow the Python C API from, so it embeds CPython and needs the real
+    # libpython. Scoping this to `test_deps` keeps the library itself -- and the
+    # extensions built from it -- on the extension-safe `:python`.
+    if include_cpython or include_python_sys or pyo3:
+        kwargs3["test_deps"] = _with_libpython(kwargs3.get("test_deps"))
+
     kwargs3["name"] = kwargs["name"]
     kwargs3["crate"] = kwargs["name"].replace("-", "_")
     kwargs3["deps"] = deps3
@@ -212,8 +201,17 @@ def fetch_as_eden():
     return read_bool("sl", "fetch_as_eden", False)
 
 def sl_binary(name, extra_deps = [], extra_features = [], **kwargs):
+    kwargs.setdefault(
+        "allocator",
+        select({
+            "DEFAULT": "malloc",
+            "ovr_config//os:linux": "jemalloc",
+            "ovr_config//os:macos": "jemalloc",
+        }),
+    )
     sl_rust_binary(
         name = name,
+        embeds_python = True,
         srcs = glob(["exec/hgmain/src/**/*.rs"]),
         features = [
             "fb",

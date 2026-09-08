@@ -119,6 +119,10 @@
 }
 
 .commit-row-selected {
+  --commit-actions-background:
+    linear-gradient(var(--selected-commit-background), var(--selected-commit-background)),
+    var(--background);
+
   background-color: var(--selected-commit-background);
 }
 
@@ -143,8 +147,12 @@
 .commit-tree-narrow .commit-details {
   flex-wrap: wrap;
   margin-right: 0;
-  padding-right: 60px;
+  padding-right: 0;
   z-index: 0;
+}
+
+.commit-tree-very-narrow .commit-details {
+  padding-right: 60px;
 }
 
 .commit-narrow-right-actions {
@@ -156,6 +164,11 @@
   top: 0;
   z-index: 1;
   transition: opacity 0.1s;
+}
+
+.commit:hover .commit-narrow-right-actions,
+.commit-narrow-right-actions:focus-within {
+  background: var(--commit-actions-background, var(--background));
 }
 
 .commit-tree-narrow .commit-wide-drag-target {
@@ -305,11 +318,6 @@
   transition: opacity 0.1s;
 }
 
-.goto-button button,
-.open-commit-info-button {
-  background-color: var(--background);
-}
-
 .commit:hover .goto-button,
 .commit:hover .open-commit-info-button {
   opacity: 1;
@@ -346,4 +354,36 @@
   margin: var(--halfpad);
   position: relative;
   min-height: var(--vscode-icon-button-height);
+}
+
+/* Keep the row below the sticky toolbar with one row of breathing room. */
+.you-are-here-container:has(#isl-you-are-here-anchor) {
+  scroll-margin-top: calc(var(--top-bar-height, 46px) + var(--pad) * 2);
+}
+
+/* Floating "scroll to current commit" pill. Sticky inside the commit-tree column
+   (`.main-content-area`) so it centers over the graph, not the whole panel (the
+   commit-info sidebar is a separate drawer). height:0 so it reserves no flow space
+   (no layout shift when it toggles); the pill overflows via align-items. z-index above
+   the sticky top-bar (11) so the top variant isn't hidden behind it. */
+.scroll-to-current-commit {
+  position: sticky;
+  z-index: 12;
+  height: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.scroll-to-current-commit.floating-top {
+  /* sit just below the sticky top-bar, whose height varies as its buttons wrap */
+  top: calc(var(--top-bar-height, 46px) + var(--pad));
+  align-items: flex-start;
+}
+.scroll-to-current-commit.floating-bottom {
+  bottom: calc(var(--pad) * 2);
+  align-items: flex-end;
+}
+.scroll-to-current-commit-pill {
+  pointer-events: auto;
+  border-radius: 999px;
 }

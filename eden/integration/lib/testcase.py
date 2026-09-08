@@ -46,7 +46,7 @@ from eden.fs.service.eden.thrift_types import (
 )
 from eden.test_support.testcase import EdenTestCaseBase
 
-from . import edenclient, gitrepo, hgrepo, repobase, skip
+from . import edenclient, gitrepo, hgrepo, mount_namespace, repobase, skip
 from .find_executables import FindExe
 
 
@@ -54,6 +54,8 @@ if not FindExe.is_buck_build() or os.environ.get("EDENFS_SUFFIX", "") != "":
     _build_flavor = "open_source"
 else:
     _build_flavor = "facebook"
+
+mount_namespace.maybe_reexec_in_private_mount_namespace()
 
 
 class IntegrationTestCase(EdenTestCaseBase):
@@ -311,14 +313,20 @@ class EdenTestCase(EdenTestCaseBase):
             "experimental": [
                 "enable-nfs-server = true",
                 "propagate-checkout-errors = true",
-                "filteredfs-optimize-unfiltered = true",
-                "prefetch-optimizations-v2 = true",
+                "overlay-direct-file-create = true",
+                "overlay-cache-wal-files = true",
+                'overlay-wal-min-compaction-threshold = "50"',
+                "overlay-reuse-created-fds = true",
+                "fuse-avoid-write-copy = true",
+                "fuse-io-uring-skip-self-wakeup = true",
             ],
             # Defaulting to 8 retry threads is excessive when the test
             # framework runs tests on each CPU core.
             "hg": ['num-retry-threads = "2"'],
             "overlay": [
                 "direct-file-writes = true",
+                'file-prealloc-pool-size = "64"',
+                'dir-prealloc-pool-size = "64"',
             ],
         }
 
@@ -1051,13 +1059,10 @@ class CoroutinesTestMixin:
 
     def get_coroutines_configs(self) -> List[str]:
         return [
-            "enable-phase5 = true",
             "enable-phase4 = true",
-            "enable-phase6 = true",
             "enable-phase7 = true",
             "enable-phase8 = true",
             "enable-phase9 = true",
-            "enable-phase11 = true",
             "enable-phase10 = true",
         ]
 

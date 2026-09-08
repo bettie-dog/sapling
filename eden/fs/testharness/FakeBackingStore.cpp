@@ -153,19 +153,31 @@ SemiFuture<BackingStore::GetTreeResult> FakeBackingStore::getTree(
       .semi();
 }
 
-SemiFuture<BackingStore::GetTreeAuxResult> FakeBackingStore::getTreeAuxData(
-    const ObjectId& /*id*/,
-    const ObjectFetchContextPtr& /*context*/) {
-  return folly::makeSemiFuture<BackingStore::GetTreeAuxResult>(
-      std::domain_error("GetTreeAuxData not implemented for FakeBackingStore"));
+void FakeBackingStore::putTreeAuxData(ObjectId id, TreeAuxDataPtr treeAuxData) {
+  data_.wlock()->treeAuxData.insert_or_assign(
+      std::move(id), std::move(treeAuxData));
 }
 
 folly::coro::now_task<BackingStore::GetTreeAuxResult>
 FakeBackingStore::co_getTreeAuxData(
-    const ObjectId& /*id*/,
+    const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
-  co_yield folly::coro::co_error(
-      std::domain_error("GetTreeAuxData not implemented for FakeBackingStore"));
+  std::optional<TreeAuxDataPtr> treeAuxData;
+  {
+    auto data = data_.rlock();
+    auto it = data->treeAuxData.find(id);
+    if (it != data->treeAuxData.end()) {
+      treeAuxData = it->second;
+    }
+  }
+  if (!treeAuxData) {
+    co_yield folly::coro::co_error(
+        std::domain_error(fmt::format("tree aux data {} not found", id)));
+  }
+  const auto origin = *treeAuxData
+      ? ObjectFetchContext::Origin::FromNetworkFetch
+      : ObjectFetchContext::Origin::NotFetched;
+  co_return GetTreeAuxResult{std::move(*treeAuxData), origin};
 }
 
 SemiFuture<BackingStore::GetBlobResult> FakeBackingStore::getBlob(
@@ -221,39 +233,6 @@ folly::coro::Task<BackingStore::GetBlobResult> FakeBackingStore::co_getBlob(
   auto blob = co_await std::move(future);
   co_return BackingStore::GetBlobResult{
       std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
-}
-
-folly::SemiFuture<BackingStore::GetBlobAuxResult>
-FakeBackingStore::getBlobAuxData(
-    const ObjectId& id,
-    const ObjectFetchContextPtr& context) {
-  {
-    auto data = data_.wlock();
-    data->auxDataLookups.push_back(id);
-  }
-
-  auto fault = ImmediateFuture<folly::Unit>{std::in_place};
-  if (serverState_) {
-    fault = serverState_->getFaultInjector().checkAsync("getBlobAuxData", id);
-  }
-
-  return std::move(fault)
-      .thenValue([this, id, context = context.copy()](auto&&) {
-        return ImmediateFuture{getBlob(id, context)};
-      })
-      .thenValue([this](BackingStore::GetBlobResult result) {
-        return BackingStore::GetBlobAuxResult{
-            std::make_shared<BlobAuxDataPtr::element_type>(
-                Hash20::sha1(result.blob->getContents()),
-                blake3Key_ ? Hash32::keyedBlake3(
-                                 folly::ByteRange{folly::StringPiece{
-                                     blake3Key_->data(), blake3Key_->size()}},
-                                 result.blob->getContents())
-                           : Hash32::blake3(result.blob->getContents()),
-                result.blob->getSize()),
-            result.origin};
-      })
-      .semi();
 }
 
 folly::coro::now_task<BackingStore::GetBlobAuxResult>

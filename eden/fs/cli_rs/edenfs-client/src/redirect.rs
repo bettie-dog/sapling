@@ -484,7 +484,7 @@ impl Redirection {
                 format!(
                     "Failed to execute command `{} {}`",
                     APFS_HELPER,
-                    shlex::join(args.iter().copied())
+                    shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
                 )
             })?;
         if output.status.success() {
@@ -551,7 +551,7 @@ impl Redirection {
                 .with_context(|| {
                     format!(
                         "Failed to execute command `hdiutil {}`",
-                        shlex::join(args.iter().copied())
+                        shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
                     )
                 })?;
             if !create_output.status.success() {
@@ -589,7 +589,7 @@ impl Redirection {
             .with_context(|| {
                 format!(
                     "Failed to execute command `hdiutil {}`",
-                    shlex::join(args.iter().copied())
+                    shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
                 )
             })?;
         if !attach_output.status.success() {
@@ -713,7 +713,7 @@ impl Redirection {
                 .with_context(|| {
                     format!(
                         "Failed to execute command `diskutil {}`",
-                        shlex::join(args.iter().copied())
+                        shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
                     )
                 })?;
             if !output.status.success() {
@@ -1399,9 +1399,12 @@ fn _should_return_success_early(
             relative_path = diff_paths(canonical_repo_path, checkout_path).unwrap_or_default();
         }
         if let Some(redir) = configured_redirections.get(&relative_path) {
-            return Ok(
-                redir.redir_type == RedirectionType::Symlink && redir.repo_path == relative_path
-            );
+            // A configured symlink is not necessarily effective: eden stop/rm
+            // and `eden redirect unmount` delete the symlink from disk while
+            // leaving it configured, and add must repair it.
+            return Ok(redir.redir_type == RedirectionType::Symlink
+                && redir.repo_path == relative_path
+                && checkout_path.join(&relative_path).is_symlink());
         }
     }
     Ok(false)
@@ -1496,7 +1499,6 @@ pub async fn try_add_redirection(
     force_remount_bind_mounts: bool,
     strict: bool,
     force: bool,
-    #[cfg(fbcode_build)] enable_xplatlogger_events: bool,
 ) -> Result<i32> {
     // Get only the explicitly configured entries for the purposes of the
     // add command, so that we avoid writing out any of the effective list
@@ -1512,9 +1514,8 @@ pub async fn try_add_redirection(
     })?;
 
     // We are only checking for pre-existing symlinks in this method, so we
-    // can use the configured mounts instead of the effective mounts. This is
-    // because the symlinks contained in these lists should be the same. I.e.
-    // if a symlink is configured, it is also effective.
+    // can use the configured mounts instead of the effective mounts; the
+    // check verifies the symlink's on-disk presence itself.
     if _should_return_success_early(redir_type, &configured_redirs, &checkout.path(), repo_path)? {
         eprintln!("EdenFS managed symlink redirection already exists.");
         return Ok(0);
@@ -1556,6 +1557,7 @@ pub async fn try_add_redirection(
         if existing_redir.repo_path == redir.repo_path
             && !force_remount_bind_mounts
             && *existing_redir_state != RedirectionState::NotMounted
+            && *existing_redir_state != RedirectionState::SymlinkMissing
         {
             eprintln!(
                 "Skipping {}; it is already configured. (use \
@@ -1583,7 +1585,7 @@ pub async fn try_add_redirection(
                     &redir.repo_path.to_string_lossy(),
                     &checkout.path().to_string_lossy(),
                 );
-                edenfs_telemetry::send_edenfs_event(sample, enable_xplatlogger_events);
+                edenfs_telemetry::send_edenfs_event(sample);
             }
         } else {
             eprintln!(

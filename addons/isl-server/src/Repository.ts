@@ -30,6 +30,7 @@ import type {
   RunnableOperation,
   SettableConfigName,
   ShelvedChange,
+  SlocDelta,
   StableInfo,
   Submodule,
   SubmodulesByRoot,
@@ -61,7 +62,7 @@ import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {ejeca, simplifyEjecaError} from 'shared/ejeca';
 import {exists} from 'shared/fs';
 import {removeLeadingPathSep} from 'shared/pathUtils';
-import {notEmpty, nullthrows, randomId} from 'shared/utils';
+import {isHexHash, notEmpty, nullthrows, pathsAreIdentical, randomId} from 'shared/utils';
 import {Internal} from './Internal';
 import {OperationQueue} from './OperationQueue';
 import {PageFocusTracker} from './PageFocusTracker';
@@ -81,6 +82,7 @@ import {
   listWorktrees,
   runCommand,
   setConfig,
+  whereami,
 } from './commands';
 import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD, ErrorShortMessages} from './constants';
 import {GitHubCodeReviewProvider} from './github/githubCodeReviewProvider';
@@ -102,6 +104,9 @@ import {
   isEjecaError,
   serializeAsyncCall,
 } from './utils';
+
+const SMARTLOG_TOO_MANY_COMMITS_WARNING =
+  /^smartlog: too many \(\d+\) commits, not rendering all of them$/m;
 
 /**
  * This class is responsible for providing information about the working copy
@@ -638,7 +643,7 @@ export class Repository {
     ctx: RepositoryContext,
     operation: RunnableOperation,
     onProgress: (progress: OperationProgress) => void,
-  ): Promise<void> {
+  ): Promise<'ran' | 'skipped'> {
     const result = await this.operationQueue.runOrQueueOperation(ctx, operation, onProgress);
 
     if (result !== 'skipped') {
@@ -646,6 +651,8 @@ export class Repository {
       // so the UI is guaranteed to get the latest data.
       this.watchForChanges.poll('force');
     }
+
+    return result;
   }
 
   /**
@@ -934,6 +941,22 @@ export class Repository {
     return this.worktreeInfo;
   }
 
+  /** Hashes checked out (`.`) in sibling worktrees, excluding this worktree, deduped. */
+  getOtherWorktreeDotHashes(): Hash[] {
+    const repoRoot = this.info.repoRoot;
+    const hashes = (this.worktreeInfo?.worktrees ?? []).flatMap(entry => {
+      if (pathsAreIdentical(entry.path, repoRoot) || entry.node == null) {
+        return [];
+      }
+      const trimmed = entry.node.trim();
+      if (trimmed === '' || !isHexHash(trimmed)) {
+        return [];
+      }
+      return [trimmed as Hash];
+    });
+    return [...new Set(hashes)];
+  }
+
   subscribeToWorktreeInfoChanges(
     callback: (result: WorktreeInfo | undefined) => unknown,
   ): Disposable {
@@ -956,11 +979,22 @@ export class Repository {
       const repoRoot = this.info.repoRoot;
       const worktreeEntries =
         worktrees.length > 0 ? worktrees : [{path: repoRoot, role: 'main' as const}];
+      // Fetch the checked-out hash for sibling worktrees only; our own is already
+      // tracked via `.` in the smartlog revset.
+      const worktreeEntriesWithNodes = await Promise.all(
+        worktreeEntries.map(async entry => {
+          if (pathsAreIdentical(entry.path, repoRoot)) {
+            return entry;
+          }
+          const node = await whereami(ctx, entry.path);
+          return node == null ? entry : {...entry, node};
+        }),
+      );
       const worktreeInfo: WorktreeInfo | undefined =
         sharedRoot != null
           ? {
               sharedRoot,
-              worktrees: worktreeEntries,
+              worktrees: worktreeEntriesWithNodes,
             }
           : undefined;
       this.worktreeInfo = worktreeInfo;
@@ -1036,6 +1070,9 @@ export class Repository {
         ...this.stableLocations.map(location => `present(${location.hash})`),
         ...(this.recommendedBookmarks ?? []).map(bookmark => `present(${bookmark})`),
         ...(this.fullRepoBranchModule?.genRevset() ?? []),
+        // sibling worktrees' checkouts happen outside this process's file watcher,
+        // so they may not otherwise be "interesting"; include them explicitly.
+        ...this.getOtherWorktreeDotHashes().map(hash => `present(${hash})`),
       ]
         .filter(notEmpty)
         .join(' + ')})`;
@@ -1047,6 +1084,9 @@ export class Repository {
         'LogCommand',
         this.initialConnectionContext,
       );
+      if (SMARTLOG_TOO_MANY_COMMITS_WARNING.test(proc.stderr)) {
+        throw new Error(ErrorShortMessages.TooManyCommits);
+      }
       const commits = parseCommitInfoOutput(
         this.initialConnectionContext.logger,
         proc.stdout.trim(),
@@ -1467,7 +1507,7 @@ export class Repository {
     ctx: RepositoryContext,
     hash: Hash,
     excludedFiles: string[],
-  ): Promise<number | undefined> {
+  ): Promise<SlocDelta | undefined> {
     const exclusions = excludedFiles.flatMap(file => [
       '-X',
       absolutePathForFileInRepo(file, this) ?? file,
@@ -1483,7 +1523,12 @@ export class Repository {
 
     const sloc = this.parseSlocFrom(output);
 
-    ctx.logger.info('Fetched SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    ctx.logger.info(
+      'Fetched SLOC for commit:',
+      hash,
+      output,
+      `SLOC: +${sloc.insertions} -${sloc.deletions}`,
+    );
     return sloc;
   }
 
@@ -1491,7 +1536,7 @@ export class Repository {
     ctx: RepositoryContext,
     hash: Hash,
     includedFiles: string[],
-  ): Promise<number | undefined> {
+  ): Promise<SlocDelta | undefined> {
     if (includedFiles.length === 0) {
       return undefined;
     }
@@ -1514,7 +1559,12 @@ export class Repository {
 
     const sloc = this.parseSlocFrom(output);
 
-    ctx.logger.info('Fetched Pending AMEND SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    ctx.logger.info(
+      'Fetched Pending AMEND SLOC for commit:',
+      hash,
+      output,
+      `SLOC: +${sloc.insertions} -${sloc.deletions}`,
+    );
     return sloc;
   }
 
@@ -1522,7 +1572,7 @@ export class Repository {
     ctx: RepositoryContext,
     hash: Hash,
     includedFiles: string[],
-  ): Promise<number | undefined> {
+  ): Promise<SlocDelta | undefined> {
     if (includedFiles.length === 0) {
       return undefined; // don't bother running sl diff if there are no files to include
     }
@@ -1541,19 +1591,24 @@ export class Repository {
 
     const sloc = this.parseSlocFrom(output);
 
-    ctx.logger.info('Fetched Pending SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    ctx.logger.info(
+      'Fetched Pending SLOC for commit:',
+      hash,
+      output,
+      `SLOC: +${sloc.insertions} -${sloc.deletions}`,
+    );
     return sloc;
   }
 
-  private parseSlocFrom(output: string) {
+  private parseSlocFrom(output: string): SlocDelta {
     const lines = output.trim().split('\n');
     const changes = lines[lines.length - 1];
     const diffStatRe = /\d+ files changed, (\d+) insertions\(\+\), (\d+) deletions\(-\)/;
     const diffStatMatch = changes.match(diffStatRe);
-    const insertions = parseInt(diffStatMatch?.[1] ?? '0', 10);
-    const deletions = parseInt(diffStatMatch?.[2] ?? '0', 10);
-    const sloc = insertions + deletions;
-    return sloc;
+    return {
+      insertions: parseInt(diffStatMatch?.[1] ?? '0', 10),
+      deletions: parseInt(diffStatMatch?.[2] ?? '0', 10),
+    };
   }
 
   private parseSubscribedBookmarks(output: string): Set<string> {

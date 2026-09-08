@@ -13,10 +13,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from eden.fs.cli.util import is_apple_silicon, write_file_atomically
+from eden.fs.cli.util import write_file_atomically
 
 
-SYSTEMD_ARGS_FILENAME = ".edenfs_start_args"
+DAEMON_ARGS_FILENAME = ".edenfs_start_args"
 SYSTEMD_STARTUP_LOG_FILENAME = ".edenfs_startup.log"
 
 
@@ -64,7 +64,7 @@ def _find_default_daemon_binary() -> Optional[str]:
     if os.access(candidate, permissions):
         return candidate
 
-    if is_apple_silicon():
+    if sys.platform == "darwin":
         # This is where the binary will be found relative to this file when it is
         # run out of buck-out in debug mode for ARM64
         candidate = os.path.normpath(
@@ -90,16 +90,25 @@ def _find_default_daemon_binary() -> Optional[str]:
     return None
 
 
-def write_systemd_args_file(
-    state_dir: Path, cmd: List[str], eden_env: Dict[str, str]
+def write_daemon_args_file(
+    state_dir: Path,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: Optional[List[str]] = None,
 ) -> Path:
     """Write the daemon command and environment to a JSON file.
 
-    This file is read by the 'eden systemd-start' subcommand which is invoked
-    by systemd's ExecStart/ExecReload.
+    ``cmd`` is read back by the 'eden systemd-start' subcommand which is
+    invoked by systemd's ExecStart/ExecReload, so it is stored verbatim.
+
+    ``restart_cmd`` is read by the daemon itself and forwarded to the
+    privhelper, which uses it to relaunch edenfs after a crash. It omits the
+    sudo wrapper and ``--takeover``, neither of which can be replayed.
     """
-    args_file = state_dir / SYSTEMD_ARGS_FILENAME
-    data = {"cmd": cmd, "env": eden_env}
+    args_file = state_dir / DAEMON_ARGS_FILENAME
+    data: Dict[str, object] = {"cmd": cmd, "env": eden_env}
+    if restart_cmd is not None:
+        data["restart_cmd"] = restart_cmd
     write_file_atomically(args_file, json.dumps(data).encode())
     return args_file
 

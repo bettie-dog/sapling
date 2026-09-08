@@ -15,7 +15,7 @@ name = "virtual_repo"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 sapling-dag = { version = "0.1.0", path = "../dag" }
 sapling-eagerepo-trait = { version = "0.1.0", path = "../eagerepo/trait" }
 sapling-factory = { version = "0.1.0", path = "../util/factory" }
@@ -26,4 +26,4 @@ sapling-types = { version = "0.1.0", path = "../types" }
 sapling-virtual-tree = { version = "0.1.0", path = "virtual-tree" }
 sapling-zstdelta = { version = "0.1.0", path = "../zstdelta" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-twox-hash = "1.6.1"
+twox-hash = "2.1.3"

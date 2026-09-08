@@ -10,6 +10,8 @@
 //! - `new_session` uses `CREATE_NEW_PROCESS_GROUP` on Windows, and `setsid` on
 //!   Unix.
 //! - `spawn_detached` is a quicker way to spawn and forget.
+//! - `hide_console_if_headless` suppresses a Windows console window for a
+//!   foreground child, but only when this process has no console to lend it.
 
 use std::error::Error;
 use std::ffi::OsStr;
@@ -21,18 +23,43 @@ use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 
 /// Extensions to `std::process::Command`.
 pub trait CommandExt {
     /// Attempt to avoid inheriting file handles.
     /// Call this before setting up redirections!
+    /// If [`CONFIG_SKIP_PRE_EXEC`] is set, do nothing instead.
     fn avoid_inherit_handles(&mut self) -> &mut Self;
 
     /// Use a new session for the new process.
     /// Call this after `avoid_inherit_handles`!
+    /// If [`CONFIG_SKIP_PRE_EXEC`] is set, do nothing instead.
     fn new_session(&mut self) -> &mut Self;
 
+    /// Stop the child popping up a console window on Windows — but only when
+    /// this process has no console of its own.
+    ///
+    /// For a foreground child that inherits our stdio, `CREATE_NO_WINDOW`
+    /// cannot be applied unconditionally: it gives the child a *separate*
+    /// console instead of ours, so output a user is waiting on could stop
+    /// reaching the terminal. When we already own a console there is also
+    /// nothing to fix — the child inherits it and no new window appears.
+    ///
+    /// The only case that needs suppressing is the one where we are headless
+    /// (spawned from an IDE, a service, or any parent without a console).
+    /// Windows then allocates a fresh, *visible* console for a console-
+    /// subsystem child, and no human is watching a terminal for its output.
+    /// So gate on that, and hiding the window costs nothing.
+    ///
+    /// Unlike [`Self::detached`], this leaves stdio alone. Note that
+    /// `creation_flags` replaces the whole flag set, so call this before
+    /// applying other Windows creation flags, not after. No-op off Windows.
+    fn hide_console_if_headless(&mut self) -> &mut Self;
+
     /// Setup this command to be detached from the parent process.
+    /// Calls `avoid_inherit_handles` and `new_session`.
+    /// If [`CONFIG_SKIP_PRE_EXEC`] is on, do nothing instead.
     fn detached(&mut self) -> &mut Self;
 
     // Setup this command to capture stderr/out.
@@ -86,6 +113,13 @@ pub struct CommandError {
     output: String,
     source: Option<io::Error>,
 }
+
+/// Skip `pre_exec` usage. When setting to `true`, it will:
+/// - No-op `avoid_inherit_handles`, `new_session`, and `detached` on unix.
+/// - Under the hood (Rust stdlib), uses `posix_spawn` instead of `fork`.
+///   `fork()` is more likely to crash on macOS. By default, this config is turned
+///   on for macOS.
+pub static CONFIG_SKIP_PRE_EXEC: AtomicBool = AtomicBool::new(cfg!(target_os = "macos"));
 
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -195,6 +229,13 @@ impl CommandExt for Command {
         self
     }
 
+    fn hide_console_if_headless(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        windows::hide_console_if_headless(self);
+
+        self
+    }
+
     fn spawn_detached(&mut self) -> io::Result<Child> {
         self.detached().closed_io().spawn()
     }
@@ -300,6 +341,7 @@ mod windows {
     use winapi::um::winbase::CREATE_NEW_PROCESS_GROUP;
     use winapi::um::winbase::CREATE_NO_WINDOW;
     use winapi::um::winbase::HANDLE_FLAG_INHERIT;
+    use winapi::um::wincon::GetConsoleWindow;
 
     use super::*;
 
@@ -341,6 +383,20 @@ mod windows {
 
     pub fn new_session(command: &mut Command) {
         command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub fn hide_console_if_headless(command: &mut Command) {
+        // GetConsoleWindow returns NULL when this process is not attached to a
+        // console, which is exactly when a console-subsystem child would get a
+        // fresh visible one. It reports the console *window*, so a process
+        // whose own console was created with CREATE_NO_WINDOW also reads as
+        // headless here — correct, since that console has no window to inherit
+        // and the child would otherwise allocate a visible one of its own.
+        // SAFETY: GetConsoleWindow takes no arguments, has no preconditions,
+        // and returns a raw HWND we only compare against NULL.
+        if unsafe { GetConsoleWindow() }.is_null() {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
     }
 
     pub fn new_shell(shell_cmd: impl AsRef<str>) -> Command {
@@ -423,6 +479,9 @@ mod unix {
     const MAXFD: i32 = 2048;
 
     pub fn avoid_inherit_handles(command: &mut Command) {
+        if CONFIG_SKIP_PRE_EXEC.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // There are some constraints for this function.
         // See std::os::unix::process::CommandExt::pre_exec.
         // Namely, do not allocate.
@@ -430,6 +489,9 @@ mod unix {
     }
 
     pub fn new_session(command: &mut Command) {
+        if CONFIG_SKIP_PRE_EXEC.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         unsafe { command.pre_exec(pre_exec_setsid) };
     }
 
@@ -482,6 +544,33 @@ mod tests {
         child.wait().unwrap();
 
         assert_eq!(&std::fs::read(dir.path().join("a")).unwrap()[..3], b"foo")
+    }
+
+    /// The flag itself is invisible to the test process (`creation_flags` is
+    /// write-only, and whether it gets applied depends on whether the test
+    /// runner owns a console). What must hold on every platform is that the
+    /// call is a chainable no-op for correctness: the child still runs and its
+    /// output still comes back. A foreground caller depends on both.
+    #[test]
+    fn hide_console_if_headless_leaves_the_command_runnable() {
+        let args = if cfg!(unix) {
+            vec!["/bin/sh", "-c", "echo foo"]
+        } else {
+            vec!["cmd.exe", "/c", "echo foo"]
+        };
+        let mut command = Command::new(args[0]);
+        let output = command
+            .args(&args[1..])
+            .hide_console_if_headless()
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "child should still run");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "foo",
+            "stdout should still reach the caller",
+        );
     }
 
     #[test]

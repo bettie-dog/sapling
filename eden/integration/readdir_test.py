@@ -1301,6 +1301,28 @@ class ReaddirTest(testcase.EdenRepoTest):
             self.assertIn(b"hello", actual.dirLists[0].dirListAttributeData)
             self.assertIn(b"cdir", actual.dirLists[0].dirListAttributeData)
 
+    async def test_readdir_invalid_path_fails_only_that_path(self) -> None:
+        # An invalid path (e.g. an absolute path) in a readdir batch produces
+        # an error in that path's slot of the result and leaves the other
+        # paths' listings intact.
+        async with self.get_async_thrift_client() as client:
+            actual = await client.readdir(
+                ReaddirParams(
+                    mountPoint=self.mount_path_bytes,
+                    directoryPaths=[b"adir", b"/etc"],
+                    sync=SyncBehavior(),
+                )
+            )
+            self.assertEqual(2, len(actual.dirLists))
+            self.assertIn(b"file", actual.dirLists[0].dirListAttributeData)
+            error = actual.dirLists[1].error
+            self.assertEqual(EINVAL, error.errorCode)
+            self.assertEqual(EdenErrorType.ARGUMENT_ERROR, error.errorType)
+            self.assertIn(
+                "attempt to construct a RelativePath from an absolute path",
+                error.message,
+            )
+
     async def readdir_single_attr_only(self, req_attr: int) -> None:
         async with self.get_async_thrift_client() as client:
             adir_result = DirListAttributeDataOrError(

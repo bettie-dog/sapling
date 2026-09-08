@@ -29,7 +29,7 @@ import {ComparisonType, isComparison, labelForComparison} from 'shared/Compariso
 import type {Deferred} from 'shared/utils';
 import {defer} from 'shared/utils';
 import * as vscode from 'vscode';
-import {executeVSCodeCommand} from './commands';
+import {executeVSCodeCommand, workingCopyUriForModifiedUri} from './commands';
 import {getCLICommand, PERSISTED_STORAGE_KEY_PREFIX, shouldOpenBeside} from './config';
 import {assignWebviewHtml, getWebviewOptions} from './htmlForWebview';
 import {locale, t} from './i18n';
@@ -100,6 +100,16 @@ let hasOpenedISLWebviewBeforeState = false;
 /** Most recently selected cwd across all ISL webviews. */
 let mostRecentISLCwd: string | undefined = undefined;
 
+export function initialCwdForISL(
+  requestedCwd: string | undefined,
+  focusedEnvironmentCwd: string | undefined,
+  recentCwd: string | undefined,
+  workspaceCwd: string | undefined,
+  fallbackCwd: string,
+): string {
+  return requestedCwd ?? focusedEnvironmentCwd ?? recentCwd ?? workspaceCwd ?? fallbackCwd;
+}
+
 const islViewType = 'sapling.isl';
 const comparisonViewType = 'sapling.comparison';
 
@@ -146,6 +156,13 @@ function createOrFocusISLWebview(
 }
 
 /**
+ * Uri schemes whose `fsPath` names a real location on disk, and so may be used as a cwd.
+ * Virtual documents (`webview-panel:` for the Home Page, `output:`, `untitled:`, ...) have
+ * Uris whose path is an internal id rather than a folder.
+ */
+const FILESYSTEM_URI_SCHEMES = new Set(['file', 'vscode-remote']);
+
+/**
  * `sapling.open-isl` can be triggered from a repository's SCM title bar, an editor title
  * button, a keybinding, or programmatically. Resolve which repository's cwd the command
  * should target from whatever argument VS Code passes for those entry points. Returns
@@ -158,9 +175,15 @@ export function cwdForOpenISLCommand(arg: unknown): string | undefined {
   if (maybeSourceControl?.rootUri instanceof vscode.Uri) {
     return maybeSourceControl.rootUri.fsPath;
   }
-  // The editor/title menu passes the active file's Uri; map it back to its repo root.
+  // The editor/title menu passes the active tab's Uri; map it back to its repo root.
+  // The button is contributed for every tab, so this may be any kind of tab, not just a file.
   if (arg instanceof vscode.Uri) {
-    return repositoryCache.cachedRepositoryForPath(arg.fsPath)?.info.repoRoot ?? arg.fsPath;
+    const uri = workingCopyUriForModifiedUri(arg);
+    const repoRoot = repositoryCache.cachedRepositoryForPath(uri.fsPath)?.info.repoRoot;
+    if (repoRoot != null) {
+      return repoRoot;
+    }
+    return FILESYSTEM_URI_SCHEMES.has(uri.scheme) ? uri.fsPath : undefined;
   }
   return undefined;
 }
@@ -621,11 +644,13 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
   const updatedPlatform = {...platform, panelOrView} as VSCodeServerPlatform as ServerPlatform;
 
   const focusedEnv = Internal.basecampGetFocusedEnvironment?.();
-  const initialCwd =
-    cwd ??
-    focusedEnv?.folderPaths?.[0] ??
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
-    process.cwd();
+  const initialCwd = initialCwdForISL(
+    cwd,
+    focusedEnv?.folderPaths?.[0],
+    mostRecentISLCwd,
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+    process.cwd(),
+  );
   mostRecentISLCwd = initialCwd;
   let disposed = false;
 

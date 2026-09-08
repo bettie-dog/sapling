@@ -551,9 +551,16 @@ class rebaseruntime:
                 repo,
                 precheckrevs,
                 "rebase",
-                checkobsolete=False,
                 checkmerge=False,
             )
+            if self.collapsef and self.collapsemsg:
+                # Validate the collapse message before any commit is rewritten
+                # so a rejection cannot leave an interrupted rebase behind.
+                rewriteutil.precheckmessage(
+                    repo,
+                    [repo[rev] for rev in sorted(precheckrevs)],
+                    self.collapsemsg,
+                )
 
         # Keep track of the active bookmarks in order to reset them later
         self.activebookmark = self.activebookmark or repo._activebookmark
@@ -757,6 +764,7 @@ class rebaseruntime:
             destphase = max(ctx.phase(), phases.draft)
             overrides = {("phases", "new-commit"): destphase}
         with repo.ui.configoverride(overrides, "rebase"):
+            commitmsg = _adjustrebasecopymessage(repo, commitmsg, self.keepf, ctx)
             # # Replicates the empty check in ``repo.commit``.
             # if wctx.isempty() and not repo.ui.configbool("ui", "allowemptycommit"):
             #     return None
@@ -1310,17 +1318,23 @@ def rebase(ui, repo, templ=None, **opts):
         or opts.get("quit")
     ):
         # 'hg rebase' w/o args should do nothing
-        if not opts.get("dest"):
+        dests = opts.get("dest")
+        if not dests:
             raise error.Abort("you must specify a destination (-d) for the rebase")
+
+        if not isinstance(dests, list):
+            dests = [dests]
+        for dest in dests:
+            bookmarks.checkagentpreferredtarget(repo, dest)
 
         # 'hg rebase' can fast-forward bookmark
         prev = repo["."]
+        dests = opts.get("dest")
 
         # Only fast-forward the bookmark if no source nodes were explicitly
         # specified.
         if not (opts.get("base") or opts.get("source") or opts.get("rev")):
-            dests = opts.get("dest")
-            if dests and len(dests) == 1 and dests[0] != prev:
+            if len(dests) == 1 and dests[0] != prev:
                 dest = scmutil.revsingle(repo, dests[0])
                 common = dest.ancestor(prev)
                 if prev == common and dest != prev:
@@ -1730,6 +1744,13 @@ def externalparent(repo, state, destancestors):
     )
 
 
+def _adjustrebasecopymessage(repo, message, keepf, source):
+    # Ordinary rebase rewrites its source; only --keep creates a second live copy.
+    if keepf:
+        return rewriteutil.copycommitmessage(repo, message, "rebase --keep", source)
+    return message
+
+
 def concludememorynode(
     repo,
     rev,
@@ -1776,6 +1797,7 @@ def concludememorynode(
         if date is None:
             date = ctx.date()
 
+        commitmsg = _adjustrebasecopymessage(repo, commitmsg, keepf, ctx)
         memctx = wctx.tomemctx(
             commitmsg,
             parents=(repo[p1], repo[p2]),
@@ -1786,7 +1808,6 @@ def concludememorynode(
             loginfo=loginfo,
             mutinfo=mutinfo,
         )
-
         commitres = repo.commitctx(memctx)
         wctx.clean()  # Might be reused
         return commitres
@@ -1832,6 +1853,7 @@ def concludenode(
         destphase = max(ctx.phase(), phases.draft)
         overrides = {("phases", "new-commit"): destphase}
         with repo.ui.configoverride(overrides, "rebase"):
+            commitmsg = _adjustrebasecopymessage(repo, commitmsg, keepf, ctx)
             # Commit might fail if unresolved files exist
             if date is None:
                 date = ctx.date()

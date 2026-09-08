@@ -229,7 +229,16 @@ class shelvedstate:
             if d.get("activebook", "") != cls._noactivebook:
                 obj.activebookmark = d.get("activebook", "")
             obj.obsshelve = d["obsshelve"] == cls._obsbased
-        except (error.RepoLookupError, KeyError) as err:
+            # optional keys, may be missing in state files written by older
+            # versions
+            obj.shelveunknown = util.unescapestr(
+                d.get("shelveunknown", "").encode("utf-8")
+            )
+            addedbefore = util.unescapestr(d.get("addedbefore", "").encode("utf-8"))
+            obj.addedbefore = (
+                frozenset(addedbefore.split("\0")) if addedbefore else frozenset()
+            )
+        except (error.RepoLookupError, KeyError, ValueError) as err:
             raise error.CorruptedState(str(err))
 
         return obj
@@ -246,6 +255,8 @@ class shelvedstate:
         keep=False,
         activebook="",
         obsshelve=False,
+        shelveunknown="",
+        addedbefore=(),
     ):
         info = {
             "name": name,
@@ -257,6 +268,8 @@ class shelvedstate:
             "keep": cls._keep if keep else cls._nokeep,
             "activebook": activebook or cls._noactivebook,
             "obsshelve": cls._obsbased if obsshelve else cls._traditional,
+            "shelveunknown": util.escapestr(shelveunknown or ""),
+            "addedbefore": util.escapestr("\0".join(sorted(addedbefore))),
         }
         scmutil.simplekeyvaluefile(repo.localvfs, cls._filename).write(
             info, firstline=str(cls._version)
@@ -433,7 +446,15 @@ def _docreatecmd(ui, repo, pats, opts) -> Optional[int]:
 
     activebookmark = None
     try:
-        with repo.lock(), repo.transaction("commit", report=None):
+        # Shelf commits are hidden bookkeeping, not stack children, so they
+        # may be created on an obsolete parent.
+        with (
+            repo.ui.configoverride(
+                {("commit", "modify-obsolete-mode"): "ignore"}, "shelve"
+            ),
+            repo.lock(),
+            repo.transaction("commit", report=None),
+        ):
             interactive = opts.get("interactive", False)
             includeunknown = opts.get("unknown", False) and not opts.get(
                 "addremove", False
@@ -712,7 +733,11 @@ def unshelvecontinue(ui, repo, state, opts) -> None:
             # if shelve is obs-based, we want rebase to be able
             # to create markers to already-obsoleted commits
             with ui.configoverride(
-                {("experimental", "rebaseskipobsolete"): "off"}, "unshelve"
+                {
+                    ("experimental", "rebaseskipobsolete"): "off",
+                    ("commit", "modify-obsolete-mode"): "ignore",
+                },
+                "unshelve",
             ):
                 rebase.rebase(ui, repo, **{"continue": True})
         except Exception:
@@ -728,6 +753,7 @@ def unshelvecontinue(ui, repo, state, opts) -> None:
             state.nodestoremove.append(shelvectx.node())
 
         mergefiles(ui, repo, state.wctx, shelvectx)
+        _forgetunknownfiles(repo, state.shelveunknown, state.addedbefore)
 
         state.removenodes(ui, repo)
         _restoreactivebookmark(repo, state.activebookmark)
@@ -754,7 +780,12 @@ def _commitworkingcopychanges(ui, repo, opts, tmpwctx):
     tempopts = {}
     tempopts["message"] = "pending changes temporary commit"
     tempopts["date"] = opts.get("date")
-    with ui.configoverride({("ui", "quiet"): True}):
+    with ui.configoverride(
+        {
+            ("ui", "quiet"): True,
+            ("commit", "modify-obsolete-mode"): "ignore",
+        }
+    ):
         node = cmdutil.commit(ui, repo, commitfunc, [], tempopts)
     tmpwctx = repo[node]
     ui.debug(
@@ -793,6 +824,8 @@ def _rebaserestoredcommit(
     shelvectx,
     branchtorestore,
     activebookmark,
+    shelveunknown,
+    addedbefore,
 ):
     """Rebase restored commit from its original location to a destination"""
     # If the shelve is not immediately on top of the commit
@@ -843,6 +876,8 @@ def _rebaserestoredcommit(
             branchtorestore,
             opts.get("keep"),
             activebookmark,
+            shelveunknown=shelveunknown,
+            addedbefore=addedbefore,
         )
 
         repo.localvfs.rename("rebasestate", "unshelverebasestate")
@@ -863,10 +898,9 @@ def _rebaserestoredcommit(
     return shelvectx
 
 
-def _forgetunknownfiles(repo, shelvectx, addedbefore) -> None:
+def _forgetunknownfiles(repo, shelveunknown, addedbefore) -> None:
     # Forget any files that were unknown before the shelve, unknown before
     # unshelve started, but are now added.
-    shelveunknown = shelvectx.extra().get("shelve_unknown")
     if not shelveunknown:
         return
     shelveunknown = frozenset(shelveunknown.split("\0"))
@@ -1040,11 +1074,14 @@ def _dounshelve(ui, repo, *shelved, **opts):
         tmpwctx, addedbefore = _commitworkingcopychanges(ui, repo, opts, tmpwctx)
         repo, shelvectx = _unshelverestorecommit(ui, repo, basename)
         _checkunshelveuntrackedproblems(ui, repo, shelvectx)
+        # Read this before rebasing because rebase drops the shelve_unknown extra.
+        shelveunknown = shelvectx.extra().get("shelve_unknown")
         branchtorestore = ""
 
         rebaseconfigoverrides = {
             ("ui", "forcemerge"): opts.get("tool", ""),
             ("experimental", "rebaseskipobsolete"): "off",
+            ("commit", "modify-obsolete-mode"): "ignore",
         }
         with ui.configoverride(rebaseconfigoverrides, "unshelve"):
             shelvectx = _rebaserestoredcommit(
@@ -1059,9 +1096,11 @@ def _dounshelve(ui, repo, *shelved, **opts):
                 shelvectx,
                 branchtorestore,
                 activebookmark,
+                shelveunknown,
+                addedbefore,
             )
             mergefiles(ui, repo, pctx, shelvectx)
-            _forgetunknownfiles(repo, shelvectx, addedbefore)
+            _forgetunknownfiles(repo, shelveunknown, addedbefore)
 
         _hideredundantnodes(repo, tr, pctx, shelvectx, tmpwctx)
 

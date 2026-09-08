@@ -10,7 +10,7 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 async-stream = "0.3"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 async_requests = { version = "0.1.0", path = ".." }
 async_requests_types_thrift = { version = "0.1.0", path = "../if" }
 bulk_derivation = { version = "0.1.0", path = "../../../derived_data/bulk_derivation" }
@@ -22,7 +22,7 @@ derived_data_manager = { version = "0.1.0", path = "../../../derived_data/manage
 enabled_derived_data_types = { version = "0.1.0", path = "../../../repo_attributes/enabled_derived_data_types" }
 ephemeral_blobstore = { version = "0.1.0", path = "../../../blobstore/ephemeral_blobstore" }
 executor_lib = { version = "0.1.0", path = "../../../cmdlib/sharding" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_watchdog = { version = "0.1.0", path = "../../../common/futures_watchdog" }
@@ -45,7 +45,7 @@ scs_methods = { version = "0.1.0", path = "../../../servers/scs/scs_methods" }
 source_control = { version = "0.1.0", path = "../../../scs/if" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 throttledblob = { version = "0.1.0", path = "../../../blobstore/throttledblob" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

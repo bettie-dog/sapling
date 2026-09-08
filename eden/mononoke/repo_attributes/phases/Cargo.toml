@@ -13,12 +13,12 @@ path = "tests/src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bincode = { version = "2", features = ["serde"] }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 
 [dev-dependencies]
 bonsai_hg_mapping = { version = "0.1.0", path = "../bonsai_hg_mapping" }
@@ -31,7 +31,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 filestore = { version = "0.1.0", path = "../filestore" }
 fixtures = { version = "0.1.0", path = "../../tests/fixtures" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 maplit = "1.0"
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }

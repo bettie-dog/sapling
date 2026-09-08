@@ -16,11 +16,11 @@ blobstore = { version = "0.1.0", path = "../../../../blobstore" }
 context = { version = "0.1.0", path = "../../../../servers/slapi/slapi_server/context" }
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 filenodes = { version = "0.1.0", path = "../../../../repo_attributes/filenodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 mercurial_types = { version = "0.1.0", path = "../../../../mercurial/types" }
 microwave_if = { version = "0.1.0", path = "../../if" }
 mononoke_types = { version = "0.1.0", path = "../../../../mononoke_types" }
 mutable_blobstore = { version = "0.1.0", path = "../../../../repo_attributes/mutable_blobstore" }
 repo_identity = { version = "0.1.0", path = "../../../../repo_attributes/repo_identity" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

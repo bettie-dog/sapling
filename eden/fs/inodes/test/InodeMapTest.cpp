@@ -11,7 +11,6 @@
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 
-#include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -21,7 +20,7 @@
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/test/CapturingScribeLogger.h"
+#include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
 #include "eden/fs/testharness/TestUtil.h"
@@ -46,6 +45,20 @@ TEST(InodeMap, invalidInodeNumber) {
   EXPECT_THROW_RE(
       std::move(future).get(), std::runtime_error, "unknown inode number");
 }
+
+#ifdef __linux__
+TEST(InodeMap, forgetMultipleReferencesFromLoadedInode) {
+  FakeTreeBuilder builder;
+  builder.setFile("file.txt", "contents\n");
+  TestMount testMount{builder};
+
+  auto file = testMount.getFileInode("file.txt"_relpath);
+  file->incFsRefcount(3);
+  testMount.getEdenMount()->getInodeMap()->decFsRefcount(file->getNodeId(), 3);
+
+  EXPECT_EQ(0, file->debugGetFsRefcount());
+}
+#endif
 
 TEST(InodeMap, simpleLookups) {
   // Test simple lookups that succeed immediately from the LocalStore
@@ -737,6 +750,26 @@ TEST_F(
   EXPECT_EQ(oldFile2Id, file2->getNodeId());
 }
 
+#ifndef _WIN32
+TEST_F(InodePersistenceTreeTest, preservesLastFsRequestTimeDuringTakeover) {
+  TestMount testMount{builder};
+  auto edenMount = testMount.getEdenMount();
+  auto file = testMount.getInode("dir/file1.txt"_relpath);
+  file->incFsRefcount();
+  const auto inodeNumber = file->getNodeId();
+  const auto expectedLastFsRequestTime = file->getLastFsRequestTime();
+
+  testMount.getClock().advance(120s);
+  edenMount.reset();
+  file.reset();
+  testMount.remountGracefully();
+
+  auto reloaded =
+      testMount.getEdenMount()->getInodeMap()->lookupInode(inodeNumber).get();
+  EXPECT_EQ(expectedLastFsRequestTime, reloaded->getLastFsRequestTime());
+}
+#endif
+
 // Verify createInodeLoadFailEvent publishes a FAIL event when a load fails
 // for an inode in unloadedInodes_.
 TEST(InodeMap, createInodeLoadFailEventPublishesFailEvent) {
@@ -836,12 +869,12 @@ TEST(InodeMap, totalInodeCountFastMatchesInodeCounts) {
 }
 
 TEST(InodeMap, inodeLoadFailureLogsError) {
-  auto scribe = std::make_shared<CapturingScribeLogger>();
+  CapturingXplatLogger xplatLogger;
   auto config = EdenConfig::createTestEdenConfig();
   config->enableErrorLogging.setValue(true, ConfigSourceType::UserConfig);
   auto reloadableConfig = std::make_shared<ReloadableConfig>(config);
   auto errorLogger =
-      std::make_shared<ErrorLogger>(scribe, SessionInfo{}, reloadableConfig);
+      std::make_shared<ErrorLogger>(reloadableConfig, &xplatLogger);
 
   auto builder = FakeTreeBuilder();
   builder.setFile("src/main.c", "int main() { return 0; }\n");
@@ -866,10 +899,8 @@ TEST(InodeMap, inodeLoadFailureLogsError) {
   ASSERT_TRUE(srcFuture.isReady());
   EXPECT_THROW(std::move(srcFuture).get(), std::domain_error);
 
-  ASSERT_EQ(scribe->messages().size(), 1);
-  const auto& msg = scribe->messages()[0];
-  EXPECT_NE(msg.find("object_store"), std::string::npos)
-      << "Should contain component, got: " << msg;
-  EXPECT_NE(msg.find("inode_loading_failed"), std::string::npos)
-      << "Should contain error_type, got: " << msg;
+  ASSERT_EQ(xplatLogger.events().size(), 1);
+  const auto& strings = xplatLogger.events()[0].event.getStringMap();
+  EXPECT_EQ(strings.at("component"), "object_store");
+  EXPECT_EQ(strings.at("error_type"), "inode_loading_failed");
 }

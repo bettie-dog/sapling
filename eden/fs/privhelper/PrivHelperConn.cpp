@@ -134,6 +134,14 @@ uint32_t deserializeUint32(Cursor& cursor) {
   return cursor.read<uint32_t>();
 }
 
+void serializeUint64(Appender& a, uint64_t val) {
+  a.write<uint64_t>(val);
+}
+
+uint64_t deserializeUint64(Cursor& cursor) {
+  return cursor.read<uint64_t>();
+}
+
 void serializeInt32(Appender& a, int32_t val) {
   a.write<int32_t>(val);
 }
@@ -166,11 +174,15 @@ folly::SocketAddress deserializeSocketAddress(Cursor& cursor) {
   }
 }
 
+// Legacy iosize option. Serialized to its old value for compatibility with old
+// privhelpers.
+constexpr uint32_t kLegacyIoSizeWireSlot = 16 * 1024;
+
 void serializeNFSMountOptions(Appender& a, const NFSMountOptions& options) {
   serializeSocketAddress(a, options.mountdAddr);
   serializeSocketAddress(a, options.nfsdAddr);
   serializeBool(a, options.readOnly);
-  serializeUint32(a, options.iosize);
+  serializeUint32(a, kLegacyIoSizeWireSlot);
   serializeBool(a, options.useReaddirplus);
   serializeBool(a, options.useSoftMount);
   serializeUint32(a, options.readIOSize);
@@ -188,7 +200,8 @@ NFSMountOptions deserializeNFSMountOptions(Cursor& cursor) {
   options.mountdAddr = deserializeSocketAddress(cursor);
   options.nfsdAddr = deserializeSocketAddress(cursor);
   options.readOnly = deserializeBool(cursor);
-  options.iosize = deserializeUint32(cursor);
+  // Legacy iosize option, ignored.
+  deserializeUint32(cursor);
   options.useReaddirplus = deserializeBool(cursor);
   options.useSoftMount = deserializeBool(cursor);
   options.readIOSize = deserializeUint32(cursor);
@@ -614,6 +627,55 @@ void PrivHelperConn::parseStartFamRequest(
   specifiedOutputPath = deserializeString(cursor);
   shouldUpload = deserializeBool(cursor);
   checkAtEnd(cursor, "start fam");
+}
+
+UnixSocket::Message PrivHelperConn::serializeSetRestartArgsRequest(
+    uint32_t xid,
+    const EdenFsRestartArgs& args) {
+  auto msg = serializeRequestPacket(xid, REQ_SET_RESTART_ARGS);
+  Appender appender(&msg.data, kDefaultBufferSize);
+
+  serializeBool(appender, args.enabled);
+  serializeString(appender, args.sentinelPath);
+  serializeUint64(appender, args.sentinelNonce);
+  serializeUint32(appender, args.restartCount);
+  serializeUint64(appender, args.firstRestartEpochSec);
+  serializeUint32(appender, args.maxRestarts);
+  serializeUint32(appender, args.windowSeconds);
+  return msg;
+}
+
+void PrivHelperConn::parseSetRestartArgsRequest(
+    Cursor& cursor,
+    EdenFsRestartArgs& args) {
+  args.enabled = deserializeBool(cursor);
+  args.sentinelPath = deserializeString(cursor);
+  args.sentinelNonce = deserializeUint64(cursor);
+  args.restartCount = deserializeUint32(cursor);
+  args.firstRestartEpochSec = deserializeUint64(cursor);
+  args.maxRestarts = deserializeUint32(cursor);
+  args.windowSeconds = deserializeUint32(cursor);
+  checkAtEnd(cursor, "set restart args");
+}
+
+UnixSocket::Message PrivHelperConn::serializeNotifyCleanShutdownRequest(
+    uint32_t xid,
+    StringPiece reason) {
+  auto msg = serializeRequestPacket(xid, REQ_NOTIFY_CLEAN_SHUTDOWN);
+  Appender appender(&msg.data, kDefaultBufferSize);
+  serializeString(appender, reason);
+  return msg;
+}
+
+void PrivHelperConn::parseNotifyCleanShutdownRequest(
+    Cursor& cursor,
+    std::string& reason) {
+  reason = deserializeString(cursor);
+  checkAtEnd(cursor, "notify clean shutdown");
+}
+
+bool PrivHelperConn::isOneWayRequest(MsgType type) {
+  return type == REQ_NOTIFY_CLEAN_SHUTDOWN;
 }
 
 void PrivHelperConn::serializeStopFamResponse(

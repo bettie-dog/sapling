@@ -11,7 +11,7 @@ license = "GPLv2+"
 acl_regions = { version = "0.1.0", path = "../common/acl_regions" }
 anyhow = "1.0.104"
 arc-swap = { version = "1.9.2", features = ["weak"] }
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 basename_suffix_skeleton_manifest_v3 = { version = "0.1.0", path = "../derived_data/basename_suffix_skeleton_manifest_v3" }
 blame = { version = "0.1.0", path = "../derived_data/blame" }
 blobrepo_hg = { version = "0.1.0", path = "../blobrepo/blobrepo_hg" }
@@ -49,14 +49,14 @@ derived_data = { version = "0.1.0", path = "../derived_data" }
 derived_data_manager = { version = "0.1.0", path = "../derived_data/manager" }
 diff = { version = "0.1.0", path = "../features/diff" }
 directory_branch_cluster_manifest = { version = "0.1.0", path = "../derived_data/directory_branch_cluster_manifest" }
-either = "1.16.0"
+either = "1.17.0"
 enabled_derived_data_types = { version = "0.1.0", path = "../repo_attributes/enabled_derived_data_types" }
 ephemeral_blobstore = { version = "0.1.0", path = "../blobstore/ephemeral_blobstore" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../repo_attributes/filestore" }
 fsnodes = { version = "0.1.0", path = "../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_lazy_shared = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -121,8 +121,8 @@ sql_query_config = { version = "0.1.0", path = "../repo_attributes/sql_query_con
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 streaming_clone = { version = "0.1.0", path = "../repo_client/streaming_clone" }
 synced_commit_mapping = { version = "0.1.0", path = "../features/commit_rewriting/synced_commit_mapping" }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unbundle = { version = "0.1.0", path = "../repo_client/unbundle" }
 unodes = { version = "0.1.0", path = "../derived_data/unodes" }

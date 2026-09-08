@@ -11,7 +11,7 @@ license = "GPLv2+"
 anyhow = "1.0.104"
 arc-swap = { version = "1.9.2", features = ["weak"] }
 arg_extensions = { version = "0.1.0", path = "../extensions" }
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 base_app = { version = "0.1.0", path = "../base_app" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
@@ -33,8 +33,8 @@ derived_data_remote = { version = "0.1.0", path = "../../derived_data/remote" }
 environment = { version = "0.1.0", path = "../environment" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-futures-util = { version = "0.3.30", features = ["compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+futures-util = { version = "0.3.34", features = ["compat"] }
 itertools = "0.15.0"
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 megarepo_config = { version = "0.1.0", path = "../../megarepo_api/megarepo_config" }
@@ -64,5 +64,5 @@ sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
 tls = { version = "0.1.0", path = "tls" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

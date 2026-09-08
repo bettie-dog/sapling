@@ -1272,6 +1272,10 @@ class AddCmd(Subcmd):
                 existing_redir
                 and existing_redir.type == RedirectionType.SYMLINK
                 and existing_redir.repo_path == relative_path
+                # A configured symlink is not necessarily effective: eden
+                # stop/rm and `eden redirect unmount` delete the symlink from
+                # disk while leaving it configured, and add must repair it.
+                and (checkout_path / relative_path).is_symlink()
             ):
                 return True
         return False
@@ -1290,9 +1294,8 @@ class AddCmd(Subcmd):
         redirs = get_configured_redirections(checkout)
 
         # We are only checking for pre-existing symlinks in this method, so we
-        # can use the configured mounts instead of the effective mounts. This is
-        # because the symlinks contained in these lists should be the same. I.e.
-        # if a symlink is configured, it is also effective.
+        # can use the configured mounts instead of the effective mounts; the
+        # check verifies the symlink's on-disk presence itself.
         if self._should_return_success_early(
             redir_type, redirs, checkout.path, Path(args.repo_path)
         ):
@@ -1392,6 +1395,22 @@ class DelCmd(Subcmd):
         # the improved `add` validation for a while, we can use it here also.
         redir = redirs.get(args.repo_path)
         if redir:
+            if redir.source == REPO_SOURCE:
+                # The deletion of a repo-defined redirection cannot be
+                # persisted: the persistence step only writes user-sourced
+                # entries, and this CLI cannot edit the source-controlled
+                # redirection file. Accepting it would tear the redirection
+                # down only for `redirect fixup` (which the daemon runs on
+                # every mount) to silently bring it back.
+                print(
+                    f"error: {args.repo_path} is defined by {REPO_SOURCE} and "
+                    f"cannot be removed using `edenfsctl redirect del "
+                    f"{args.repo_path}`. To temporarily unmount it, use "
+                    f"`edenfsctl redirect unmount`; to remove it permanently, "
+                    f"delete it from {REPO_SOURCE}.",
+                    file=sys.stderr,
+                )
+                return 1
             redir.remove_existing(checkout)
             del redirs[args.repo_path]
             config = apply_redirection_configs_to_checkout_config(

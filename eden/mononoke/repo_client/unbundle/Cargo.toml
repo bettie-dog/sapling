@@ -23,7 +23,7 @@ context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context"
 cross_repo_sync = { version = "0.1.0", path = "../../features/cross_repo_sync" }
 dbbookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks/dbbookmarks" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 getbundle_response = { version = "0.1.0", path = "../getbundle_response" }
@@ -54,7 +54,7 @@ repo_update_logger = { version = "0.1.0", path = "../../features/repo_update_log
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 synced_commit_mapping = { version = "0.1.0", path = "../../features/commit_rewriting/synced_commit_mapping" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 wirepack = { version = "0.1.0", path = "../wirepack" }
@@ -69,4 +69,4 @@ mercurial_types-mocks = { version = "0.1.0", path = "../../mercurial/types/mocks
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 quickcheck_macros = "1.2.0"
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }

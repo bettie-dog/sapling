@@ -11,7 +11,8 @@ import type {ServerPlatform} from '../serverPlatform';
 import type {RepositoryContext} from '../serverTypes';
 
 import {deserializeFromString, serializeToString} from 'isl/src/serialize';
-import {mockLogger, nextTick} from 'shared/testUtils';
+import {mockLogger} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import {Internal} from '../Internal';
 import {Repository} from '../Repository';
 import {repositoryCache} from '../RepositoryCache';
@@ -157,6 +158,92 @@ describe('ServerToClientAPI disposable scoping', () => {
     api.dispose();
 
     expect(connectionDispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ServerToClientAPI diff summary fetches', () => {
+  let platform: ServerPlatform;
+  let connection: ReturnType<typeof createMockConnection>;
+  let api: ServerToClientAPI;
+  let triggerDiffSummariesFetch: jest.Mock;
+
+  beforeEach(async () => {
+    platform = {
+      platformName: 'test',
+      handleMessageFromClient: jest.fn(),
+    };
+
+    triggerDiffSummariesFetch = jest.fn();
+    const repo = Object.assign(Object.create(Repository.prototype), {
+      info: mockRepoInfo,
+      initialConnectionContext: {logger: mockLogger, tracker: mockTracker},
+      codeReviewProvider: {
+        triggerDiffSummariesFetch,
+        getSummaryName: () => 'test',
+        onChangeDiffSummaries: () => ({dispose: jest.fn()}),
+      },
+      getAllDiffIds: () => ['D1', 'D2'],
+      ref: jest.fn(),
+      unref: jest.fn(),
+      dispose: jest.fn(),
+      fetchAndSetRecommendedBookmarks: jest.fn(),
+      fetchAndSetHiddenMasterConfig: jest.fn(),
+      pullFetchedDiffs: jest.fn().mockResolvedValue(undefined),
+      fetchSmartlogCommits: jest.fn(),
+      fetchUncommittedChanges: jest.fn(),
+      fetchSubmoduleMap: jest.fn(),
+      checkForMergeConflicts: jest.fn(),
+      refreshWorktreeInfo: jest.fn(),
+    });
+    (repositoryCache.getOrCreate as jest.Mock).mockReturnValue({
+      promise: Promise.resolve(repo),
+      unref: jest.fn(),
+    });
+
+    connection = createMockConnection();
+    api = new ServerToClientAPI(platform, connection, mockTracker, mockLogger);
+    api.setActiveRepoForCwd('/path/to/repo/cwd');
+    await nextTick();
+  });
+
+  afterEach(() => {
+    api.dispose();
+    jest.clearAllMocks();
+  });
+
+  it('forces the diff summary refetch', async () => {
+    connection.triggerMessage({type: 'refresh'});
+    await nextTick();
+
+    // Unforced, the server answers from its signal count cache, so the one gesture a user has for
+    // "CI moved but the diff did not" leaves the badge showing the same stale count.
+    expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D1', 'D2'], true);
+  });
+
+  it('passes on a request that marks itself partial', async () => {
+    connection.triggerMessage({type: 'fetchDiffSummaries', diffIds: ['D2'], partial: true});
+    await nextTick();
+
+    // Selecting a commit asks about the diff it carries. Unmarked, a provider that remembers what
+    // to refetch after a submit takes that one diff for the whole smartlog.
+    expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D2'], false, true);
+  });
+
+  it('treats a request that names diffs but not itself as the whole smartlog', async () => {
+    connection.triggerMessage({type: 'fetchDiffSummaries', diffIds: ['D2']});
+    await nextTick();
+
+    // Clients outside this repo build `diffIds` from every commit they hold and send no `partial`.
+    // Inferring it from the presence of `diffIds` would leave the server with nothing recorded as
+    // the smartlog, and no post-submit refetch to make from it.
+    expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D2'], false, false);
+  });
+
+  it('treats a request that names no diffs as the whole smartlog', async () => {
+    connection.triggerMessage({type: 'fetchDiffSummaries'});
+    await nextTick();
+
+    expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D1', 'D2'], false, false);
   });
 });
 

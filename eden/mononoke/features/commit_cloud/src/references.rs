@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
@@ -26,6 +29,7 @@ use futures::FutureExt;
 use futures::future;
 use futures::stream;
 use futures::stream::TryStreamExt;
+use futures::try_join;
 use history::WorkspaceHistory;
 use repo_derived_data::ArcRepoDerivedData;
 use sql_ext::Transaction;
@@ -54,58 +58,187 @@ pub mod versions;
 define_stats! {
     prefix = "mononoke.commit_cloud.get_references";
     // Total number of heads returned per sync (with a resolved author date).
+    // This is the denominator that makes the timers below per-head figures, so
+    // it stays as long as any of them do.
     heads_returned: timeseries(Sum, Average, Count),
-    // Per-sync count of returned heads falling into each age bucket, keyed by
-    // bucket label (see AGE_BUCKETS).
-    head_age_bucket: dynamic_timeseries("head_age.{}", (bucket: &'static str); Sum, Average),
+    heads_derived: timeseries(Sum, Average, Count),
+    // Wall-clock latency of the get_references read path, split into its two
+    // phases plus the total. Emitted as quantile_stat (not the deprecated
+    // histogram, whose tail percentiles run 2-3x too high) to match the
+    // *_duration_ms convention used by the slapi ODS middleware.
+    fetch_references_ms: quantile_stat(Average, Sum, Count; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
+    cast_references_data_ms: quantile_stat(Average, Sum, Count; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
+    total_ms: quantile_stat(Average, Sum, Count; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
+    // The two I/O stages inside cast_references_data, as the per-sync sum of time
+    // spent inside each stage's futures. The stages are pipelined and run
+    // concurrently, so these are sums over overlapping futures: they routinely
+    // exceed wall clock and do NOT partition cast_references_data_ms. Compare them
+    // to each other, not to it.
+    bonsai_mapping_ms: quantile_stat(Average, Sum, Count; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
+    changeset_info_ms: quantile_stat(Average, Sum, Count; P 50, P 75, P 95, P 99; Duration::from_secs(60), Duration::from_secs(600), Duration::from_secs(3600)),
 }
 
-const SECONDS_PER_DAY: i64 = 86400;
-
-// Age histogram buckets, ordered from youngest to oldest, as (exclusive upper
-// bound in whole days, label) pairs. The last bound is `i64::MAX` so the oldest
-// bucket catches everything. The labels are used as the ODS `head_age_bucket`
-// key, so keep them stable -- renaming them breaks existing dashboards.
-const AGE_BUCKETS: [(i64, &str); 6] = [
-    (1, "lt_1d"),
-    (7, "1d_7d"),
-    (14, "7d_14d"),
-    (28, "14d_28d"),
-    (90, "28d_90d"),
-    (i64::MAX, "gt_90d"),
-];
-
-// Map a head age (in whole days) to its `AGE_BUCKETS` index. The clamp keeps
-// this total: an age equal to the `i64::MAX` sentinel would otherwise index one
-// past the end.
-fn age_bucket_index(age_days: i64) -> usize {
-    AGE_BUCKETS
-        .partition_point(|(upper_bound, _)| age_days >= *upper_bound)
-        .min(AGE_BUCKETS.len() - 1)
+// Emit the number of heads a (non-no-op) get_references resolved author dates
+// for. Same always-on, O(1), pure-telemetry contract as the timers below, and
+// the per-head denominator for them.
+fn log_heads_returned(heads: usize) {
+    STATS::heads_returned.add_value(heads as i64);
 }
 
-// Emit a per-sync age histogram and head count for the heads returned by
-// `get_references`.
-//
-// `age` is `now - author_date`, matching the author-date basis the client uses
-// for its `max_sync_age` omission (default 14 days), so the histogram lines up
-// directly with the client-side omitted-heads line. This is pure telemetry and
-// must not affect sync results.
-fn log_head_age_metrics(heads_dates: &HashMap<CloudChangesetId, i64>) {
-    let now = mononoke_types::DateTime::now().timestamp_secs();
+fn log_heads_derived(heads: usize) {
+    STATS::heads_derived.add_value(heads as i64);
+}
 
-    // Single pass over the heads to build the histogram (heads can number in
-    // the thousands, so avoid repeated traversals).
-    let mut buckets = [0i64; AGE_BUCKETS.len()];
-    for author_date in heads_dates.values() {
-        let age_days = (now - *author_date).max(0) / SECONDS_PER_DAY;
-        buckets[age_bucket_index(age_days)] += 1;
+// Emit the per-phase and total wall-clock timing of a (non-no-op) get_references
+// read. This is always-on and O(1) -- just a few Instant reads in the caller plus
+// these add_value calls -- so it is deliberately not gated by a JustKnob. The
+// read path had no sub-phase timing, and profiling shows latency concentrated in
+// the tail of rebuild syncs (scaling super-linearly with workspace size); this
+// splits fetch_references vs cast_references_data vs total so we can confirm which
+// phase dominates before optimizing. Pure telemetry: it must not affect results.
+pub(crate) fn log_get_references_timing(fetch_ms: i64, cast_ms: i64, total_ms: i64) {
+    STATS::fetch_references_ms.add_value(fetch_ms);
+    STATS::cast_references_data_ms.add_value(cast_ms);
+    STATS::total_ms.add_value(total_ms);
+}
+
+// Emit the split of cast_references_data into its two I/O stages. See the counter
+// comments in define_stats!: these are sums over concurrent futures, so their
+// ratio identifies the dominant stage but their total is not comparable to
+// cast_references_data_ms. Same always-on, O(1), pure-telemetry contract as
+// log_get_references_timing.
+fn log_cast_phase_timing(bonsai_mapping_ms: i64, changeset_info_ms: i64) {
+    STATS::bonsai_mapping_ms.add_value(bonsai_mapping_ms);
+    STATS::changeset_info_ms.add_value(changeset_info_ms);
+}
+
+// Chunk size and the try_flatten_unordered limit below multiply out to the
+// number of heads in flight against bonsai_hg_mapping, so they are tuned as a
+// pair.
+const HEADS_CHUNK_SIZE: usize = 250;
+const BONSAI_MAPPING_CONCURRENCY: usize = 40;
+const CHANGESET_INFO_CONCURRENCY: usize = 100;
+
+/// The stage timings are returned rather than logged here so that each caller
+/// attributes them to its own series.
+pub(crate) struct ResolvedHeadAuthorDates {
+    pub dates: HashMap<CloudChangesetId, i64>,
+    pub bonsai_mapping_ms: i64,
+    pub changeset_info_ms: i64,
+}
+
+pub(crate) async fn resolve_head_author_dates(
+    core_ctx: &CoreContext,
+    cc_ctx: &CommitCloudContext,
+    bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
+    bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
+    repo_derived_data: &ArcRepoDerivedData,
+    cloud_ids: Vec<CloudChangesetId>,
+) -> Result<ResolvedHeadAuthorDates, anyhow::Error> {
+    let chunks_iter = cloud_ids
+        .chunks(HEADS_CHUNK_SIZE)
+        .map(|chunk| Ok::<_, anyhow::Error>(chunk.to_vec()));
+
+    // The two stages below are pipelined, so neither can be bracketed by a single
+    // Instant; each future adds its own elapsed time here instead.
+    let bonsai_mapping_nanos = AtomicU64::new(0);
+    let changeset_info_nanos = AtomicU64::new(0);
+    let bonsai_mapping_nanos = &bonsai_mapping_nanos;
+    let changeset_info_nanos = &changeset_info_nanos;
+
+    // A failed derive still fails the whole read via `?`: the client treats the
+    // head set it gets back as authoritative, so a dateless head is worse.
+    let dates: HashMap<CloudChangesetId, i64> = stream::iter(chunks_iter)
+        // map [CloudChangesetId] to [(CloudChangesetId, BonsaiChangesetId)]
+        .and_then(|heads| {
+            cloned!(bonsai_hg_mapping, bonsai_git_mapping);
+            async move {
+                let start = Instant::now();
+                let mapped = utils::get_bonsai_from_cloud_ids(
+                    core_ctx,
+                    cc_ctx,
+                    bonsai_hg_mapping,
+                    bonsai_git_mapping,
+                    heads,
+                )
+                .await?;
+                bonsai_mapping_nanos
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                Ok(stream::iter(mapped.into_iter().map(Ok::<_, anyhow::Error>)))
+            }
+        })
+        .try_flatten_unordered(BONSAI_MAPPING_CONCURRENCY)
+        // map (CloudChangesetId, BonsaiChangesetId) to (CloudChangesetId, unix_timestamp)
+        .and_then(|(cid, bcs_id)| async move {
+            let start = Instant::now();
+            let derived = repo_derived_data
+                .derive::<ChangesetInfo>(core_ctx, bcs_id, DerivationPriority::LOW)
+                .await;
+            changeset_info_nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            derived
+                .map_err(Into::into)
+                .map(|cs_info| future::ok((cid, cs_info.author_date().as_chrono().timestamp())))
+        })
+        .try_buffer_unordered(CHANGESET_INFO_CONCURRENCY)
+        .try_collect()
+        .boxed()
+        .await?;
+
+    Ok(ResolvedHeadAuthorDates {
+        dates,
+        bonsai_mapping_ms: (bonsai_mapping_nanos.load(Ordering::Relaxed) / 1_000_000) as i64,
+        changeset_info_ms: (changeset_info_nanos.load(Ordering::Relaxed) / 1_000_000) as i64,
+    })
+}
+
+/// Must run before the transaction opens: deriving inside one would hold an XDB
+/// transaction -- which `query_with_transaction` never retries -- across N
+/// blobstore round trips.
+///
+/// Unlike the read path, a failed derive is swallowed here: it must never fail
+/// an upload.
+pub(crate) async fn resolve_write_head_author_dates(
+    core_ctx: &CoreContext,
+    cc_ctx: &CommitCloudContext,
+    bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
+    bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
+    repo_derived_data: &ArcRepoDerivedData,
+    new_heads: &[CloudChangesetId],
+) -> HashMap<CloudChangesetId, i64> {
+    if new_heads.is_empty()
+        || !justknobs::eval(
+            "scm/mononoke:commitcloud_write_head_author_date",
+            None,
+            None,
+        )
+    {
+        return HashMap::new();
     }
 
-    STATS::heads_returned.add_value(heads_dates.len() as i64);
-    for ((_, label), count) in AGE_BUCKETS.iter().zip(buckets.iter()) {
-        STATS::head_age_bucket.add_value(*count, (*label,));
-    }
+    let resolved = match resolve_head_author_dates(
+        core_ctx,
+        cc_ctx,
+        bonsai_hg_mapping,
+        bonsai_git_mapping,
+        repo_derived_data,
+        new_heads.to_vec(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            core_ctx.scuba().clone().log_with_msg(
+                "commit cloud: failed to resolve head author dates on write",
+                format!(
+                    "For workspace {} in repo {}: {:#}",
+                    cc_ctx.workspace, cc_ctx.reponame, e
+                ),
+            );
+            return HashMap::new();
+        }
+    };
+
+    resolved.dates
 }
 
 // Workspace information as we retrieve it form the database
@@ -123,21 +256,28 @@ pub(crate) async fn fetch_references(
     cc_ctx: &CommitCloudContext,
     sql: &SqlCommitCloud,
 ) -> Result<RawReferencesData, anyhow::Error> {
-    let heads: Vec<WorkspaceHead> = sql
-        .get(ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone())
-        .await?;
-
-    let local_bookmarks: Vec<WorkspaceLocalBookmark> = sql
-        .get(ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone())
-        .await?;
-
-    let remote_bookmarks: Vec<WorkspaceRemoteBookmark> = sql
-        .get(ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone())
-        .await?;
-
-    let snapshots: Vec<WorkspaceSnapshot> = sql
-        .get(ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone())
-        .await?;
+    // The four reads below are independent SQL queries against different
+    // tables (heads/local_bookmarks/remote_bookmarks/snapshots), keyed only
+    // by (reponame, workspace) -- none depends on another's result. Issuing
+    // them concurrently instead of sequentially cuts this function's wall
+    // time from ~4 round trips to ~1 on the `hg cloud sync` hot path (every
+    // get_references/update_references call goes through here).
+    let (heads, local_bookmarks, remote_bookmarks, snapshots) = try_join!(
+        Get::<WorkspaceHead>::get(sql, ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone()),
+        Get::<WorkspaceLocalBookmark>::get(
+            sql,
+            ctx,
+            cc_ctx.reponame.clone(),
+            cc_ctx.workspace.clone()
+        ),
+        Get::<WorkspaceRemoteBookmark>::get(
+            sql,
+            ctx,
+            cc_ctx.reponame.clone(),
+            cc_ctx.workspace.clone()
+        ),
+        Get::<WorkspaceSnapshot>::get(sql, ctx, cc_ctx.reponame.clone(), cc_ctx.workspace.clone()),
+    )?;
 
     Ok(RawReferencesData {
         heads,
@@ -162,55 +302,43 @@ pub(crate) async fn cast_references_data(
     let remote_bookmarks: Vec<WorkspaceRemoteBookmark> = raw_references_data.remote_bookmarks;
     let mut snapshots: Vec<CloudChangesetId> = Vec::new();
 
-    // Start the pipeline with batches of 1000 heads.
-    let chunks_iter = raw_references_data.heads.chunks(1000).map(|chunk| {
-        let chunk_heads: Vec<CloudChangesetId> = chunk.iter().map(|head| head.commit).collect();
-        Ok::<_, anyhow::Error>(chunk_heads)
-    });
+    let read_stored_author_date =
+        justknobs::eval("scm/mononoke:commitcloud_read_head_author_date", None, None);
 
-    let repo_derived_data = &repo_derived_data;
+    let heads_to_derive: Vec<CloudChangesetId> = raw_references_data
+        .heads
+        .iter()
+        .filter(|head| !read_stored_author_date || head.author_date.is_none())
+        .map(|head| head.commit)
+        .collect();
+    let heads_derived_count = heads_to_derive.len();
 
-    let heads_dates: HashMap<CloudChangesetId, i64> = stream::iter(chunks_iter)
-        // map [CloudChangesetId] to [(CloudChangesetId, BonsaiChangesetId)]
-        .and_then(|heads| {
-            cloned!(bonsai_hg_mapping, bonsai_git_mapping);
-            async move {
-                Ok(stream::iter(
-                    utils::get_bonsai_from_cloud_ids(
-                        core_ctx,
-                        cc_ctx,
-                        bonsai_hg_mapping,
-                        bonsai_git_mapping,
-                        heads,
-                    )
-                    .await?
-                    .into_iter()
-                    .map(Ok::<_, anyhow::Error>),
-                ))
-            }
-        })
-        // do up to 10 hg->bonsai mappings concurrently, flattening out results
-        .try_flatten_unordered(10)
-        // map (CloudChangesetId, BonsaiChangesetId) to (CloudChangesetId, unix_timestamp)
-        .and_then(|(cid, bcs_id)| async move {
-            repo_derived_data
-                .derive::<ChangesetInfo>(core_ctx, bcs_id, DerivationPriority::LOW)
-                .await
-                .map_err(Into::into)
-                .map(|cs_info| future::ok((cid, cs_info.author_date().as_chrono().timestamp())))
-        })
-        // do up to 100 derived data fetches concurrently
-        .try_buffer_unordered(100)
-        .try_collect()
-        .boxed()
-        .await?;
+    let resolved = resolve_head_author_dates(
+        core_ctx,
+        cc_ctx,
+        bonsai_hg_mapping,
+        bonsai_git_mapping,
+        &repo_derived_data,
+        heads_to_derive,
+    )
+    .await?;
 
-    // Pure telemetry: emit a per-sync head-age histogram and head count from the
-    // author dates we already computed above. Gated by a JustKnob so it can be
-    // disabled instantly without a code push.
-    if justknobs::eval("scm/mononoke:commitcloud_log_head_age_metrics", None, None) {
-        log_head_age_metrics(&heads_dates);
+    log_cast_phase_timing(resolved.bonsai_mapping_ms, resolved.changeset_info_ms);
+
+    log_heads_derived(heads_derived_count);
+
+    let mut heads_dates = resolved.dates;
+    if read_stored_author_date {
+        heads_dates.reserve(raw_references_data.heads.len() - heads_derived_count);
+        heads_dates.extend(
+            raw_references_data
+                .heads
+                .iter()
+                .filter_map(|head| head.author_date.map(|date| (head.commit, date))),
+        );
     }
+
+    log_heads_returned(heads_dates.len());
 
     for bookmark in raw_references_data.local_bookmarks {
         bookmarks.insert(bookmark.name().clone(), bookmark.commit().clone());
@@ -243,6 +371,7 @@ pub(crate) async fn update_references_data(
     ctx: &CoreContext,
     params: UpdateReferencesParams,
     cc_ctx: &CommitCloudContext,
+    head_author_dates: &HashMap<CloudChangesetId, i64>,
 ) -> anyhow::Result<Transaction> {
     let mut txn = txn;
     txn = update_heads(
@@ -252,6 +381,7 @@ pub(crate) async fn update_references_data(
         cc_ctx,
         params.removed_heads,
         params.new_heads,
+        head_author_dates,
     )
     .await?;
     txn = update_bookmarks(
@@ -322,31 +452,4 @@ pub async fn rename_all(
     )
     .await?;
     Ok((txn, affected_rows))
-}
-
-#[cfg(test)]
-mod test {
-    use mononoke_macros::mononoke;
-
-    use super::*;
-
-    #[mononoke::test]
-    fn age_bucket_index_maps_ages_to_labels() {
-        let label = |age_days| AGE_BUCKETS[age_bucket_index(age_days)].1;
-
-        // Each bucket's lower edge, upper edge, and the boundary above it.
-        assert_eq!(label(0), "lt_1d");
-        assert_eq!(label(1), "1d_7d");
-        assert_eq!(label(6), "1d_7d");
-        assert_eq!(label(7), "7d_14d");
-        assert_eq!(label(13), "7d_14d");
-        assert_eq!(label(14), "14d_28d");
-        assert_eq!(label(27), "14d_28d");
-        assert_eq!(label(28), "28d_90d");
-        assert_eq!(label(89), "28d_90d");
-        assert_eq!(label(90), "gt_90d");
-
-        // The oldest bucket is unbounded, so no age can index past the array.
-        assert_eq!(label(i64::MAX), "gt_90d");
-    }
 }

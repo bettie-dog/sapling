@@ -102,7 +102,6 @@ define_stats! {
     push_success: dynamic_timeseries("push_success.{}", (reponame: String); Rate, Sum),
     push_hook_failure: dynamic_timeseries("push_hook_failure.{}.{}", (reponame: String, hook_failure: String); Rate, Sum),
     push_conflicts: dynamic_timeseries("push_conflicts.{}", (reponame: String); Rate, Sum),
-    rate_limits_exceeded: dynamic_timeseries("rate_limits_exceeded.{}", (reponame: String); Rate, Sum),
     push_error: dynamic_timeseries("push_error.{}", (reponame: String); Rate, Sum),
 }
 
@@ -527,7 +526,7 @@ impl<R: Repo> HgCommands for RepoClient<R> {
                         .collect::<Vec<_>>();
                     infos.push(b"ambiguous identifier\nsuggestions are:\n".to_vec());
                     infos.reverse();
-                    generate_lookup_resp_buf(false, &infos.join(&[b'\n'][..]))
+                    generate_lookup_resp_buf(false, &infos.join(&b"\n"[..]))
                 })
                 .boxify()
                 .compat()

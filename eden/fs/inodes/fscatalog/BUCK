@@ -24,6 +24,7 @@ cpp_library(
         "//folly:conv",
         "//folly:exception",
         "//folly:file_util",
+        "//folly:string",
         "//folly/io:iobuf",
         "//folly/lang:to_ascii",
         "//folly/logging:logging",
@@ -38,6 +39,8 @@ cpp_library(
         "//eden/fs/inodes/overlay:serialization-cpp2-types",
         "//folly:file",
         "//folly:range",
+        "//folly:synchronized",
+        "//folly/container:evicting_cache_map",
     ],
     external_deps = [
         ("boost", None, "boost_filesystem"),

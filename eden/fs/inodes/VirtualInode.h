@@ -141,29 +141,12 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
-  // DEPRECATED: Use co_getSHA1 instead.
-  ImmediateFuture<Hash20> getSHA1(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
   folly::coro::now_task<Hash20> co_getSHA1(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
-  ImmediateFuture<Hash32> getBlake3(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
   folly::coro::now_task<Hash32> co_getBlake3(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
-  // DEPRECATED: Use co_getDigestHash instead.
-  ImmediateFuture<std::optional<Hash32>> getDigestHash(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
@@ -247,7 +230,7 @@ class VirtualInode {
    */
   folly::coro::now_task<
       std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
-  co_getChildren(
+  getChildren(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext);
@@ -275,10 +258,6 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       timespec lastCheckoutTime,
       const ObjectFetchContextPtr& fetchContext);
-
-  ImmediateFuture<std::string> getBlob(
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
 
   folly::coro::now_task<std::string> co_getBlob(
       const std::shared_ptr<ObjectStore>& objectStore,

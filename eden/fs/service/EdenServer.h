@@ -352,14 +352,14 @@ class EdenServer : private TakeoverHandler {
       CheckoutMode checkoutMode);
 
   /**
-   * Garbage collect the working copy of the passed in mount.
+   * Garbage collect inodes in the passed-in mount.
    */
-  ImmediateFuture<uint64_t> garbageCollectWorkingCopy(
+  ImmediateFuture<uint64_t> garbageCollectInodes(
       EdenMount& mount,
       TreeInodePtr rootInode,
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
-      bool pressureBased = false);
+      bool pressureBased);
 
   /**
    * Stop all garbage collection tasks and wait for any running GC to finish.
@@ -377,7 +377,7 @@ class EdenServer : private TakeoverHandler {
       uint8_t maxRetries,
       std::chrono::seconds retryInterval);
 
-  bool isWorkingCopyGCRunningForAnyMount() const;
+  bool isInodeGCRunningForAnyMount() const;
 
   const std::shared_ptr<BlobCache>& getBlobCache() const {
     return blobCache_;
@@ -406,6 +406,16 @@ class EdenServer : private TakeoverHandler {
   AbsolutePathPiece getEdenDir() const {
     return edenDir_.getPath();
   }
+
+  /**
+   * Give the privhelper what it needs to relaunch this daemon after a crash,
+   * and create the sentinel whose existence says "still armed".
+   *
+   * No-op unless this is macOS with privhelper:restart-edenfs-on-crash set.
+   * Best effort: a daemon started without edenfsctl has no recorded command,
+   * and the only consequence is that it will not be restarted.
+   */
+  void armPrivHelperRestart();
 
   std::string getEdenHeartbeatFileNameStr() const;
   std::optional<std::string> getOldEdenHeartbeatFileNameStr() const;
@@ -800,7 +810,42 @@ class EdenServer : private TakeoverHandler {
   };
   folly::Synchronized<RunStateData> runningState_;
 
+  /**
+   * Move the server into RunState::SHUTTING_DOWN.
+   *
+   * The single entry point for that transition, so that everything which has
+   * to happen once a shutdown is intended happens on every path that intends
+   * one.
+   *
+   * Caller must hold runningState_ write-locked.
+   */
+  void markShuttingDownLocked(RunStateData& state);
+
+  /** Remove this daemon's restart sentinel. Idempotent. */
+  void removeRestartSentinel();
+
+  /**
+   * Whether the privhelper accepted our restart configuration. Only ever true
+   * on macOS with the feature enabled; gates every disarm action.
+   */
+  std::atomic<bool> privHelperRestartArmed_{false};
+
 #ifdef __APPLE__
+  /**
+   * The `argv` and `env` edenfsctl recorded for this daemon, read on the first
+   * arm and kept.
+   *
+   * Returns nullopt, having logged why, if there is nothing to relaunch with.
+   */
+  std::optional<folly::dynamic> getRelaunchCommand();
+
+  /**
+   * Memoizes getRelaunchCommand(). The args file has one fixed path per state
+   * directory, so a daemon that failed to take over from us has already
+   * replaced its contents with its own command by the time we re-arm.
+   */
+  folly::Synchronized<std::optional<folly::dynamic>> relaunchCommand_;
+
   folly::dynamic nfsStatOutput_;
   std::optional<std::string> mapCounterNameForNFSStat(
       std::pair<std::string, std::string> nfsStatsCounter);
@@ -858,9 +903,8 @@ class EdenServer : private TakeoverHandler {
 #endif
 
   /**
-   * Structured logger for error telemetry. When scribe binary and
-   * error category are configured, this is an ErrorLogger instance;
-   * Always created; no-ops internally when scribe is not configured.
+   * XplatLogger-backed structured logger for error telemetry. Always created;
+   * no-ops internally when XplatLogger is unavailable.
    */
   std::shared_ptr<ErrorLogger> errorLogger_;
 
@@ -1022,7 +1066,7 @@ class EdenServer : private TakeoverHandler {
   PeriodicFnTask<&EdenServer::manageOverlay> overlayTask_{this, "overlay"};
   PeriodicFnTask<&EdenServer::garbageCollectAllMounts> gcTask_{
       this,
-      "working_copy_gc"};
+      "inode_gc"};
   PeriodicFnTask<&EdenServer::detectNfsCrawl> detectNfsCrawlTask_{
       this,
       "detect_nfs_crawl"};

@@ -10,7 +10,7 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 async-recursion = "1.1.1"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blame = { version = "0.1.0", path = "../../derived_data/blame" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bytes = { version = "1.12.1", features = ["serde"] }
@@ -20,10 +20,10 @@ context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context"
 deleted_manifest = { version = "0.1.0", path = "../../derived_data/deleted_manifest" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derived_data = { version = "0.1.0", path = "../../derived_data" }
-either = "1.16.0"
+either = "1.17.0"
 fastlog = { version = "0.1.0", path = "../../derived_data/fastlog" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-futures-util = { version = "0.3.30", features = ["compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+futures-util = { version = "0.3.34", features = ["compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 history_manifest = { version = "0.1.0", path = "../../derived_data/history_manifest" }
 inferred_copy_from = { version = "0.1.0", path = "../../derived_data/inferred_copy_from" }
@@ -37,9 +37,9 @@ repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_deri
 repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
 
 [dev-dependencies]

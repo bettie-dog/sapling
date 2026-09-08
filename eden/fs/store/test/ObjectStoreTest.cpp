@@ -9,10 +9,11 @@
 #include <gtest/gtest.h>
 #include <re2/re2.h>
 
+#include <array>
+
 #include <fb303/ServiceData.h>
 #include <folly/coro/GtestHelpers.h>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/EdenConfig.h"
@@ -38,14 +39,12 @@ constexpr size_t kTreeCacheMinimumEntries = 0;
 constexpr folly::StringPiece kBlake3Key = "19700101-1111111111111111111111#";
 
 std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger() {
-  return std::make_shared<EdenFsEventsLogger>(
-      std::make_shared<NullStructuredLogger>(),
-      /*xplatLogger=*/nullptr,
-      /*reloadableConfig=*/nullptr,
-      makeRefPtr<EdenStats>());
+  return std::make_shared<EdenFsEventsLogger>(nullptr);
 }
 
 struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
+  using TreeAuxStats = std::array<int64_t, 3>;
+
   void SetUp() override {
     std::shared_ptr<EdenConfig> rawEdenConfig{
         EdenConfig::createTestEdenConfig()};
@@ -53,6 +52,9 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
         kTreeCacheMaximumSize, ConfigSourceType::Default, true);
     rawEdenConfig->inMemoryTreeCacheMinimumItems.setValue(
         kTreeCacheMinimumEntries, ConfigSourceType::Default, true);
+    // The tests rely on deterministic caching of small trees, so use a single
+    // shard to avoid the tiny per-shard capacity evicting entries immediately.
+    rawEdenConfig->treeCacheShards.setValue(1, ConfigSourceType::Default, true);
     auto edenConfig = std::make_shared<ReloadableConfig>(rawEdenConfig);
     stats = makeRefPtr<EdenStats>();
     treeCache = TreeCache::create(edenConfig, stats.copy());
@@ -162,6 +164,52 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
         : CaseSensitivity::Sensitive;
   }
 
+  TreeAuxStats getTreeAuxStats() {
+    stats->flush();
+    auto* serviceData = facebook::fb303::ServiceData::get();
+    return {
+        serviceData
+            ->getCounterIfExists("object_store.get_tree_metadata.memory.sum.60")
+            .value_or(0),
+        serviceData
+            ->getCounterIfExists(
+                "object_store.get_tree_metadata.backing_store.sum.60")
+            .value_or(0),
+        serviceData
+            ->getCounterIfExists("object_store.get_tree_metadata_failed.sum.60")
+            .value_or(0),
+    };
+  }
+
+  TreeAuxStats getTreeAuxStatsDelta(const TreeAuxStats& before) {
+    auto after = getTreeAuxStats();
+    return {
+        after[0] - before[0],
+        after[1] - before[1],
+        after[2] - before[2],
+    };
+  }
+
+  static void expectTreeAuxData(
+      const TreeAuxData& expected,
+      const std::optional<TreeAuxData>& actual) {
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(expected.digestHash, actual->digestHash);
+    EXPECT_EQ(expected.digestSize, actual->digestSize);
+  }
+
+  static void expectTreeAuxFetch(
+      const LoggingFetchContext& context,
+      size_t index,
+      const ObjectId& expectedId,
+      ObjectFetchContext::Origin expectedOrigin) {
+    ASSERT_GT(context.requests.size(), index);
+    const auto& request = context.requests[index];
+    EXPECT_EQ(ObjectFetchContext::TreeAuxData, request.type);
+    EXPECT_EQ(expectedId, request.id);
+    EXPECT_EQ(expectedOrigin, request.origin);
+  }
+
   RefPtr<LoggingFetchContext> loggingContext =
       makeRefPtr<LoggingFetchContext>();
   const ObjectFetchContextPtr& context =
@@ -207,6 +255,130 @@ TEST_P(ObjectStoreTest, getTree_tracks_second_read_from_cache) {
   EXPECT_EQ(ObjectFetchContext::Tree, request.type);
   EXPECT_EQ(readyTreeId, request.id);
   EXPECT_EQ(ObjectFetchContext::FromMemoryCache, request.origin);
+}
+
+CO_TEST_P(
+    ObjectStoreTest,
+    getTreeAuxData_adapterMatchesCoroutineForBackingStoreAndMemoryCache) {
+  const ObjectId adapterId{"adapter_tree_aux"};
+  const ObjectId coroutineId{"coroutine_tree_aux"};
+  const TreeAuxData expected{Hash32::blake3("tree aux data"_sp), 123};
+  fakeBackingStore->putTreeAuxData(
+      adapterId, std::make_shared<TreeAuxData>(expected));
+  fakeBackingStore->putTreeAuxData(
+      coroutineId, std::make_shared<TreeAuxData>(expected));
+
+  auto adapterContext = makeRefPtr<LoggingFetchContext>();
+  auto coroutineContext = makeRefPtr<LoggingFetchContext>();
+
+  auto before = getTreeAuxStats();
+  auto adapterResult =
+      co_await objectStore
+          ->getTreeAuxData(adapterId, adapterContext.as<ObjectFetchContext>())
+          .semi();
+  EXPECT_EQ(TreeAuxStats({0, 1, 0}), getTreeAuxStatsDelta(before));
+
+  before = getTreeAuxStats();
+  auto coroutineResult = co_await objectStore->co_getTreeAuxData(
+      coroutineId, coroutineContext.as<ObjectFetchContext>());
+  EXPECT_EQ(TreeAuxStats({0, 1, 0}), getTreeAuxStatsDelta(before));
+
+  expectTreeAuxData(expected, adapterResult);
+  expectTreeAuxData(expected, coroutineResult);
+  EXPECT_EQ(1, adapterContext->requests.size());
+  EXPECT_EQ(1, coroutineContext->requests.size());
+  expectTreeAuxFetch(
+      *adapterContext, 0, adapterId, ObjectFetchContext::FromNetworkFetch);
+  expectTreeAuxFetch(
+      *coroutineContext, 0, coroutineId, ObjectFetchContext::FromNetworkFetch);
+
+  before = getTreeAuxStats();
+  adapterResult =
+      co_await objectStore
+          ->getTreeAuxData(adapterId, adapterContext.as<ObjectFetchContext>())
+          .semi();
+  EXPECT_EQ(TreeAuxStats({1, 0, 0}), getTreeAuxStatsDelta(before));
+
+  before = getTreeAuxStats();
+  coroutineResult = co_await objectStore->co_getTreeAuxData(
+      coroutineId, coroutineContext.as<ObjectFetchContext>());
+  EXPECT_EQ(TreeAuxStats({1, 0, 0}), getTreeAuxStatsDelta(before));
+
+  expectTreeAuxData(expected, adapterResult);
+  expectTreeAuxData(expected, coroutineResult);
+  EXPECT_EQ(2, adapterContext->requests.size());
+  EXPECT_EQ(2, coroutineContext->requests.size());
+  expectTreeAuxFetch(
+      *adapterContext, 1, adapterId, ObjectFetchContext::FromMemoryCache);
+  expectTreeAuxFetch(
+      *coroutineContext, 1, coroutineId, ObjectFetchContext::FromMemoryCache);
+}
+
+CO_TEST_P(ObjectStoreTest, getTreeAuxData_adapterMatchesCoroutineWhenAbsent) {
+  const ObjectId adapterId{"adapter_missing_tree_aux"};
+  const ObjectId coroutineId{"coroutine_missing_tree_aux"};
+  fakeBackingStore->putTreeAuxData(adapterId, nullptr);
+  fakeBackingStore->putTreeAuxData(coroutineId, nullptr);
+
+  auto adapterContext = makeRefPtr<LoggingFetchContext>();
+  auto coroutineContext = makeRefPtr<LoggingFetchContext>();
+
+  auto before = getTreeAuxStats();
+  auto adapterResult =
+      co_await objectStore
+          ->getTreeAuxData(adapterId, adapterContext.as<ObjectFetchContext>())
+          .semi();
+  EXPECT_EQ(TreeAuxStats({0, 0, 2}), getTreeAuxStatsDelta(before));
+
+  before = getTreeAuxStats();
+  auto coroutineResult = co_await objectStore->co_getTreeAuxData(
+      coroutineId, coroutineContext.as<ObjectFetchContext>());
+  EXPECT_EQ(TreeAuxStats({0, 0, 2}), getTreeAuxStatsDelta(before));
+
+  EXPECT_FALSE(adapterResult.has_value());
+  EXPECT_FALSE(coroutineResult.has_value());
+  EXPECT_TRUE(adapterContext->requests.empty());
+  EXPECT_TRUE(coroutineContext->requests.empty());
+}
+
+CO_TEST_P(
+    ObjectStoreTest,
+    getTreeAuxData_adapterMatchesCoroutineExceptionPropagation) {
+  const ObjectId missingId{"missing_tree_aux"};
+  auto adapterContext = makeRefPtr<LoggingFetchContext>();
+  auto coroutineContext = makeRefPtr<LoggingFetchContext>();
+
+  auto before = getTreeAuxStats();
+  bool adapterCaught = false;
+  std::string adapterError;
+  try {
+    co_await objectStore
+        ->getTreeAuxData(missingId, adapterContext.as<ObjectFetchContext>())
+        .semi();
+  } catch (const std::domain_error& error) {
+    adapterCaught = true;
+    adapterError = error.what();
+  }
+  EXPECT_TRUE(adapterCaught);
+  EXPECT_EQ(TreeAuxStats({0, 0, 1}), getTreeAuxStatsDelta(before));
+
+  before = getTreeAuxStats();
+  bool coroutineCaught = false;
+  std::string coroutineError;
+  try {
+    co_await objectStore->co_getTreeAuxData(
+        missingId, coroutineContext.as<ObjectFetchContext>());
+  } catch (const std::domain_error& error) {
+    coroutineCaught = true;
+    coroutineError = error.what();
+  }
+  EXPECT_TRUE(coroutineCaught);
+  EXPECT_EQ(
+      "tree aux data 6d697373696e675f747265655f617578 not found", adapterError);
+  EXPECT_EQ(adapterError, coroutineError);
+  EXPECT_EQ(TreeAuxStats({0, 0, 1}), getTreeAuxStatsDelta(before));
+  EXPECT_TRUE(adapterContext->requests.empty());
+  EXPECT_TRUE(coroutineContext->requests.empty());
 }
 
 TEST_P(ObjectStoreTest, getTree_doesNotCacheRestrictedTree) {
@@ -373,22 +545,23 @@ TEST_P(ObjectStoreTest, getBlobSha1) {
   EXPECT_EQ(expectedSha1.toString(), sha1.toString());
 }
 
-TEST_P(ObjectStoreTest, getBlobBlake3) {
+CO_TEST_P(ObjectStoreTest, getBlobBlake3) {
   auto data = "A"_sp;
   ObjectId id = putReadyBlob(data);
 
   Hash32 expectedBlake3 = Hash32::blake3(data);
-  Hash32 blake3 = objectStore->getBlobBlake3(id, context).get();
+  Hash32 blake3 = co_await objectStore->co_getBlobBlake3(id, context);
   EXPECT_EQ(expectedBlake3.toString(), blake3.toString());
 }
 
-TEST_P(ObjectStoreTest, getBlobKeyedBlake3) {
+CO_TEST_P(ObjectStoreTest, getBlobKeyedBlake3) {
   auto data = "A"_sp;
   ObjectId id = putReadyBlob(data);
 
   Hash32 expectedBlake3 =
       Hash32::keyedBlake3(folly::ByteRange{kBlake3Key}, data);
-  Hash32 blake3 = objectStoreWithBlake3Key->getBlobBlake3(id, context).get();
+  Hash32 blake3 =
+      co_await objectStoreWithBlake3Key->co_getBlobBlake3(id, context);
   EXPECT_EQ(expectedBlake3.toString(), blake3.toString());
 }
 
@@ -401,19 +574,25 @@ TEST_P(ObjectStoreTest, getBlobSha1NotFound) {
       "blob .* not found");
 }
 
-TEST_P(ObjectStoreTest, getBlobBlake3NotFound) {
+CO_TEST_P(ObjectStoreTest, getBlobBlake3NotFound) {
   ObjectId id;
 
-  EXPECT_THROW_RE(
-      objectStore->getBlobBlake3(id, context).get(),
-      std::domain_error,
-      "blob .* not found");
+  bool caught = false;
+  try {
+    co_await objectStore->co_getBlobBlake3(id, context);
+  } catch (const std::domain_error& e) {
+    caught = true;
+    EXPECT_TRUE(RE2::PartialMatch(e.what(), "blob .* not found"));
+  }
+  EXPECT_TRUE(caught);
 }
 
-TEST_P(ObjectStoreTest, get_size_and_sha1_and_blake3_only_imports_blob_once) {
+CO_TEST_P(
+    ObjectStoreTest,
+    get_size_and_sha1_and_blake3_only_imports_blob_once) {
   objectStore->getBlobSize(readyBlobId, context).get(0ms);
   objectStore->getBlobSha1(readyBlobId, context).get(0ms);
-  objectStore->getBlobBlake3(readyBlobId, context).get(0ms);
+  co_await objectStore->co_getBlobBlake3(readyBlobId, context);
 
   EXPECT_EQ(1, fakeBackingStore->getAccessCount(readyBlobId));
 }

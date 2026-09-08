@@ -8,27 +8,43 @@
 #include <boost/filesystem.hpp>
 #include <folly/Exception.h>
 #include <folly/File.h>
+#include <folly/FileUtil.h>
+#include <folly/Portability.h>
 #include <folly/Range.h>
+#include <folly/Synchronized.h>
 #include <folly/futures/Future.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseThread.h>
+#include <folly/json/json.h>
+#include <folly/portability/Fcntl.h>
+#include <folly/synchronization/Baton.h>
+#include <folly/synchronization/SaturatingSemaphore.h>
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <sys/wait.h>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 
+#include "eden/common/telemetry/DynamicEvent.h"
 #include "eden/common/testharness/TempFile.h"
 #include "eden/common/utils/UserInfo.h"
+#include "eden/common/utils/test/ScopedEnvVar.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperImpl.h"
+#include "eden/fs/privhelper/RestartSentinel.h"
 #include "eden/fs/privhelper/test/PrivHelperTestServer.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
+#include "eden/fs/telemetry/IXplatLogger.h"
+#include "eden/fs/telemetry/XplatKeys.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;
@@ -45,6 +61,17 @@ using folly::test::TemporaryDirectory;
 using folly::test::TemporaryFile;
 using std::string;
 using testing::UnorderedElementsAre;
+
+TEST(TccDisclaimKillswitch, presentWhenFileExists) {
+  TemporaryFile killswitch;
+  EXPECT_TRUE(tccDisclaimKillswitchPresent(killswitch.path().c_str()));
+}
+
+TEST(TccDisclaimKillswitch, absentWhenFileDoesNotExist) {
+  TemporaryDirectory dir;
+  auto missing = (dir.path() / "disable-tcc-disclaim").string();
+  EXPECT_FALSE(tccDisclaimKillswitchPresent(missing.c_str()));
+}
 
 /**
  * A PrivHelperServer implementation intended to be used in a separate thread in
@@ -292,7 +319,112 @@ UnixSocket::Message makeLegacyMacFuseConfigRequest(
 static_assert(PrivHelperConn::REQ_SET_DAEMON_TIMEOUT == 9);
 static_assert(PrivHelperConn::REQ_SET_USE_EDENFS == 10);
 
+// An arbitrary fixed point in time, so that the restart window can be aged
+// without sleeping.
+constexpr uint64_t kFakeNow = 1'700'000'000ull;
+
+// Distinct bytes above 2^32, so a truncated width or a swapped field fails.
+constexpr uint64_t kSentinelNonce = 0x0123456789abcdefull;
+
+EdenFsRestartArgs makeRestartArgs(std::string sentinelPath) {
+  EdenFsRestartArgs args;
+  args.enabled = true;
+  args.sentinelPath = std::move(sentinelPath);
+  args.sentinelNonce = kSentinelNonce;
+  args.restartCount = 1;
+  args.firstRestartEpochSec = kFakeNow;
+  args.maxRestarts = 3;
+  args.windowSeconds = 600;
+  return args;
+}
+
+#ifdef __APPLE__
+const std::vector<std::string> kSentinelArgv{
+    "/usr/local/libexec/eden/edenfs",
+    "--edenfs"};
+
+folly::dynamic makeSentinelEnv() {
+  return folly::dynamic::object("PATH", "/usr/bin")("HOME", "/home/test");
+}
+
+/** The relaunch command as EdenServer::armPrivHelperRestart() writes it. */
+std::string makeSentinelContents(
+    uint64_t nonce = kSentinelNonce,
+    folly::dynamic env = makeSentinelEnv()) {
+  folly::dynamic argv = folly::dynamic::array;
+  for (const auto& arg : kSentinelArgv) {
+    argv.push_back(arg);
+  }
+  return folly::toJson(
+      folly::dynamic::object("argv", argv)("env", std::move(env))(
+          "nonce", static_cast<int64_t>(nonce)));
+}
+
+/** As a daemon too old to stamp a generation writes it. */
+std::string makeSentinelContentsWithoutNonce() {
+  return folly::toJson(
+      folly::dynamic::object("argv", folly::dynamic::array("/bin/edenfs")));
+}
+#endif // __APPLE__
+
+EdenFsRestartArgs roundTrip(const EdenFsRestartArgs& args) {
+  auto msg = PrivHelperConn::serializeSetRestartArgsRequest(/*xid=*/42, args);
+  folly::io::Cursor cursor{&msg.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  EdenFsRestartArgs parsed;
+  PrivHelperConn::parseSetRestartArgsRequest(cursor, parsed);
+  return parsed;
+}
+
 } // namespace
+
+TEST(PrivHelperConnRestartArgs, roundTripPreservesAwkwardValues) {
+  auto expected =
+      makeRestartArgs("/var/eden dir/.edenfs_restart_armed \xc3\xa9");
+  // Above 2^32, to catch a truncated width on the wire.
+  expected.firstRestartEpochSec = uint64_t{1} << 33;
+
+  EXPECT_EQ(expected, roundTrip(expected));
+}
+
+TEST(PrivHelperRestartCounterEnv, absentIsZero) {
+  ScopedEnvVar var{kEdenFsRestartCountEnv};
+  var.unset();
+  EXPECT_EQ(0, readEdenFsRestartCounterEnv(kEdenFsRestartCountEnv));
+}
+
+TEST(PrivHelperRestartCounterEnv, emptyIsZero) {
+  ScopedEnvVar var{kEdenFsRestartCountEnv};
+  var.set("");
+  EXPECT_EQ(0, readEdenFsRestartCounterEnv(kEdenFsRestartCountEnv));
+}
+
+TEST(PrivHelperRestartCounterEnv, malformedIsZero) {
+  ScopedEnvVar var{kEdenFsRestartCountEnv};
+  var.set("three");
+  EXPECT_EQ(0, readEdenFsRestartCounterEnv(kEdenFsRestartCountEnv));
+}
+
+TEST(PrivHelperRestartCounterEnv, readsAValueAbove32Bits) {
+  // The epoch variable outgrows uint32 in 2106, so the reader is 64-bit.
+  ScopedEnvVar var{kEdenFsFirstRestartAtEnv};
+  var.set("4294967296");
+  EXPECT_EQ(
+      uint64_t{1} << 32, readEdenFsRestartCounterEnv(kEdenFsFirstRestartAtEnv));
+}
+
+TEST(PrivHelperConnRestartArgs, notifyCleanShutdownRoundTrip) {
+  constexpr folly::StringPiece kReason{"graceful restart"};
+  auto msg = PrivHelperConn::serializeNotifyCleanShutdownRequest(
+      /*xid=*/7, kReason);
+  folly::io::Cursor cursor{&msg.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  std::string reason;
+  PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+  EXPECT_EQ(kReason, reason);
+}
 
 class RawPrivHelperClient : private UnixSocket::ReceiveCallback {
  public:
@@ -313,6 +445,14 @@ class RawPrivHelperClient : private UnixSocket::ReceiveCallback {
         conn_.reset();
       }
     });
+  }
+
+  /** Sends without expecting a reply, as a one-way request does. */
+  void send(UnixSocket::Message request) {
+    clientIoThread_.getEventBase()->runInEventBaseThreadAndWait(
+        [this, request = std::move(request)]() mutable {
+          conn_->send(std::move(request));
+        });
   }
 
   UnixSocket::Message sendAndRecv(UnixSocket::Message request) {
@@ -363,6 +503,37 @@ class RawPrivHelperClient : private UnixSocket::ReceiveCallback {
   std::optional<Promise<UnixSocket::Message>> responsePromise_;
 };
 
+/**
+ * An IXplatLogger that records logged events so tests can assert on the
+ * telemetry the privhelper client emits. logEvent() is called from the
+ * client's EventBase thread.
+ */
+class RecordingXplatLogger : public IXplatLogger {
+ public:
+  void logEvent(std::string_view category, const DynamicEvent& event) override {
+    recordedEvents_.wlock()->emplace_back(std::string{category}, event);
+    eventRecorded_.post();
+  }
+
+  std::vector<std::pair<std::string, DynamicEvent>> getEvents() const {
+    return *recordedEvents_.rlock();
+  }
+
+  /**
+   * Block until at least one event has been recorded. Returns false if none
+   * was recorded within the timeout.
+   */
+  bool waitForEvent(std::chrono::milliseconds timeout) {
+    return eventRecorded_.try_wait_for(timeout);
+  }
+
+ private:
+  folly::Synchronized<std::vector<std::pair<std::string, DynamicEvent>>>
+      recordedEvents_;
+  // Saturating (multi-post safe), unlike folly::Baton.
+  folly::SaturatingSemaphore<true /* MayBlock */> eventRecorded_;
+};
+
 class PrivHelperTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -376,6 +547,8 @@ class PrivHelperTest : public ::testing::Test {
           server_.run();
         });
     client_ = createTestPrivHelper(std::move(clientConn));
+    client_->setEdenFsEventsLogger(
+        std::make_shared<EdenFsEventsLogger>(xplatLogger_));
     clientIoThread_.getEventBase()->runInEventBaseThreadAndWait(
         [&] { client_->attachEventBase(clientIoThread_.getEventBase()); });
   }
@@ -395,6 +568,8 @@ class PrivHelperTest : public ::testing::Test {
   PrivHelperThreadedTestServer server_;
   std::thread serverThread_;
   EventBaseThread clientIoThread_;
+  std::shared_ptr<RecordingXplatLogger> xplatLogger_{
+      std::make_shared<RecordingXplatLogger>()};
 };
 
 class PrivHelperFdUnmountTest : public ::testing::Test {
@@ -466,6 +641,19 @@ TEST_F(PrivHelperRawProtocolTest, legacyMacFuseConfigRequestsAreNoOps) {
       PrivHelperConn::REQ_SET_USE_EDENFS, useEdenFsResponse);
 }
 
+TEST_F(PrivHelperRawProtocolTest, cleanShutdownNotificationIsNotAnswered) {
+  client_->send(
+      PrivHelperConn::serializeNotifyCleanShutdownRequest(/*xid=*/1, "stop"));
+
+  // Nothing came back for the notification, so this reply is the next one on
+  // the wire. Answering a one-way request would make it arrive here instead,
+  // and parseEmptyResponse() rejects the mismatched type.
+  auto response = client_->sendAndRecv(
+      makeLegacyMacFuseConfigRequest(2, PrivHelperConn::REQ_SET_USE_EDENFS, 1));
+  PrivHelperConn::parseEmptyResponse(
+      PrivHelperConn::REQ_SET_USE_EDENFS, response);
+}
+
 TEST_F(PrivHelperTest, fuseMount) {
   auto mountPoint = makeTempDir("bar");
   auto path = mountPoint.path().string();
@@ -512,6 +700,39 @@ TEST_F(PrivHelperTest, fuseMount) {
   // We could register a result for the unmount operation here, but seems nice
   // for now to test that the privhelper server gracefully handles the exception
   // from the unmount operation.
+}
+
+TEST_F(PrivHelperTest, stalledRequestIsLoggedAndStillSucceeds) {
+  auto mountPoint = makeTempDir("bar");
+  auto path = mountPoint.path().string();
+
+  client_->setRequestStallThresholdForTest(50ms);
+
+  auto filePromise = server_.setFuseMountResult(path);
+  auto result = client_->fuseMount(path, false, "fuse");
+  EXPECT_FALSE(result.isReady());
+
+  // Hold the response until the stall watchdog has fired and recorded its
+  // event. The watchdog is scheduled for 50ms; the generous timeout only
+  // bounds how long we wait on a starved host.
+  ASSERT_TRUE(xplatLogger_->waitForEvent(10s));
+
+  TemporaryFile tempFile;
+  filePromise.setValue(File(tempFile.fd(), /* ownsFD */ false));
+
+  // The stall watchdog is log-only: the request must still succeed.
+  auto resultFile = std::move(result).get(1s);
+  EXPECT_GE(resultFile.fd(), 0);
+
+  auto events = xplatLogger_->getEvents();
+  ASSERT_EQ(1u, events.size());
+  EXPECT_EQ(std::string{xplat_keys::kEventsCategory}, events[0].first);
+  const auto& strings = events[0].second.getStringMap();
+  EXPECT_EQ(
+      "privhelper_request_stall", strings.at(std::string{xplat_keys::kType}));
+  EXPECT_EQ("fuse_mount", strings.at(std::string{xplat_keys::kMethod}));
+  const auto& doubles = events[0].second.getDoubleMap();
+  EXPECT_GE(doubles.at(std::string{xplat_keys::kDuration}), 0.05);
 }
 
 TEST_F(PrivHelperTest, fuseMountCustomVfsType) {
@@ -749,6 +970,37 @@ TEST_F(PrivHelperTest, bindMountRejectsEscapedMountPath) {
       "Invalid cross-device link");
 
 #endif
+}
+
+/*
+ * The privhelper control descriptor arrives across an exec without
+ * FD_CLOEXEC; startOrConnectToPrivHelper has to restore it.
+ */
+TEST(PrivHelperCloExec, adoptedClientDescriptorIsCloseOnExec) {
+  folly::File clientConn;
+  folly::File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+
+  // Reproduce what an exec leaves behind: the flag cleared.
+  const int fd = clientConn.fd();
+  folly::checkUnixError(fcntl(fd, F_SETFD, 0), "clearing FD_CLOEXEC");
+  ASSERT_EQ(0, fcntl(fd, F_GETFD) & FD_CLOEXEC)
+      << "test setup failed to clear FD_CLOEXEC";
+
+  const auto fdArg = folly::to<std::string>(fd);
+  std::vector<const char*> argv{"edenfs", "--privhelper_fd", fdArg.c_str()};
+  auto helper = startOrConnectToPrivHelper(
+      UserInfo::lookup(),
+      static_cast<int>(argv.size()),
+      const_cast<char**>(argv.data()));
+  ASSERT_NE(nullptr, helper);
+
+  EXPECT_NE(0, fcntl(fd, F_GETFD) & FD_CLOEXEC)
+      << "the adopted privhelper descriptor is inheritable; it will leak into "
+         "every child EdenFS spawns and delay the privhelper's EOF";
+
+  // startOrConnectToPrivHelper took ownership of the descriptor.
+  clientConn.release();
 }
 
 TEST_F(PrivHelperTest, bindMountRejectsSymlinkComponent) {
@@ -1121,3 +1373,867 @@ TEST_F(PrivHelperTest, setLogFile) {
   EXPECT_EQ(s1.st_dev, s2.st_dev);
   EXPECT_EQ(s1.st_ino, s2.st_ino);
 }
+
+TEST(PrivHelperSessionTest, detachesFromParentProcessGroup) {
+  // The privhelper binary calls detachFromParentProcessGroup() at startup
+  // so that killing the process group it was spawned into (as agent
+  // command runners do when cleaning up an `eden restart` invocation)
+  // cannot take the privhelper down with it. Verify in a forked child
+  // that the call moves the process into its own session and group.
+  // The child only makes raw syscalls, so forking with test threads
+  // running is safe.
+  pid_t childPid = fork();
+  folly::checkUnixError(childPid, "fork failed");
+  if (childPid == 0) {
+    if (getpgid(0) == getpid()) {
+      // The child must start out in its parent's process group for this
+      // test to prove anything.
+      _exit(2);
+    }
+    detachFromParentProcessGroup();
+    if (getpgid(0) != getpid()) {
+      _exit(3);
+    }
+    if (getsid(0) != getpid()) {
+      _exit(4);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  folly::checkUnixError(waitpid(childPid, &status, 0), "waitpid failed");
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(PrivHelperTest, cleanShutdownNotificationLeavesTheConnectionUsable) {
+  client_->notifyCleanShutdown("stop");
+
+  // A privhelper that does not act on this request -- every Linux one, and any
+  // build too old to know the type -- must still not reply to it. A later
+  // request completing proves nothing crashed and the stream is intact.
+  EXPECT_EQ(getpid(), std::move(client_->getServerPid()).get(1s));
+}
+
+TEST(
+    PrivHelperClientLifetime,
+    destroyingTheClientLeavesRequestsQueuedOnItsEventBaseSafeToRun) {
+  File clientConn;
+  File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+
+  PrivHelperThreadedTestServer server;
+  std::thread serverThread(
+      [&server, conn = std::move(serverConn)]() mutable noexcept {
+        server.initPartial(std::move(conn), getuid(), getgid());
+        server.run();
+      });
+
+  // Declared before the client so that it outlives it, leaving the request
+  // queued against a client that is already gone.
+  EventBase eventBase;
+  auto pid = Future<pid_t>::makeEmpty();
+  {
+    auto client = createTestPrivHelper(std::move(clientConn));
+    client->attachEventBase(&eventBase);
+    pid = client->getServerPid();
+  }
+
+  // Destroying the client does not drain the queue, and does not have to: the
+  // request holds the session alive, so running it late is defined.
+  EXPECT_EQ(1u, eventBase.getNotificationQueueSize());
+
+  eventBase.loopOnce(EVLOOP_NONBLOCK);
+  EXPECT_EQ(0u, eventBase.getNotificationQueueSize());
+  EXPECT_THROW_RE(
+      std::move(pid).get(1s),
+      std::runtime_error,
+      "cannot send new requests on closed privhelper connection");
+
+  serverThread.join();
+}
+
+TEST(PrivHelperConnectionLossTest, serverDeathFailsRequestsWithoutDeadlock) {
+  // This test models the privhelper process dying (e.g. killed under memory
+  // pressure) while the daemon is running: the server end of the socket
+  // closes and the client sees EOF.
+  EventBaseThread ioThread;
+  File clientConn;
+  File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+  auto client = createTestPrivHelper(std::move(clientConn));
+  ioThread.getEventBase()->runInEventBaseThreadAndWait(
+      [&] { client->attachEventBase(ioThread.getEventBase()); });
+
+  // Issue a request that the server never answers, and make sure it has
+  // been written before the connection drops, so this test pins the EOF
+  // path rather than the send-failure path covered below.
+  auto pending = client->fuseUnmount("/never/answered", {});
+  ioThread.getEventBase()->runInEventBaseThreadAndWait([] {});
+
+  // The privhelper process dies.
+  serverConn.close();
+
+  // The pending request fails with the connection error rather than
+  // hanging. (folly::FutureTimeout is a std::logic_error, so this assertion
+  // also proves the future was actually fulfilled.)
+  EXPECT_THROW(std::move(pending).get(5s), std::runtime_error);
+
+  // New requests fail fast instead of queueing against a dead connection.
+  EXPECT_THROW(
+      client->fuseUnmount("/other/mount", {}).get(5s), std::runtime_error);
+
+  // The closed connection no longer has a file descriptor to report.
+  EXPECT_EQ(-1, client->getRawClientFd());
+
+  // The EventBase thread survived processing the EOF.
+  folly::Baton<> alive;
+  ioThread.getEventBase()->runInEventBaseThread([&] { alive.post(); });
+  EXPECT_TRUE(alive.try_wait_for(5s));
+}
+
+TEST(PrivHelperConnectionLossTest, sendFailureFailsRequestsWithoutDeadlock) {
+  // Same failure family as above, but through the other entry point: the
+  // send itself fails synchronously while the connection still looks open,
+  // which invokes the error callbacks from inside send().
+#ifdef __APPLE__
+  // On macOS, shutting down the peer's receive side does not make sends
+  // fail with EPIPE (they are silently accepted until the socket is fully
+  // closed), so this test cannot trigger the send-failure path there.
+  GTEST_SKIP() << "shutdown(SHUT_RD) does not fail peer sends on macOS";
+#else
+  EventBaseThread ioThread;
+  File clientConn;
+  File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+  auto client = createTestPrivHelper(std::move(clientConn));
+  ioThread.getEventBase()->runInEventBaseThreadAndWait(
+      [&] { client->attachEventBase(ioThread.getEventBase()); });
+
+  // Shut down only the server's receiving side: the client never sees EOF,
+  // but its next send fails with EPIPE.
+  folly::checkUnixError(
+      ::shutdown(serverConn.fd(), SHUT_RD), "shutdown failed");
+
+  auto pending = client->fuseUnmount("/never/answered", {});
+  EXPECT_THROW(std::move(pending).get(5s), std::runtime_error);
+  EXPECT_THROW(
+      client->fuseUnmount("/other/mount", {}).get(5s), std::runtime_error);
+
+  folly::Baton<> alive;
+  ioThread.getEventBase()->runInEventBaseThread([&] { alive.post(); });
+  EXPECT_TRUE(alive.try_wait_for(5s));
+#endif // !__APPLE__
+}
+
+TEST(PrivHelperConnectionLossTest, unexpectedExitLogsOneEvent) {
+  EventBaseThread ioThread;
+  File clientConn;
+  File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+  auto client = createTestPrivHelper(std::move(clientConn));
+  auto recorder = std::make_shared<RecordingXplatLogger>();
+  client->setEdenFsEventsLogger(std::make_shared<EdenFsEventsLogger>(recorder));
+  ioThread.getEventBase()->runInEventBaseThreadAndWait(
+      [&] { client->attachEventBase(ioThread.getEventBase()); });
+
+  auto pending = client->fuseUnmount("/never/answered", {});
+  ioThread.getEventBase()->runInEventBaseThreadAndWait([] {});
+
+  // Drain the request from the server side before closing: closing a
+  // socket with unread data produces ECONNRESET on the client instead of
+  // a clean EOF.
+  char buf[4096];
+  while (recv(serverConn.fd(), buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+  }
+
+  // The privhelper process dies.
+  serverConn.close();
+  EXPECT_THROW(std::move(pending).get(5s), std::runtime_error);
+
+  // Exactly one privhelper_exit event is logged, even though tearing down
+  // the connection triggers multiple socket callbacks (EOF, socket closed).
+  auto events = recorder->getEvents();
+  ASSERT_EQ(1ul, events.size());
+  const auto& strings = events[0].second.getStringMap();
+  EXPECT_EQ("privhelper_exit", strings.at("type"));
+  EXPECT_EQ("eof", strings.at("reason"));
+}
+
+TEST(PrivHelperConnectionLossTest, cleanShutdownLogsNoEvent) {
+  EventBaseThread ioThread;
+  File clientConn;
+  File serverConn;
+  PrivHelperConn::createConnPair(clientConn, serverConn);
+  auto recorder = std::make_shared<RecordingXplatLogger>();
+  {
+    auto client = createTestPrivHelper(std::move(clientConn));
+    client->setEdenFsEventsLogger(
+        std::make_shared<EdenFsEventsLogger>(recorder));
+    ioThread.getEventBase()->runInEventBaseThreadAndWait(
+        [&] { client->attachEventBase(ioThread.getEventBase()); });
+    ioThread.getEventBase()->runInEventBaseThreadAndWait(
+        [&] { client->detachEventBase(); });
+  }
+
+  // Locally-initiated teardown is not an unexpected privhelper exit.
+  EXPECT_EQ(0ul, recorder->getEvents().size());
+}
+
+#ifdef __APPLE__
+
+/**
+ * The sentinel is written by the daemon's unprivileged user and read by a root
+ * privhelper, so these cases are all about what a replaced file can do to the
+ * reader rather than about ordinary parse errors.
+ */
+class PrivHelperSentinelTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = std::make_unique<TemporaryDirectory>("edenfs_sentinel");
+    sentinel_.setConfig(makeRestartArgs(sentinelPath()));
+  }
+
+  std::string sentinelPath() const {
+    return (dir_->path() / "sentinel").string();
+  }
+
+  /** Owned by us and only ours to write, as the daemon writes it. */
+  void writeSentinel(const std::string& contents) {
+    ASSERT_TRUE(folly::writeFile(contents, sentinelPath().c_str()));
+    checkUnixError(::chmod(sentinelPath().c_str(), 0600));
+  }
+
+  RestartSentinel sentinel_{getuid()};
+  std::unique_ptr<TemporaryDirectory> dir_;
+};
+
+TEST_F(PrivHelperSentinelTest, readsTheCommandAndEnvironment) {
+  writeSentinel(makeSentinelContents());
+
+  const auto command = sentinel_.readRelaunchCommand();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(kSentinelArgv, command->argv);
+  EXPECT_THAT(
+      command->env,
+      UnorderedElementsAre(
+          std::pair<std::string, std::string>{"PATH", "/usr/bin"},
+          std::pair<std::string, std::string>{"HOME", "/home/test"}));
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsASymlink) {
+  const auto target = (dir_->path() / "target").string();
+  ASSERT_TRUE(folly::writeFile(makeSentinelContents(), target.c_str()));
+  checkUnixError(::symlink(target.c_str(), sentinelPath().c_str()));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAFifo) {
+  // Without the regular-file check, opening this would block a root process
+  // that still owes the mounts a cleanup.
+  checkUnixError(::mkfifo(sentinelPath().c_str(), 0600));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsASentinelOwnedByAnotherUser) {
+  writeSentinel(makeSentinelContents());
+  RestartSentinel otherOwner{getuid() + 1};
+  otherOwner.setConfig(makeRestartArgs(sentinelPath()));
+
+  EXPECT_FALSE(otherOwner.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAGroupWritableSentinel) {
+  writeSentinel(makeSentinelContents());
+  checkUnixError(::chmod(sentinelPath().c_str(), 0660));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAnOversizedFile) {
+  writeSentinel(std::string(2 * 1024 * 1024, 'x'));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAnEmptyFile) {
+  writeSentinel("");
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAMissingFile) {
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsASentinelFromAnotherGeneration) {
+  writeSentinel(makeSentinelContents(kSentinelNonce + 1));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsASentinelWithNoNonce) {
+  writeSentinel(makeSentinelContentsWithoutNonce());
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+TEST_F(PrivHelperSentinelTest, rejectsAConfigurationWithNoNonce) {
+  writeSentinel(makeSentinelContentsWithoutNonce());
+  auto args = makeRestartArgs(sentinelPath());
+  args.sentinelNonce = 0;
+  sentinel_.setConfig(std::move(args));
+
+  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+}
+
+class PrivHelperBreakerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    configure(makeRestartArgs("/unused"));
+  }
+
+  void configure(EdenFsRestartArgs args) {
+    config_ = args;
+    sentinel_.setConfig(std::move(args));
+  }
+
+  /** A budget already spent up to its limit. */
+  void configureAtTheLimit() {
+    auto args = makeRestartArgs("/unused");
+    args.restartCount = args.maxRestarts;
+    configure(std::move(args));
+  }
+
+  EdenFsRestartArgs config_;
+  RestartSentinel sentinel_{getuid()};
+};
+
+TEST_F(PrivHelperBreakerTest, admitsAndChargesAnAttemptWithinBudget) {
+  EXPECT_TRUE(sentinel_.admitRestartAttempt(kFakeNow));
+  EXPECT_EQ(2, sentinel_.restartCount());
+}
+
+TEST_F(PrivHelperBreakerTest, refusesAtTheLimit) {
+  configureAtTheLimit();
+
+  EXPECT_FALSE(sentinel_.admitRestartAttempt(kFakeNow));
+  EXPECT_EQ(config_.maxRestarts, sentinel_.restartCount());
+}
+
+TEST_F(PrivHelperBreakerTest, holdsTheCountToTheWindowEdge) {
+  configureAtTheLimit();
+
+  EXPECT_FALSE(sentinel_.admitRestartAttempt(kFakeNow + config_.windowSeconds));
+}
+
+TEST_F(PrivHelperBreakerTest, decaysTheCountAfterTheWindow) {
+  configureAtTheLimit();
+
+  EXPECT_TRUE(
+      sentinel_.admitRestartAttempt(kFakeNow + config_.windowSeconds + 1));
+  EXPECT_EQ(1, sentinel_.restartCount());
+}
+
+TEST_F(PrivHelperBreakerTest, aBackwardsClockStartsAFreshWindow) {
+  configureAtTheLimit();
+
+  EXPECT_TRUE(sentinel_.admitRestartAttempt(kFakeNow - 60));
+  EXPECT_EQ(1, sentinel_.restartCount());
+}
+
+TEST_F(PrivHelperBreakerTest, aZeroWindowStillBoundsTheCount) {
+  auto args = makeRestartArgs("/unused");
+  args.windowSeconds = 0;
+  args.restartCount = args.maxRestarts;
+  configure(std::move(args));
+
+  EXPECT_FALSE(sentinel_.admitRestartAttempt(kFakeNow));
+}
+
+TEST_F(PrivHelperBreakerTest, aLimitTheDaemonInflatedIsStillBounded) {
+  auto args = makeRestartArgs("/unused");
+  args.maxRestarts = std::numeric_limits<uint32_t>::max();
+  args.restartCount = 0;
+  configure(std::move(args));
+
+  constexpr uint32_t kGenerous = 1000;
+  uint32_t admitted = 0;
+  while (admitted < kGenerous && sentinel_.admitRestartAttempt(kFakeNow)) {
+    ++admitted;
+  }
+
+  EXPECT_LT(admitted, kGenerous);
+}
+
+/** Exposes the binary resolution, which is protected. */
+class PrivHelperBinaryTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::findSiblingEdenFs;
+  using PrivHelperServer::resolveEdenFsBinary;
+};
+
+class PrivHelperBinaryTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = std::make_unique<TemporaryDirectory>("edenfs_libexec");
+  }
+
+  AbsolutePath dirPath() const {
+    return canonicalPath(dir_->path().string());
+  }
+
+  void createFile(const std::string& path, mode_t mode = 0755) {
+    ASSERT_TRUE(folly::writeFile(std::string{"binary"}, path.c_str()));
+    checkUnixError(::chmod(path.c_str(), mode));
+  }
+
+  /**
+   * resolveEdenFsBinary probes the directory holding the test binary, which
+   * this fixture does not own and cannot override, so its fallback branches
+   * are only reachable while nothing named edenfs is installed there.
+   */
+  static testing::AssertionResult noEdenFsNextToTheTestBinary() {
+    const auto executable = executablePath();
+    const auto sibling =
+        PrivHelperBinaryTestServer::findSiblingEdenFs(executable.dirname());
+    if (sibling.has_value()) {
+      return testing::AssertionFailure()
+          << "the test binary is installed next to an edenfs at "
+          << sibling->view();
+    }
+    return testing::AssertionSuccess();
+  }
+
+  PrivHelperBinaryTestServer server_;
+  std::unique_ptr<TemporaryDirectory> dir_;
+};
+
+TEST_F(PrivHelperBinaryTest, findsTheSibling) {
+  createFile((dir_->path() / "edenfs").string());
+
+  EXPECT_EQ(dirPath() + "edenfs"_relpath, server_.findSiblingEdenFs(dirPath()));
+}
+
+TEST_F(PrivHelperBinaryTest, findsNothingWhenThereIsNoSibling) {
+  EXPECT_EQ(std::nullopt, server_.findSiblingEdenFs(dirPath()));
+}
+
+TEST_F(PrivHelperBinaryTest, rejectsASymlinkedSibling) {
+  // The leaf is the one path component an attacker who cannot write the
+  // install directory itself could still repoint.
+  const auto target = (dir_->path() / "elsewhere").string();
+  createFile(target);
+  checkUnixError(
+      ::symlink(target.c_str(), (dir_->path() / "edenfs").string().c_str()));
+
+  EXPECT_EQ(std::nullopt, server_.findSiblingEdenFs(dirPath()));
+}
+
+TEST_F(PrivHelperBinaryTest, rejectsADirectorySibling) {
+  // 0755 so that access(X_OK) alone would accept it: a searchable directory
+  // passes the executable check.
+  checkUnixError(::mkdir((dir_->path() / "edenfs").string().c_str(), 0755));
+
+  EXPECT_EQ(std::nullopt, server_.findSiblingEdenFs(dirPath()));
+}
+
+TEST_F(PrivHelperBinaryTest, rejectsANonExecutableSibling) {
+  createFile((dir_->path() / "edenfs").string(), 0644);
+
+  EXPECT_EQ(std::nullopt, server_.findSiblingEdenFs(dirPath()));
+}
+
+TEST_F(PrivHelperBinaryTest, acceptsASymlinkedAncestor) {
+  const auto real = (dir_->path() / "real").string();
+  checkUnixError(::mkdir(real.c_str(), 0700));
+  createFile(real + "/edenfs");
+  const auto link = (dir_->path() / "link").string();
+  checkUnixError(::symlink(real.c_str(), link.c_str()));
+
+  const auto linkDir = canonicalPath(link);
+  EXPECT_EQ(linkDir + "edenfs"_relpath, server_.findSiblingEdenFs(linkDir));
+}
+
+TEST_F(PrivHelperBinaryTest, fallsBackToTheRecordedCommand) {
+  ASSERT_TRUE(noEdenFsNextToTheTestBinary());
+
+  RestartSentinel::RelaunchCommand command;
+  command.argv = kSentinelArgv;
+
+  EXPECT_EQ(
+      canonicalPath(kSentinelArgv[0]), server_.resolveEdenFsBinary(command));
+}
+
+TEST_F(PrivHelperBinaryTest, throwsWhenThereIsNothingToRelaunch) {
+  ASSERT_TRUE(noEdenFsNextToTheTestBinary());
+
+  EXPECT_THROW(
+      server_.resolveEdenFsBinary(RestartSentinel::RelaunchCommand{}),
+      std::runtime_error);
+}
+
+class PrivHelperRestartOwnerTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::validateRestartOwner;
+};
+
+class PrivHelperRestartOwnerTest : public ::testing::Test {
+ protected:
+  void initWithOwner(uid_t uid, gid_t gid) {
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+    clientConn_ = std::move(clientConn);
+    server_.initPartial(std::move(serverConn), uid, gid);
+  }
+
+  PrivHelperRestartOwnerTestServer server_;
+  File clientConn_;
+};
+
+TEST_F(PrivHelperRestartOwnerTest, acceptsMatchingNonRootRealIds) {
+  if (getuid() == 0) {
+    GTEST_SKIP() << "requires a non-root real uid";
+  }
+  initWithOwner(getuid(), getgid());
+
+  EXPECT_NO_THROW(server_.validateRestartOwner());
+}
+
+TEST_F(PrivHelperRestartOwnerTest, refusesARootRealUid) {
+  if (getuid() != 0) {
+    GTEST_SKIP() << "requires a root real uid";
+  }
+  initWithOwner(getuid(), getgid());
+
+  EXPECT_THROW(server_.validateRestartOwner(), std::runtime_error);
+}
+
+TEST_F(PrivHelperRestartOwnerTest, refusesAnOwnerMismatch) {
+  initWithOwner(getuid() + 1, getgid() + 1);
+
+  EXPECT_THROW(server_.validateRestartOwner(), std::runtime_error);
+}
+
+/** Exposes the two disarm channels and the state they meet in. */
+class PrivHelperDisarmTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::processNotifyCleanShutdownMsg;
+  using PrivHelperServer::processSetRestartArgsMsg;
+  using PrivHelperServer::sentinel_;
+};
+
+/**
+ * The two disarm channels are deliberately redundant: the notification fails
+ * when the event loop is wedged, and the sentinel unlink fails essentially
+ * never. Each has to disarm on its own.
+ */
+class PrivHelperDisarmTest : public ::testing::Test {
+ protected:
+  using DisarmState = RestartSentinel::DisarmState;
+
+  void SetUp() override {
+    sentinelFile_ = std::make_unique<TemporaryFile>("edenfs_restart_armed");
+    // Nothing calls initPartial() here, which is what would otherwise
+    // construct the sentinel from the daemon's uid.
+    server_.sentinel_.emplace(getuid());
+    deliverRestartArgs();
+  }
+
+  void deliverRestartArgs() {
+    deliverRestartArgs(sentinelFile_->path().string());
+  }
+
+  void deliverRestartArgs(std::string sentinelPath) {
+    auto msg = PrivHelperConn::serializeSetRestartArgsRequest(
+        /*xid=*/1, makeRestartArgs(std::move(sentinelPath)));
+    folly::io::Cursor cursor{&msg.data};
+    PrivHelperConn::parsePacket(cursor);
+    server_.processSetRestartArgsMsg(cursor);
+  }
+
+  void deliverCleanShutdown() {
+    auto msg = PrivHelperConn::serializeNotifyCleanShutdownRequest(
+        /*xid=*/2, "stop");
+    folly::io::Cursor cursor{&msg.data};
+    PrivHelperConn::parsePacket(cursor);
+    server_.processNotifyCleanShutdownMsg(cursor);
+  }
+
+  void expectSentinelPathRejected(const std::string& sentinelPath) {
+    SCOPED_TRACE(sentinelPath);
+    deliverRestartArgs(sentinelPath);
+    EXPECT_EQ(DisarmState::Unknown, server_.sentinel_->disarmState());
+  }
+
+  std::string sentinelDir() const {
+    return sentinelFile_->path().parent_path().string();
+  }
+
+  PrivHelperDisarmTestServer server_;
+  std::unique_ptr<TemporaryFile> sentinelFile_;
+};
+
+TEST_F(PrivHelperDisarmTest, restartArgsArm) {
+  ASSERT_TRUE(server_.sentinel_->enabled());
+  EXPECT_EQ(DisarmState::Armed, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, theNotificationAloneDisarms) {
+  deliverCleanShutdown();
+
+  EXPECT_EQ(DisarmState::ShutdownAnnounced, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, removingTheSentinelAloneDisarms) {
+  sentinelFile_.reset();
+
+  EXPECT_EQ(DisarmState::ShutdownAnnounced, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, freshRestartArgsReArm) {
+  // A daemon that resends its configuration has recovered from a failed
+  // takeover, and would otherwise stay permanently un-restartable behind the
+  // flag its aborted shutdown set.
+  deliverCleanShutdown();
+  ASSERT_EQ(DisarmState::ShutdownAnnounced, server_.sentinel_->disarmState());
+
+  deliverRestartArgs();
+
+  EXPECT_EQ(DisarmState::Armed, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, freshRestartArgsDropTheResolvedDirectory) {
+  ASSERT_EQ(DisarmState::Armed, server_.sentinel_->disarmState());
+
+  const TemporaryDirectory elsewhere{"edenfs_restart_elsewhere"};
+  deliverRestartArgs((elsewhere.path() / "absent").string());
+
+  EXPECT_EQ(DisarmState::ShutdownAnnounced, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, aSentinelPathRootCannotResolveIsUnknown) {
+  deliverRestartArgs("not/absolute");
+
+  EXPECT_EQ(DisarmState::Unknown, server_.sentinel_->disarmState());
+}
+
+TEST_F(PrivHelperDisarmTest, aLeafThatAlwaysResolvesIsUnknown) {
+  // faccessat() resolves "." and ".." whatever the directory holds, so a
+  // sentinel named either could never be reported gone.
+  expectSentinelPathRejected(sentinelDir() + "/.");
+  expectSentinelPathRejected(sentinelDir() + "/..");
+}
+
+TEST_F(PrivHelperDisarmTest, aSentinelPathWithAnEmbeddedNulIsUnknown) {
+  // The syscalls stop at the NUL, so they would act on a prefix of the path
+  // that was validated.
+  expectSentinelPathRejected(sentinelFile_->path().string() + '\0');
+}
+
+TEST_F(PrivHelperDisarmTest, aServerThatNeverReceivedRestartArgsHasNoState) {
+  const RestartSentinel unconfigured{getuid()};
+
+  EXPECT_EQ(std::nullopt, unconfigured.disarmState());
+}
+
+/**
+ * A PrivHelperServer that records what the restart path would have done rather
+ * than resolving a real binary or launching anything.
+ */
+class PrivHelperRestartTestServer : public PrivHelperServer {
+ public:
+  struct Spawn {
+    AbsolutePath binary;
+    std::vector<std::string> argv;
+    std::vector<std::pair<std::string, std::string>> env;
+  };
+
+  PrivHelperRestartTestServer() {
+    spawnEdenFs_ =
+        [this](
+            const AbsolutePath& binary,
+            const std::vector<std::string>& argv,
+            const std::vector<std::pair<std::string, std::string>>& env) {
+          spawns.wlock()->push_back(Spawn{binary, argv, env});
+          return spawnSucceeds.load();
+        };
+    now_ = [this] { return now.load(); };
+  }
+
+  using PrivHelperServer::launchRestart;
+  using PrivHelperServer::prepareRestart;
+  using PrivHelperServer::sentinel_;
+
+  size_t spawnCount() {
+    return spawns.rlock()->size();
+  }
+
+  std::atomic<uint64_t> now{0};
+  std::atomic<bool> spawnSucceeds{true};
+  std::atomic<bool> restartOwnerValid{true};
+  // Every attempt, including the ones spawnSucceeds turned into a failure.
+  folly::Synchronized<std::vector<Spawn>> spawns;
+
+ private:
+  AbsolutePath resolveEdenFsBinary(
+      const RestartSentinel::RelaunchCommand& /* command */) const override {
+    return canonicalPath("/fake/libexec/eden/edenfs");
+  }
+
+  void validateRestartOwner() const override {
+    if (!restartOwnerValid.load()) {
+      throw std::runtime_error("real uid is root");
+    }
+  }
+};
+
+/**
+ * Exercises the restart decision directly, without a socket or an event loop.
+ *
+ * The privhelper is armed by default once it has restart args; each test here
+ * removes exactly one of the reasons to restart and checks that nothing is
+ * launched.
+ */
+class PrivHelperRestartDecisionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    sentinelFile_ = std::make_unique<TemporaryFile>("edenfs_restart_armed");
+    writeSentinel(makeSentinelContents());
+    server_.now.store(kFakeNow);
+    // Nothing calls initPartial() here, so the sentinel's owner has to be
+    // declared by hand for the reader's ownership check to pass.
+    server_.sentinel_.emplace(getuid());
+    configure(restartArgs());
+  }
+
+  EdenFsRestartArgs restartArgs() const {
+    return makeRestartArgs(sentinelFile_->path().string());
+  }
+
+  void configure(EdenFsRestartArgs args) {
+    server_.sentinel_->setConfig(std::move(args));
+  }
+
+  void writeSentinel(const std::string& contents) {
+    ASSERT_TRUE(
+        folly::writeFile(contents, sentinelFile_->path().string().c_str()));
+  }
+
+  void removeSentinel() {
+    sentinelFile_.reset();
+  }
+
+  /**
+   * Runs the same two-step sequence run() does, or nullopt when the plan step
+   * already decided to leave edenfs down.
+   */
+  std::optional<bool> restart() {
+    const auto plan = server_.prepareRestart();
+    if (!plan) {
+      return std::nullopt;
+    }
+    return server_.launchRestart(*plan);
+  }
+
+  void expectNoRestart() {
+    EXPECT_EQ(std::nullopt, restart());
+    EXPECT_EQ(0, server_.spawnCount());
+  }
+
+  PrivHelperRestartTestServer server_;
+  std::unique_ptr<TemporaryFile> sentinelFile_;
+};
+
+TEST_F(PrivHelperRestartDecisionTest, restartsAfterACrash) {
+  EXPECT_EQ(true, restart());
+  EXPECT_EQ(1, server_.spawnCount());
+}
+
+TEST_F(PrivHelperRestartDecisionTest, doesNotRestartWithoutRestartArgs) {
+  server_.sentinel_.emplace(getuid());
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, doesNotRestartWhenDisabled) {
+  auto args = restartArgs();
+  args.enabled = false;
+  configure(std::move(args));
+
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, cleanShutdownNotificationDisarms) {
+  server_.sentinel_->noteCleanShutdown();
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, removingTheSentinelDisarms) {
+  removeSentinel();
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, anUnparseableSentinelStopsTheRestart) {
+  writeSentinel("} not json {");
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, doesNotRestartOnceTheBreakerIsTripped) {
+  auto args = restartArgs();
+  args.restartCount = args.maxRestarts;
+  configure(std::move(args));
+
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, refusesToRestartWhenOwnerIsInvalid) {
+  server_.restartOwnerValid.store(false);
+
+  EXPECT_EQ(false, restart());
+  EXPECT_EQ(0, server_.spawnCount());
+}
+
+TEST_F(PrivHelperRestartDecisionTest, reportsAFailedSpawn) {
+  server_.spawnSucceeds.store(false);
+
+  EXPECT_EQ(false, restart());
+  EXPECT_EQ(1, server_.spawnCount());
+}
+
+TEST_F(PrivHelperRestartDecisionTest, relaysTheRestartBudgetToTheNewDaemon) {
+  ASSERT_EQ(true, restart());
+
+  const auto spawns = *server_.spawns.rlock();
+  ASSERT_EQ(1, spawns.size());
+  EXPECT_EQ(kSentinelArgv, spawns[0].argv);
+  EXPECT_THAT(
+      spawns[0].env,
+      UnorderedElementsAre(
+          std::pair<std::string, std::string>{"PATH", "/usr/bin"},
+          std::pair<std::string, std::string>{"HOME", "/home/test"},
+          std::pair<std::string, std::string>{"EDENFS_RESTART_COUNT", "2"},
+          std::pair<std::string, std::string>{
+              "EDENFS_FIRST_RESTART_AT", folly::to<std::string>(kFakeNow)}));
+}
+
+TEST_F(PrivHelperRestartDecisionTest, replacesARecordedRestartBudget) {
+  writeSentinel(makeSentinelContents(
+      kSentinelNonce,
+      folly::dynamic::object("EDENFS_RESTART_COUNT", "99")(
+          "EDENFS_FIRST_RESTART_AT", "1")));
+
+  ASSERT_EQ(true, restart());
+
+  const auto spawns = *server_.spawns.rlock();
+  ASSERT_EQ(1, spawns.size());
+  EXPECT_THAT(
+      spawns[0].env,
+      UnorderedElementsAre(
+          std::pair<std::string, std::string>{"EDENFS_RESTART_COUNT", "2"},
+          std::pair<std::string, std::string>{
+              "EDENFS_FIRST_RESTART_AT", folly::to<std::string>(kFakeNow)}));
+}
+
+#endif // __APPLE__

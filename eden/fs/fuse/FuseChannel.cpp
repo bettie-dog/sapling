@@ -10,6 +10,7 @@
 #include "eden/fs/fuse/FuseChannel.h"
 #include <boost/cast.hpp>
 #include <fmt/core.h>
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
 #include <folly/system/ThreadName.h>
@@ -49,6 +50,8 @@ using std::string;
 namespace facebook::eden {
 
 namespace {
+
+constexpr size_t kMaxInvalidationThreads = 64;
 
 /**
  * For most FUSE requests, the protocol is simple: an optional request
@@ -150,6 +153,20 @@ std::string rename(FuseArg arg) {
   auto newName = arg.readz();
   return fmt::format("old={}, newdir={}, new={}", oldName, in.newdir, newName);
 }
+
+#ifdef __linux__
+std::string rename2(FuseArg arg) {
+  auto& in = arg.read<fuse_rename2_in>();
+  auto oldName = arg.readz();
+  auto newName = arg.readz();
+  return fmt::format(
+      "old={}, newdir={}, new={}, flags={:#x}",
+      oldName,
+      in.newdir,
+      newName,
+      in.flags);
+}
+#endif
 
 std::string link(FuseArg arg) {
   auto& in = arg.read<fuse_link_in>();
@@ -603,7 +620,15 @@ constexpr auto kFuseHandlers = [] {
       Write};
 #ifdef __linux__
   handlers[FUSE_READDIRPLUS] = {"FUSE_READDIRPLUS", Read};
-  handlers[FUSE_RENAME2] = {"FUSE_RENAME2", Write};
+  handlers[FUSE_RENAME2] = {
+      "FUSE_RENAME2",
+      &FuseChannel::fuseRename2,
+      &argrender::rename2,
+      &FuseStats::rename2,
+      &FuseStats::rename2Successful,
+      &FuseStats::rename2Failure,
+      Write,
+      SamplingGroup::One};
   handlers[FUSE_LSEEK] = {"FUSE_LSEEK"};
   handlers[FUSE_COPY_FILE_RANGE] = {"FUSE_COPY_FILE_RANGE", Write};
   handlers[FUSE_SETUPMAPPING] = {"FUSE_SETUPMAPPING", Read};
@@ -844,6 +869,9 @@ bool FuseChannel::isIoUringTransportAvailable() const {
 FuseChannel::DataRange::DataRange(int64_t off, int64_t len)
     : offset(off), length(len) {}
 
+FuseChannel::InvalidationEntry::InvalidationEntry()
+    : type(InvalidationType::STOP), inode(kRootNodeId) {}
+
 FuseChannel::InvalidationEntry::InvalidationEntry(
     InodeNumber num,
     PathComponentPiece n)
@@ -871,6 +899,8 @@ FuseChannel::InvalidationEntry::~InvalidationEntry() {
     case InvalidationType::FLUSH:
       promise.~Promise();
       return;
+    case InvalidationType::STOP:
+      return;
   }
   XLOGF(
       FATAL, "unknown InvalidationEntry type: {}", static_cast<uint64_t>(type));
@@ -891,6 +921,8 @@ FuseChannel::InvalidationEntry::
       return;
     case InvalidationType::FLUSH:
       new (&promise) Promise<Unit>(std::move(other.promise));
+      return;
+    case InvalidationType::STOP:
       return;
   }
 }
@@ -1003,7 +1035,10 @@ FuseChannel::FuseChannel(
     bool useIoUring,
     std::string ioUringKernelReleaseRegex,
     uint32_t ioUringQueueDepth,
-    bool ioUringDisableIoWait)
+    bool ioUringDisableIoWait,
+    bool ioUringSkipSelfWakeup,
+    bool ioUringPreCreateQueues,
+    size_t numInvalidationThreads)
     : privHelper_{privHelper},
       // Pre-allocate based on configured max_pages so the buffer can handle
       // the larger requests we'll negotiate during FUSE_INIT. This is
@@ -1017,6 +1052,10 @@ FuseChannel::FuseChannel(
                   : size_t(getpagesize()) + 0x1000)),
       threadPool_{std::move(threadPool)},
       configuredWorkerThreadCount_(numThreads),
+      numInvalidationThreads_{std::clamp<size_t>(
+          numInvalidationThreads,
+          1,
+          kMaxInvalidationThreads)},
       dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
       edenFsEventsLogger_(edenFsEventsLogger),
@@ -1036,6 +1075,8 @@ FuseChannel::FuseChannel(
       ioUringKernelReleaseRegex_{std::move(ioUringKernelReleaseRegex)},
       ioUringQueueDepth_{ioUringQueueDepth},
       ioUringDisableIoWait_{ioUringDisableIoWait},
+      ioUringSkipSelfWakeup_{ioUringSkipSelfWakeup},
+      ioUringPreCreateQueues_{ioUringPreCreateQueues},
       fuseDevice_(std::move(fuseDevice)),
       transport_(std::make_unique<DevFuseTransport>()),
       processAccessLog_(std::move(processInfoCache)),
@@ -1044,6 +1085,19 @@ FuseChannel::FuseChannel(
           TraceBus<FuseTraceEvent>::create(
               "FuseTrace" + mountPath.asString(),
               fuseTraceBusCapacity)) {
+  if (numInvalidationThreads == 0) {
+    XLOGF(
+        WARN,
+        "fuse:num-invalidation-threads is 0 for {}; using 1 instead",
+        mountPath_);
+  } else if (numInvalidationThreads > kMaxInvalidationThreads) {
+    XLOGF(
+        WARN,
+        "fuse:num-invalidation-threads is {} for {}; using {} instead",
+        numInvalidationThreads,
+        mountPath_,
+        kMaxInvalidationThreads);
+  }
   XLOGF(
       INFO,
       "Creating FuseChannel: mountPath={}, numThreads={}, requireUtf8={}, maximumBackgroundRequests={}, maximumInFlightRequests={}, useWriteBackCache={}, fuseMaxPages={}",
@@ -1055,6 +1109,7 @@ FuseChannel::FuseChannel(
       useWriteBackCache,
       fuseMaxPages_);
   XCHECK_GE(configuredWorkerThreadCount_, 1ul);
+  XCHECK_GE(numInvalidationThreads_, 1ul);
   updateEffectiveWorkerThreadCount();
   installSignalHandler();
 
@@ -1218,8 +1273,15 @@ FuseChannel::StopFuture FuseChannel::initializeFromTakeover(
   takeoverReadinessStarted_.store(true, std::memory_order_release);
   connInfo_ = connInfo;
   if (negotiatedIoUringTransport(connInfo)) {
+    // TODO: fuse:io-uring-pre-create-queues is deliberately not honored here.
+    // io_uring was already negotiated by the process we took over from, so
+    // there is no INIT reply left to withhold and nothing to fall back to: if
+    // the queues do not fit, this mount is stuck either way. Recovering that
+    // case needs its own mechanism (fail the takeover and let the old process
+    // keep the mount), which is worth building only once the pre-create path
+    // has proven itself on fresh mounts.
     transport_ = std::make_unique<IoUringFuseTransport>(
-        ioUringQueueDepth_, ioUringDisableIoWait_);
+        ioUringQueueDepth_, ioUringDisableIoWait_, ioUringSkipSelfWakeup_);
   }
   updateEffectiveWorkerThreadCount();
   dispatcher_->initConnection(connInfo);
@@ -1273,7 +1335,9 @@ void FuseChannel::startWorkerThreads() {
       state->workerThreads.emplace_back([this] { fuseWorkerThread(); });
     }
 
-    invalidationThread_ = std::thread([this] { invalidationThread(); });
+    for (size_t i = 0; i < numInvalidationThreads_; ++i) {
+      invalidationThreads_.emplace_back([this] { invalidationThread(); });
+    }
   } catch (const std::exception& ex) {
     XLOGF(ERR, "Error starting FUSE worker threads: {}", exceptionStr(ex));
     // Request any threads we did start to stop now.
@@ -1332,20 +1396,74 @@ void FuseChannel::destroy() {
 void FuseChannel::invalidateInode(InodeNumber ino, off_t off, off_t len) {
   // Add the entry to invalidationQueue_ and wake up the invalidation thread to
   // send it.
-  invalidationQueue_.lock()->queue.emplace_back(ino, off, len);
+  auto queue = invalidationQueue_.lock();
+  if (queue->state != InvalidationQueueState::ACCEPTING) {
+    return;
+  }
+  queue->queue.emplace_back(ino, off, len);
+  queue.unlock();
   invalidationCV_.notify_one();
 }
 
 void FuseChannel::invalidateEntry(InodeNumber parent, PathComponentPiece name) {
   // Add the entry to invalidationQueue_ and wake up the invalidation thread to
   // send it.
-  invalidationQueue_.lock()->queue.emplace_back(parent, name);
+  auto queue = invalidationQueue_.lock();
+  if (queue->state != InvalidationQueueState::ACCEPTING) {
+    return;
+  }
+  queue->queue.emplace_back(parent, name);
+  queue.unlock();
   invalidationCV_.notify_one();
+}
+
+bool FuseChannel::invalidateEntryWithQueueLimit(
+    InodeNumber parent,
+    PathComponentPiece name,
+    size_t maxQueueSize,
+    const folly::CancellationToken& cancellationToken) {
+  if (maxQueueSize == 0) {
+    return false;
+  }
+  folly::CancellationCallback cancellationCallback{
+      cancellationToken, [this] {
+        // Synchronize with the wait predicate so cancellation cannot notify
+        // immediately before the producer starts waiting.
+        auto queue = invalidationQueue_.lock();
+        queue.unlock();
+        invalidationCapacityCV_.notify_all();
+      }};
+  auto queue = invalidationQueue_.lock();
+  if (queue->queue.size() >= maxQueueSize &&
+      queue->state == InvalidationQueueState::ACCEPTING &&
+      !cancellationToken.isCancellationRequested()) {
+    getStats()->increment(&FuseStats::invalidationQueueThrottleWait);
+    invalidationCapacityWaiters_.fetch_add(1, std::memory_order_relaxed);
+    SCOPE_EXIT {
+      invalidationCapacityWaiters_.fetch_sub(1, std::memory_order_relaxed);
+    };
+    invalidationCapacityCV_.wait(queue.as_lock(), [&] {
+      return queue->queue.size() < maxQueueSize ||
+          queue->state != InvalidationQueueState::ACCEPTING ||
+          cancellationToken.isCancellationRequested();
+    });
+  }
+  if (queue->state != InvalidationQueueState::ACCEPTING ||
+      cancellationToken.isCancellationRequested()) {
+    return false;
+  }
+  queue->queue.emplace_back(parent, name);
+  queue.unlock();
+  invalidationCV_.notify_one();
+  return true;
 }
 
 void FuseChannel::invalidateInodes(folly::Range<InodeNumber*> range) {
   {
     auto queue = invalidationQueue_.lock();
+    if (queue->state != InvalidationQueueState::ACCEPTING) {
+      return;
+    }
     std::transform(
         range.begin(),
         range.end(),
@@ -1353,7 +1471,7 @@ void FuseChannel::invalidateInodes(folly::Range<InodeNumber*> range) {
         [](const auto& inodeNum) { return InvalidationEntry(inodeNum, 0, 0); });
   }
   if (range.begin() != range.end()) {
-    invalidationCV_.notify_one();
+    invalidationCV_.notify_all();
   }
 }
 
@@ -1364,7 +1482,7 @@ ImmediateFuture<folly::Unit> FuseChannel::completeInvalidations() {
   auto result = promise.getFuture();
   {
     auto state = invalidationQueue_.lock();
-    if (state->stop) {
+    if (state->state != InvalidationQueueState::ACCEPTING) {
       // In the case of a concurrent unmount with a checkout, the unmount could
       // win the race and thus have shutdown the invalidation thread. This is
       // not an issue as the mount is gone at this point, let's thus return
@@ -1382,7 +1500,7 @@ folly::coro::now_task<folly::Unit> FuseChannel::co_completeInvalidations() {
   auto result = promise.getSemiFuture();
   {
     auto state = invalidationQueue_.lock();
-    if (state->stop) {
+    if (state->state != InvalidationQueueState::ACCEPTING) {
       co_return folly::unit;
     }
     state->queue.emplace_back(std::move(promise));
@@ -1415,6 +1533,8 @@ void FuseChannel::sendInvalidation(InvalidationEntry& entry) {
         // invalidation queue have been completed.
         entry.promise.setValue();
         return;
+      case InvalidationType::STOP:
+        EDEN_BUG() << "STOP entry passed to sendInvalidation";
     }
     EDEN_BUG() << "unknown invalidation entry type "
                << static_cast<uint64_t>(entry.type);
@@ -1668,10 +1788,11 @@ void FuseChannel::initWorkerThread() noexcept {
     setThreadName(fmt::format("fuse{}", mountPath_.basename()));
     XLOGF(
         DBG6,
-        "Fuse init worker starting for mount={} transport={} useIoUringConfig={}",
+        "Fuse init worker starting for mount={} transport={} useIoUringConfig={} ioUringPreCreateQueuesConfig={}",
         mountPath_,
         transport_->getName(),
-        useIoUring_);
+        useIoUring_,
+        ioUringPreCreateQueues_);
 
     // Read the INIT packet
     readInitPacket();
@@ -1751,9 +1872,9 @@ void FuseChannel::fuseWorkerThread() noexcept {
 void FuseChannel::invalidationThread() noexcept {
   setThreadName(fmt::format("inval{}", mountPath_.basename()));
 
-  // We send all FUSE_NOTIFY_INVAL_ENTRY and FUSE_NOTIFY_INVAL_INODE requests
-  // in a dedicated thread.  These requests will block in the kernel until it
-  // can obtain the inode lock on the inode in question.
+  // We send FUSE_NOTIFY_INVAL_ENTRY and FUSE_NOTIFY_INVAL_INODE requests in
+  // dedicated threads. These requests may block in the kernel until it can
+  // obtain the inode lock on the inode in question.
   //
   // It is possible that the kernel-level inode lock is already held by another
   // thread that is waiting on one of our own user-space locks.  To avoid
@@ -1767,38 +1888,164 @@ void FuseChannel::invalidationThread() noexcept {
   // currently owns the rename lock, and will generate invalidation requests.
   // We need to make sure the checkout operation does not block waiting on the
   // invalidation requests to complete, since otherwise this would deadlock.
-  while (true) {
-    // Wait for entries to process
-    std::vector<InvalidationEntry> entries;
-    {
-      auto lockedQueue = invalidationQueue_.lock();
-      while (lockedQueue->queue.empty()) {
-        if (lockedQueue->stop) {
+  //
+  if (numInvalidationThreads_ == 1) {
+    while (true) {
+      std::deque<InvalidationEntry> entries;
+      {
+        auto queue = invalidationQueue_.lock();
+        invalidationCV_.wait(queue.as_lock(), [&] {
+          return queue->state == InvalidationQueueState::STOPPED ||
+              !queue->queue.empty();
+        });
+        if (queue->state == InvalidationQueueState::STOPPED) {
           return;
         }
-        invalidationCV_.wait(lockedQueue.as_lock());
+        queue->queue.swap(entries);
+        notifyInvalidationCapacityWaiters();
       }
-      lockedQueue->queue.swap(entries);
+
+      for (auto& entry : entries) {
+        if (entry.type == InvalidationType::STOP) {
+          {
+            auto queue = invalidationQueue_.lock();
+            queue->state = InvalidationQueueState::STOPPED;
+          }
+          invalidationCV_.notify_all();
+          return;
+        }
+        sendInvalidation(entry);
+      }
+    }
+  }
+
+  // Multiple threads run this loop concurrently to avoid serialization
+  // bottlenecks.
+  while (true) {
+    // Take one entry from the front of the queue.
+    std::optional<InvalidationEntry> entry;
+    {
+      auto lockedQueue = invalidationQueue_.lock();
+      invalidationCV_.wait(lockedQueue.as_lock(), [&] {
+        return lockedQueue->state == InvalidationQueueState::STOPPED ||
+            (!lockedQueue->queue.empty() && !lockedQueue->flushInProgress);
+      });
+      if (lockedQueue->state == InvalidationQueueState::STOPPED) {
+        return;
+      }
+      entry.emplace(std::move(lockedQueue->queue.front()));
+      lockedQueue->queue.pop_front();
+      notifyInvalidationCapacityWaiters();
+
+      if (entry->type == InvalidationType::STOP) {
+        lockedQueue.unlock();
+
+        std::unique_lock lock{inflightInvalidationsMutex_};
+        inflightInvalidationsCV_.wait(lock, [&] {
+          return inflightInvalidations_.load(std::memory_order_acquire) == 0;
+        });
+        lock.unlock();
+
+        {
+          auto queue = invalidationQueue_.lock();
+          queue->state = InvalidationQueueState::STOPPED;
+        }
+        invalidationCV_.notify_all();
+        return;
+      }
+
+      if (entry->type == InvalidationType::FLUSH) {
+        // FLUSH is a queue barrier for completeInvalidations(): by the time
+        // it reaches the front of the queue, all prior entries have either
+        // completed or are counted as in-flight. Prevent later entries from
+        // starting while waiting so later traffic cannot keep the in-flight
+        // count non-zero indefinitely.
+        lockedQueue->flushInProgress = true;
+        lockedQueue.unlock();
+
+        std::unique_lock lock{inflightInvalidationsMutex_};
+        inflightInvalidationsCV_.wait(lock, [&] {
+          return inflightInvalidations_.load(std::memory_order_acquire) == 0;
+        });
+        lock.unlock();
+
+        {
+          auto queue = invalidationQueue_.lock();
+          queue->flushInProgress = false;
+        }
+        invalidationCV_.notify_all();
+        sendInvalidation(*entry);
+        continue;
+      }
+
+      // Count the entry as in-flight before releasing the queue lock. This
+      // ensures a later FLUSH cannot slip between dequeue and execution and
+      // incorrectly resolve before this entry finishes.
+      inflightInvalidations_.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    // Process all of the entries we found
-    for (auto& entry : entries) {
-      sendInvalidation(entry);
-    }
-    entries.clear();
+    SCOPE_EXIT {
+      auto prev =
+          inflightInvalidations_.fetch_sub(1, std::memory_order_acq_rel);
+      if (prev == 1) {
+        // Last in-flight entry finished - wake any FLUSH waiter.
+        std::lock_guard lock{inflightInvalidationsMutex_};
+        inflightInvalidationsCV_.notify_all();
+      }
+    };
+    sendInvalidation(*entry);
+  }
+}
+
+void FuseChannel::notifyInvalidationCapacityWaiters() {
+  // Waiters increment the count under the queue lock before waiting, so a
+  // blocked waiter is always visible to a worker that dequeued under the same
+  // lock; skipping the broadcast when the count is zero cannot lose a wakeup.
+  if (invalidationCapacityWaiters_.load(std::memory_order_relaxed) != 0) {
+    invalidationCapacityCV_.notify_all();
   }
 }
 
 void FuseChannel::stopInvalidationThread() {
-  // Check that the thread is joinable just in case we were destroyed
-  // before the invalidation thread was started.
-  if (!invalidationThread_.joinable()) {
-    return;
-  }
+  folly::call_once(stopInvalidationThreadsFlag_, [this] {
+    {
+      auto queue = invalidationQueue_.lock();
+      if (queue->state == InvalidationQueueState::ACCEPTING) {
+        queue->state = InvalidationQueueState::DRAINING;
+        if (!queue->queue.empty()) {
+          XLOGF(
+              INFO,
+              "draining {} pending invalidation(s) for {} before stopping invalidation workers",
+              queue->queue.size(),
+              mountPath_);
+        }
+        queue->queue.emplace_back();
+      }
+    }
+    invalidationCV_.notify_all();
+    invalidationCapacityCV_.notify_all();
 
-  invalidationQueue_.lock()->stop = true;
-  invalidationCV_.notify_one();
-  invalidationThread_.join();
+    for (auto& thread : invalidationThreads_) {
+      thread.join();
+    }
+    invalidationThreads_.clear();
+
+    std::deque<InvalidationEntry> abandonedEntries;
+    {
+      auto queue = invalidationQueue_.lock();
+      if (queue->state != InvalidationQueueState::STOPPED) {
+        queue->queue.swap(abandonedEntries);
+        queue->flushInProgress = false;
+        queue->state = InvalidationQueueState::STOPPED;
+      }
+    }
+    for (auto& entry : abandonedEntries) {
+      if (entry.type == InvalidationType::FLUSH) {
+        sendInvalidation(entry);
+      }
+    }
+    invalidationCapacityCV_.notify_all();
+  });
 }
 
 void FuseChannel::readInitPacket() {
@@ -1971,10 +2218,43 @@ void FuseChannel::readInitPacket() {
   want |= FUSE_ALLOW_IDMAP;
 #endif
 
+  // Carries a pre-created io_uring transport across the INIT reply. Assigned
+  // just below when the queues are created up front, and consumed at the
+  // transport switch further down (after sendReply()); stays null otherwise.
+  //
+  // The two halves cannot be merged. The queues have to exist *before* the
+  // reply, because that reply is the last point at which io_uring can be
+  // declined: once it advertises FUSE_OVER_IO_URING the kernel blocks request
+  // allocation until a ring is ready, so a failure afterwards hangs the mount
+  // instead of falling back. But transport_ can only be swapped *after* the
+  // reply, both because that is where the negotiated flags are known and
+  // because the reply itself is still sent over devfuse. Hence a local that
+  // spans the two.
+  std::unique_ptr<IoUringFuseTransport> preparedIoUringTransport;
+
   // Only return the capabilities the kernel supports.
 #if EDEN_HAVE_FUSE_IO_URING
-  if (isIoUringTransportAvailable()) {
-    want |= FUSE_OVER_IO_URING;
+  if (isIoUringTransportAvailable() && (capable & FUSE_OVER_IO_URING)) {
+    bool negotiateIoUring = true;
+    if (ioUringPreCreateQueues_) {
+      auto transport = std::make_unique<IoUringFuseTransport>(
+          ioUringQueueDepth_, ioUringDisableIoWait_);
+      if (auto error = transport->prepareAllQueues(*this)) {
+        XLOGF(
+            WARN,
+            "Not negotiating FUSE io_uring on mount \"{}\": {}",
+            mountPath_,
+            *error);
+        getStats()->increment(&FuseStats::ioUringPreCreateQueuesFailure);
+        negotiateIoUring = false;
+      } else {
+        getStats()->increment(&FuseStats::ioUringPreCreateQueuesSuccess);
+        preparedIoUringTransport = std::move(transport);
+      }
+    }
+    if (negotiateIoUring) {
+      want |= FUSE_OVER_IO_URING;
+    }
   }
 #else
   (void)useIoUring_;
@@ -2051,8 +2331,17 @@ void FuseChannel::readInitPacket() {
         mountPath_,
         transport_->getName(),
         ioUringQueueDepth_);
-    transport_ = std::make_unique<IoUringFuseTransport>(
-        ioUringQueueDepth_, ioUringDisableIoWait_);
+    // Adopt the transport prepared before the INIT reply, if there is one.
+    // Constructing a fresh one here instead would strand the queues it
+    // already created and silently rebuild them per worker, undoing the
+    // pre-creation. It is null whenever the queues were not pre-created, in
+    // which case each worker creates its own queue as it starts, as before.
+    transport_ = preparedIoUringTransport
+        ? std::move(preparedIoUringTransport)
+        : std::make_unique<IoUringFuseTransport>(
+              ioUringQueueDepth_,
+              ioUringDisableIoWait_,
+              ioUringSkipSelfWakeup_);
   }
   updateEffectiveWorkerThreadCount();
 
@@ -2452,18 +2741,18 @@ void FuseChannel::sessionComplete(folly::Synchronized<State>::LockedPtr state) {
 
   auto data = std::make_unique<StopData>();
   data->reason = state->stopReason;
+  // Unlock the state before the remaining steps
+  state.unlock();
+
+  // Stop the invalidation threads. We do not do this when requestSessionExit()
+  // is called since we want to continue to allow invalidation requests to be
+  // processed until all outstanding requests complete.
+  stopInvalidationThread();
+
   if (isFuseDeviceValid(data->reason) && connInfo_.has_value()) {
     data->fuseDevice = std::move(fuseDevice_);
     data->fuseSettings = connInfo_.value();
   }
-
-  // Unlock the state before the remaining steps
-  state.unlock();
-
-  // Stop the invalidation thread.  We do not do this when requestSessionExit()
-  // is called since we want to continue to allow invalidation requests to be
-  // processed until all outstanding requests complete.
-  stopInvalidationThread();
 
   // Fulfill sessionCompletePromise
   sessionCompletePromise_.setValue(std::move(data));
@@ -2726,6 +3015,36 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseRename(
           request.getObjectFetchContext())
       .thenValue([&request](auto&&) { request.replyError(0); });
 }
+
+#ifdef __linux__
+ImmediateFuture<folly::Unit> FuseChannel::fuseRename2(
+    FuseRequestContext& request,
+    const fuse_in_header& header,
+    ByteRange arg) {
+  const auto rename = reinterpret_cast<const fuse_rename2_in*>(arg.data());
+  auto oldNameStr = reinterpret_cast<const char*>(rename + 1);
+  StringPiece oldName{oldNameStr};
+  StringPiece newName{oldNameStr + oldName.size() + 1};
+
+  InodeNumber parent{header.nodeid};
+  InodeNumber newParent{rename->newdir};
+  XLOGF(
+      DBG7,
+      "FUSE_RENAME2 {} -> {}, flags={:#x}",
+      oldName,
+      newName,
+      rename->flags);
+  return dispatcher_
+      ->rename2(
+          parent,
+          extractPathComponent(oldName, requireUtf8Path_),
+          newParent,
+          extractPathComponent(newName, requireUtf8Path_),
+          rename->flags,
+          request.getObjectFetchContext())
+      .thenValue([&request](auto&&) { request.replyError(0); });
+}
+#endif
 
 ImmediateFuture<folly::Unit> FuseChannel::fuseLink(
     FuseRequestContext& request,

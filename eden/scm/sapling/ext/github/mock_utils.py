@@ -323,6 +323,9 @@ class MockGitHubServer:
         owner: str = OWNER,
         name: str = REPO_NAME,
         stack_pr_ids: Optional[List[int]] = None,
+        *,
+        review_url: str,
+        review_tool: str,
     ) -> "UpdatePrRequest":
         """base=None expects the no-base variant of the mutation, which is what
         the stack workflow must always use: an expectation with base=None will
@@ -342,8 +345,7 @@ class MockGitHubServer:
                 ("" if commit_msg.endswith("\n") else "\n") + "---\n"
                 "[//]: # (BEGIN SAPLING FOOTER)\n"
                 "Stack created with [Sapling](https://sapling-scm.com). Best reviewed"
-                f" with [ReviewStack](https://reviewstack.dev/{owner}/{name}/pull/{pr_number}).\n"
-                + "\n".join(pr_list)
+                f" with [{review_tool}]({review_url}).\n" + "\n".join(pr_list)
             )
 
         title, body = title_and_body(commit_msg)

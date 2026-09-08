@@ -9,7 +9,14 @@
 
 #include <boost/filesystem.hpp>
 #include <algorithm>
+#include <array>
+#include <charconv>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
+
+#include <fmt/format.h>
 #include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
@@ -19,12 +26,12 @@
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <folly/stop_watch.h>
+#include <folly/system/ThreadName.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include "eden/common/telemetry/DurationScope.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/PathFuncs.h"
-#include "eden/common/utils/PathMapMutator.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/FileContentStore.h"
@@ -53,6 +60,41 @@ namespace facebook::eden {
 namespace {
 constexpr uint64_t ioCountMask = 0x7FFFFFFFFFFFFFFFull;
 constexpr uint64_t ioClosedMask = 1ull << 63;
+
+#ifndef _WIN32
+constexpr folly::StringPiece kInodeReservationFile{"inode-reservation"};
+constexpr folly::StringPiece kInodeReservationTempFile{"inode-reservation.tmp"};
+constexpr uint64_t kInodeReservationSize = 4096;
+
+// Load on-disk inode reservation state. Returns nullopt on unexpected on-disk
+// state.
+std::optional<uint64_t> loadInodeReservation(AbsolutePathPiece localDir) {
+  const auto path = localDir + PathComponentPiece{kInodeReservationFile};
+  std::array<char, 32> target{};
+  const auto size = ::readlink(path.c_str(), target.data(), target.size());
+  if (size < 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    XLOGF(
+        WARN,
+        "Failed to read inode reservation {}: {}",
+        path,
+        folly::errnoStr(errno));
+    return std::nullopt;
+  }
+
+  uint64_t reservation;
+  const auto result = std::from_chars(
+      target.data(), target.data() + size, reservation, /*base=*/10);
+  if (result.ec != std::errc{} || result.ptr != target.data() + size ||
+      reservation <= kRootNodeId.get()) {
+    XLOGF(WARN, "Invalid inode reservation in {}", path);
+    return std::nullopt;
+  }
+  return reservation;
+}
+#endif
 
 bool getOverlayEntryIsRestricted(const overlay::OverlayEntry& entry) {
   return apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
@@ -172,17 +214,22 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
 std::unique_ptr<FileContentStore> makeFileContentStore(
     AbsolutePathPiece localDir,
     const std::shared_ptr<EdenFsEventsLogger>& logger,
-    InodeCatalogType inodeCatalogType) {
+    InodeCatalogType inodeCatalogType,
+    bool directFileCreate,
+    bool cacheWalFiles) {
 #ifdef _WIN32
   (void)localDir;
   (void)logger;
+  (void)directFileCreate;
+  (void)cacheWalFiles;
   return nullptr;
 #else
   // LegacyEphemeral only applies to the inode catalog, not the file content
   // store
   if (inodeCatalogType == InodeCatalogType::Legacy ||
       inodeCatalogType == InodeCatalogType::LegacyEphemeral) {
-    return std::make_unique<FsFileContentStore>(localDir);
+    return std::make_unique<FsFileContentStore>(
+        localDir, directFileCreate, cacheWalFiles);
   } else if (inodeCatalogType == InodeCatalogType::LegacyDev) {
     return std::make_unique<FsFileContentStoreDev>(localDir);
   } else {
@@ -248,7 +295,9 @@ Overlay::Overlay(
     : fileContentStore_{makeFileContentStore(
           localDir,
           logger,
-          inodeCatalogType)},
+          inodeCatalogType,
+          config.experimentalOverlayDirectFileCreate.getValue(),
+          config.experimentalOverlayCacheWalFiles.getValue())},
       inodeCatalog_{makeInodeCatalog(
           localDir,
           inodeCatalogType,
@@ -267,11 +316,31 @@ Overlay::Overlay(
       errorLogger_(errorLogger),
       stats_{std::move(stats)},
       useDirectFileWrites_(config.overlayDirectFileWrites.getValue()),
+      useInodeReservation_{
+          !folly::kIsWindows && config.overlayInodeReservation.getValue() &&
+          (inodeCatalogType == InodeCatalogType::Legacy ||
+           inodeCatalogType == InodeCatalogType::LegacyDev)},
       useWal_{config.overlayUseWal.getValue() && inodeCatalog_->supportsWal()},
       walCompactionMultiplier_{
           config.overlayWalCompactionMultiplier.getValue()},
       walCompactionByteCap_{config.overlayWalCompactionByteCap.getValue()},
-      walCompactionRng_{[] { return folly::Random::rand32(); }} {}
+      walMinCompactionThreshold_{static_cast<size_t>(
+          config.experimentalOverlayWalMinCompactionThreshold.getValue())},
+      walCompactionRng_{[] { return folly::Random::rand32(); }} {
+#ifndef _WIN32
+  if (fileContentStore_) {
+    filePreallocPoolSize_ = config.overlayFilePreallocPoolSize.getValue();
+  }
+  // Only the Fs catalog pays a file creation (tmp file + rename) per dir
+  // record; DB-backed catalogs write records cheaply and would only gain
+  // orphan rows from preallocation.
+  if (inodeCatalogType == InodeCatalogType::Legacy ||
+      inodeCatalogType == InodeCatalogType::LegacyDev ||
+      inodeCatalogType == InodeCatalogType::LegacyEphemeral) {
+    dirPreallocPoolSize_ = config.overlayDirPreallocPoolSize.getValue();
+  }
+#endif
+}
 
 Overlay::~Overlay() {
   close();
@@ -285,6 +354,10 @@ void Overlay::close() {
   if (gcThread_.joinable()) {
     gcThread_.join();
   }
+
+#ifndef _WIN32
+  stopPreallocThread();
+#endif
 
   // Make sure everything is shut down in reverse of construction order.
   // Cleanup is not necessary if tree overlay was not initialized and either
@@ -368,6 +441,12 @@ folly::SemiFuture<Unit> Overlay::initialize(
       promise.setException(std::move(ew));
       return;
     }
+#ifndef _WIN32
+    if (filePreallocPoolSize_ > 0 || dirPreallocPoolSize_ > 0) {
+      preallocThread_ = std::thread([this] { preallocThreadLoop(); });
+    }
+#endif
+
     promise.setValue();
 
     gcThread();
@@ -526,7 +605,13 @@ void Overlay::initOverlay(
             false /*attempted_repair*/});
   }
 
-  nextInodeNumber_.store(optNextInodeNumber->get(), std::memory_order_relaxed);
+  auto nextInodeNumber = optNextInodeNumber->get();
+#ifndef _WIN32
+  if (useInodeReservation_) {
+    initializeInodeReservation(nextInodeNumber);
+  }
+#endif
+  nextInodeNumber_.store(nextInodeNumber, std::memory_order_relaxed);
 
 #ifndef _WIN32
   // Open after infoFile_'s lock is acquired because the InodeTable acquires
@@ -554,6 +639,11 @@ InodeNumber Overlay::allocateInodeNumber() {
   // might on ARM.
   auto previous = nextInodeNumber_++;
   XDCHECK_NE(0u, previous) << "allocateInodeNumber called before initialize";
+#ifndef _WIN32
+  if (useInodeReservation_) {
+    ensureInodeReservation(previous + 1);
+  }
+#endif
   return InodeNumber{previous};
 }
 
@@ -566,8 +656,78 @@ InodeNumber Overlay::allocateInodeNumbers(uint64_t count) {
 
   auto previous = nextInodeNumber_.fetch_add(count);
   XDCHECK_NE(0u, previous) << "allocateInodeNumbers called before initialize";
+#ifndef _WIN32
+  if (useInodeReservation_ && count != 0) {
+    ensureInodeReservation(previous + count);
+  }
+#endif
   return InodeNumber{previous};
 }
+
+#ifndef _WIN32
+void Overlay::initializeInodeReservation(uint64_t nextInodeNumber) {
+  auto reservation = loadInodeReservation(localDir_);
+  // Inode reservation should be >= nextInodeNumber.
+  if (!reservation || *reservation <= nextInodeNumber) {
+    reservation = nextInodeNumber + kInodeReservationSize;
+    saveInodeReservation(*reservation);
+  }
+  inodeReservation_.store(*reservation, std::memory_order_release);
+}
+
+void Overlay::ensureInodeReservation(uint64_t allocatedEnd) {
+  auto reservation = inodeReservation_.load(std::memory_order_acquire);
+  if (allocatedEnd <= reservation) {
+    return;
+  }
+
+  auto reservationUpdateLock = inodeReservationUpdateLock_.lock();
+  reservation = inodeReservation_.load(std::memory_order_relaxed);
+  if (allocatedEnd <= reservation) {
+    return;
+  }
+
+  auto reservationsNeeded =
+      (allocatedEnd - reservation) / kInodeReservationSize + 1;
+  reservation += reservationsNeeded * kInodeReservationSize;
+  saveInodeReservation(reservation);
+  inodeReservation_.store(reservation, std::memory_order_release);
+}
+
+// Update on-disk inode reservation state. Throws on I/O error.
+void Overlay::saveInodeReservation(uint64_t reservation) {
+  const auto path = localDir_ + PathComponentPiece{kInodeReservationFile};
+  const auto tempPath =
+      localDir_ + PathComponentPiece{kInodeReservationTempFile};
+  if (::unlink(tempPath.c_str()) != 0 && errno != ENOENT) {
+    folly::throwSystemError(
+        "Failed to remove temporary inode reservation ", tempPath.view());
+  }
+
+  SCOPE_FAIL {
+    ::unlink(tempPath.c_str());
+  };
+
+  const auto target = fmt::format("{}", reservation);
+  folly::checkUnixError(
+      ::symlink(target.c_str(), tempPath.c_str()),
+      "Failed to create temporary inode reservation ",
+      tempPath.view());
+  folly::checkUnixError(
+      ::rename(tempPath.c_str(), path.c_str()),
+      "Failed to replace inode reservation ",
+      path.view());
+
+  folly::File directory{localDir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC};
+#ifdef __APPLE__
+  const auto fsyncResult = ::fcntl(directory.fd(), F_FULLFSYNC);
+#else
+  const auto fsyncResult = ::fsync(directory.fd());
+#endif
+  folly::checkUnixError(
+      fsyncResult, "Failed to persist inode reservation in ", localDir_.view());
+}
+#endif
 
 bool Overlay::buildDirEntries(
     OverlayEntrySource source,
@@ -642,9 +802,8 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
 
   if (hasWal) {
     // Pre-process WAL into a collapsed net delta and merge it into the
-    // streamed-load PathMap via PathMapMutator. saveOverlayDir below
-    // flushes the merged base file and clearWalAfterFullWrite removes
-    // the WAL.
+    // streamed-load PathMap. saveOverlayDir below flushes the merged
+    // base file and clearWalAfterFullWrite removes the WAL.
     auto walResult = inodeCatalog_->loadWalDelta(inodeNumber, caseSensitive_);
     auto& delta = walResult.delta;
     stats_->increment(&OverlayStats::walReplay);
@@ -657,8 +816,7 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
           static_cast<double>(walResult.parseErrors));
     }
 
-    DirContents base{std::move(entries), caseSensitive_};
-    PathMapMutator<DirEntry> mutator{std::move(base)};
+    DirContents merged{std::move(entries), caseSensitive_};
 
     for (auto& [name, walDelta] : delta) {
       switch (walDelta.type) {
@@ -677,32 +835,34 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
             // WAL key matches the stored key exactly — no rekey needed, so
             // insert_or_assign is sufficient (vs. the erase+emplace in the
             // case-insensitive branch).
-            mutator.insert_or_assign(
-                PathComponentPiece{name}, std::move(entry));
+            merged.insert_or_assign(PathComponentPiece{name}, std::move(entry));
           } else {
             // On case-insensitive mounts the stored key spelling may differ
             // from the WAL ADD's spelling (e.g., base "foo" with WAL ADD
             // "FOO"). Erase any case-equivalent entry first so the inserted
             // key uses the WAL casing.
-            mutator.erase(PathComponentPiece{name});
-            mutator.emplace(PathComponentPiece{name}, std::move(entry));
+            merged.erase(PathComponentPiece{name});
+            merged.emplace(PathComponentPiece{name}, std::move(entry));
           }
           break;
         }
         case WalOpType::REMOVE:
-          mutator.erase(PathComponentPiece{name});
+          merged.erase(PathComponentPiece{name});
           break;
         case WalOpType::MATERIALIZE: {
-          auto it = mutator.find(PathComponentPiece{name});
-          if (it != mutator.end()) {
+          auto it = merged.find(PathComponentPiece{name});
+          if (it != merged.end()) {
             it->second.setMaterialized();
           }
           break;
         }
       }
     }
+    // The replayed map becomes the directory's live contents; fold the
+    // pending inserts and tombstones now instead of leaving lookups and
+    // iteration on the two-region path until the next mutation.
+    merged.compact();
 
-    DirContents merged{mutator.finalize()};
     if (!shouldDeferWalFlush() || walResult.parseErrors > 0 ||
         shouldRewriteOverlay) {
       // The clean-WAL rewrite is opportunistic compaction, redundant with what
@@ -880,8 +1040,12 @@ void Overlay::maybeCompactWal(
     // Below the cap: probabilistic roll. Expected appends between
     // compactions = `threshold`, so amortized rewrite cost is O(1) per
     // append.
-    size_t threshold = walCompactionMultiplier_ *
-        std::max(content.size(), static_cast<size_t>(10));
+    size_t threshold = walMinCompactionThreshold_
+        ? std::max(
+              walMinCompactionThreshold_,
+              walCompactionMultiplier_ * content.size())
+        : walCompactionMultiplier_ *
+            std::max(content.size(), static_cast<size_t>(10));
     if (walCompactionRng_() % threshold != 0) {
       return;
     }
@@ -1132,6 +1296,255 @@ OverlayFile Overlay::createOverlayFile(
     errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::createOverlayFileFailure);
     throw;
+  }
+}
+
+std::optional<std::pair<InodeNumber, OverlayFile>>
+Overlay::tryClaimPreparedFile(folly::ByteRange contents) {
+  if (filePreallocPoolSize_ == 0) {
+    return std::nullopt;
+  }
+  IORequest req{this};
+  PreparedFile prepared;
+  bool needRefill;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    if (preallocPool_.empty()) {
+      stats_->increment(&OverlayStats::preallocFileMissed);
+      if (!preallocBroken_) {
+        preallocCondVar_.notify_one();
+      }
+      return std::nullopt;
+    }
+    prepared = std::move(preallocPool_.back());
+    preallocPool_.pop_back();
+    // Only wake the refill thread once half the pool has drained, so a
+    // steady stream of creates costs one wakeup and one refill batch per
+    // half-pool of claims rather than a futex wake per claim.
+    needRefill = preallocPool_.size() <= filePreallocPoolSize_ / 2;
+  }
+  if (needRefill) {
+    preallocCondVar_.notify_one();
+  }
+  if (!contents.empty()) {
+    // The fd is positioned just past the header, so this appends the
+    // contents (e.g. a symlink target) in the right place.
+    auto written =
+        folly::writeFull(prepared.file.fd(), contents.data(), contents.size());
+    if (written < 0) {
+      // Remove the file so a failed claim doesn't leave a partial
+      // payload behind for fsck to report.
+      int writeErrno = errno;
+      stats_->increment(&OverlayStats::preallocFileClaimFailed);
+      try {
+        fileContentStore_->removeOverlayFile(prepared.number);
+      } catch (const std::exception& ex) {
+        XLOGF(
+            WARN,
+            "failed to remove overlay file {} after a failed claim write: {}",
+            prepared.number,
+            folly::exceptionStr(ex));
+      }
+      folly::throwSystemErrorExplicit(
+          writeErrno, "failed to write contents to preallocated overlay file");
+    }
+  }
+  stats_->increment(&OverlayStats::preallocFileClaimed);
+  return std::make_pair(
+      prepared.number, OverlayFile{std::move(prepared.file), weak_from_this()});
+}
+
+std::optional<InodeNumber> Overlay::tryClaimPreparedDir() {
+  if (dirPreallocPoolSize_ == 0) {
+    return std::nullopt;
+  }
+  InodeNumber number;
+  bool needRefill;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    if (preallocDirPool_.empty()) {
+      stats_->increment(&OverlayStats::preallocDirMissed);
+      preallocCondVar_.notify_one();
+      return std::nullopt;
+    }
+    number = preallocDirPool_.back();
+    preallocDirPool_.pop_back();
+    // Match the file pool's refill hysteresis: one wakeup per half-pool of
+    // claims rather than a futex wake per mkdir.
+    needRefill = preallocDirPool_.size() <= dirPreallocPoolSize_ / 2;
+  }
+  if (needRefill) {
+    preallocCondVar_.notify_one();
+  }
+  stats_->increment(&OverlayStats::preallocDirClaimed);
+  return number;
+}
+
+void Overlay::preallocThreadLoop() {
+  folly::setThreadName("OverlayPrealloc");
+  bool backoff = false;
+  bool filePoolBroken = false;
+  while (true) {
+    size_t wantFiles;
+    size_t wantDirs;
+    {
+      std::unique_lock<std::mutex> lock{preallocMutex_};
+      if (backoff) {
+        preallocCondVar_.wait_for(
+            lock, std::chrono::seconds(1), [&] { return preallocStop_; });
+        backoff = false;
+      } else {
+        preallocCondVar_.wait(lock, [&] {
+          return preallocStop_ ||
+              (!preallocBroken_ &&
+               preallocPool_.size() < filePreallocPoolSize_) ||
+              preallocDirPool_.size() < dirPreallocPoolSize_;
+        });
+      }
+      if (preallocStop_) {
+        return;
+      }
+      wantFiles =
+          preallocBroken_ ? 0 : filePreallocPoolSize_ - preallocPool_.size();
+      wantDirs = dirPreallocPoolSize_ - preallocDirPool_.size();
+    }
+    std::vector<PreparedFile> fileBatch;
+    fileBatch.reserve(wantFiles);
+    for (size_t i = 0; i < wantFiles; ++i) {
+      // If creation fails below, this number stays consumed; the inode
+      // number space is 64 bits, so the gap is harmless.
+      auto number = allocateInodeNumber();
+      try {
+        auto created =
+            fileContentStore_->createOverlayFile(number, folly::ByteRange{});
+        auto* file = std::get_if<folly::File>(&created);
+        if (!file) {
+          XLOG(
+              WARN,
+              "overlay file preallocation is not supported by this "
+              "FileContentStore; disabling the file pool");
+          filePoolBroken = true;
+          // The store may have persisted the file even though it did not
+          // return an fd (the LMDB store does); remove it so the probe
+          // leaves no orphan behind.
+          try {
+            fileContentStore_->removeOverlayFile(number);
+          } catch (const std::exception& removeEx) {
+            XLOGF(
+                WARN,
+                "failed to remove prealloc probe file {}: {}",
+                number,
+                folly::exceptionStr(removeEx));
+          }
+          break;
+        }
+        fileBatch.push_back(PreparedFile{number, std::move(*file)});
+      } catch (const std::exception& ex) {
+        // Likely ENOSPC or an unusable overlay directory. Keep what we
+        // have and retry after a delay instead of spinning.
+        XLOGF(
+            WARN,
+            "overlay file preallocation failed for {}: {}",
+            number,
+            folly::exceptionStr(ex));
+        backoff = true;
+        break;
+      }
+    }
+    std::vector<InodeNumber> dirBatch;
+    dirBatch.reserve(wantDirs);
+    for (size_t i = 0; i < wantDirs; ++i) {
+      auto number = allocateInodeNumber();
+      try {
+        // Publish a complete record before making its inode number claimable.
+        inodeCatalog_->saveOverlayEntries(
+            number, 0, [](auto) {}, /*crashSafe=*/true);
+        dirBatch.push_back(number);
+      } catch (const std::exception& ex) {
+        XLOGF(
+            WARN,
+            "overlay dir preallocation failed for {}: {}; retrying after "
+            "backoff",
+            number,
+            folly::exceptionStr(ex));
+        // Best-effort cleanup in case the record was partially created.
+        try {
+          inodeCatalog_->removeOverlayDir(number);
+        } catch (const std::exception& removeEx) {
+          XLOGF(
+              WARN,
+              "failed to remove preallocated overlay dir {} after a failed "
+              "write: {}",
+              number,
+              folly::exceptionStr(removeEx));
+        }
+        backoff = true;
+        break;
+      }
+    }
+    bool allPoolsInactive;
+    {
+      std::lock_guard<std::mutex> guard{preallocMutex_};
+      if (filePoolBroken) {
+        preallocBroken_ = true;
+      }
+      for (auto& entry : fileBatch) {
+        preallocPool_.push_back(std::move(entry));
+      }
+      preallocDirPool_.insert(
+          preallocDirPool_.end(), dirBatch.begin(), dirBatch.end());
+      allPoolsInactive = (filePreallocPoolSize_ == 0 || preallocBroken_) &&
+          dirPreallocPoolSize_ == 0;
+    }
+    if (allPoolsInactive) {
+      return;
+    }
+  }
+}
+
+void Overlay::stopPreallocThread() {
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    preallocStop_ = true;
+  }
+  preallocCondVar_.notify_all();
+  if (preallocThread_.joinable()) {
+    preallocThread_.join();
+  }
+  // Remove any unclaimed pre-created files so they don't linger as orphans
+  // in the overlay directory.
+  std::vector<PreparedFile> leftover;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    leftover.swap(preallocPool_);
+  }
+  for (auto& entry : leftover) {
+    entry.file.closeNoThrow();
+    try {
+      fileContentStore_->removeOverlayFile(entry.number);
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "failed to remove unclaimed preallocated overlay file {}: {}",
+          entry.number,
+          folly::exceptionStr(ex));
+    }
+  }
+  std::vector<InodeNumber> dirLeftover;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    dirLeftover.swap(preallocDirPool_);
+  }
+  for (auto number : dirLeftover) {
+    try {
+      inodeCatalog_->removeOverlayDir(number);
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "failed to remove unclaimed preallocated overlay dir {}: {}",
+          number,
+          folly::exceptionStr(ex));
+    }
   }
 }
 

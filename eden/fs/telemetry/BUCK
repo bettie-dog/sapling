@@ -133,7 +133,6 @@ cpp_library(
         "//eden/fs/config:config",
     ],
     exported_deps = [
-        ":structured_logger",
         "//eden/common/utils:ref_ptr",
     ],
 )
@@ -219,16 +218,12 @@ cpp_library(
         "EdenStructuredLogger.h",
     ],
     deps = [
-        ":stats",
         ":xplat_keys",
         ":xplat_logger",
-        "//eden/common/telemetry:structured_logger_factory",
-        "//eden/fs/config:config",
     ],
     exported_deps = [
         "//eden/common/telemetry:log_info",
         "//eden/common/telemetry:scribe_logger",
         "//eden/common/telemetry:structured_logger",
-        "//eden/common/utils:ref_ptr",
     ],
 )

@@ -56,7 +56,9 @@ use futures_lazy_shared::LazyShared;
 use futures_watchdog::WatchdogExt;
 use git_types::MappedGitCommitId;
 use hooks::CrossRepoPushSource;
+use hooks::HookExecutionPurpose;
 use hooks::HookOutcome;
+use hooks::LogOnlyRejections;
 use hooks::PushAuthoredBy;
 use itertools::Itertools;
 use manifest::Diff as ManifestDiff;
@@ -537,6 +539,12 @@ impl<R: RepoDerivedDataArc + RepoIdentityRef> ChangesetContext<R> {
                 }
             })
             .await
+    }
+
+    /// Derive the root content manifest, memoizing it on this context and its clones.
+    pub async fn prewarm_root_content_manifest(&self) -> Result<(), MononokeError> {
+        self.root_content_manifest_id().await?;
+        Ok(())
     }
 }
 
@@ -1756,6 +1764,7 @@ where
                     ManifestDiff::Changed(path, convert_entry(from), convert_entry(to))
                 }
             })
+            .map_err(MononokeError::from)
             .try_filter_map(|diff_entry| {
                 async {
                     let entry = match diff_entry {
@@ -2117,6 +2126,8 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         bookmark: impl AsRef<str>,
         pushvars: Option<&HashMap<String, Bytes>>,
         run_as: Option<MononokeIdentitySet>,
+        override_commit_message: Option<String>,
+        log_only_rejections: LogOnlyRejections,
     ) -> Result<Vec<HookOutcome>, MononokeError> {
         // When `run_as` is provided, run the hooks against a context derived from
         // the caller's session with only the metadata identities swapped for the
@@ -2138,17 +2149,27 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             self.ctx().with_overridden_metadata(Arc::new(metadata))
         });
         let ctx = run_as_ctx.as_ref().unwrap_or_else(|| self.ctx());
+        // The override keeps the stored changeset id so hooks that look data
+        // up by id (e.g. file lists) still resolve the real commit; only the
+        // message hooks parse changes. The resulting value violates
+        // id == hash(content) and exists solely for this in-memory dry run.
+        let mut bonsai = self.bonsai_changeset().await?;
+        if let Some(message) = override_commit_message {
+            bonsai = bonsai.replace_message_keeping_id(message)?;
+        }
         Ok(self
             .repo_ctx()
             .hook_manager()
             .run_changesets_hooks_for_bookmark(
                 ctx,
-                &[self.bonsai_changeset().await?],
+                &[bonsai],
                 &BookmarkKey::new(bookmark.as_ref())?,
                 pushvars,
                 CrossRepoPushSource::NativeToThisRepo,
                 PushAuthoredBy::User,
+                HookExecutionPurpose::DryRun,
                 run_as_original_identities.as_ref(),
+                log_only_rejections,
             )
             .await?)
     }

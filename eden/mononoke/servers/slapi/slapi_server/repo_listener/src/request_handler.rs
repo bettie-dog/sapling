@@ -25,9 +25,9 @@ use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use hgproto::HgProtoHandler;
 use hgproto::sshproto;
+use metaconfig_types::RepoConfigRef;
 use mononoke_api::Mononoke;
 use mononoke_api::Repo;
-use mononoke_configs::MononokeConfigs;
 use qps::Qps;
 use rate_limiting::LoadShedResult;
 use rate_limiting::Metric;
@@ -59,7 +59,6 @@ pub async fn request_handler(
     fb: FacebookInit,
     reponame: String,
     mononoke: Arc<Mononoke<Repo>>,
-    configs: Arc<MononokeConfigs>,
     _security_checker: &ConnectionSecurityChecker,
     stdio: Stdio,
     rate_limiter: Option<RateLimitEnvironment>,
@@ -93,9 +92,12 @@ pub async fn request_handler(
     // Upgrade log to include server drain
     scuba = scuba.with_seq("seq");
     scuba.add("repo", reponame);
-    if let Some(config_info) = configs.config_info().as_ref() {
-        scuba.add("config_store_version", config_info.content_hash.clone());
-        scuba.add("config_store_last_updated_at", config_info.last_updated_at);
+    // Per-repo config provenance; mutation id is always None until plumbed.
+    if let Some(version) = repo.repo_config().config_version.clone() {
+        scuba.add("repo_config_version", version);
+    }
+    if let Some(mutation_id) = repo.repo_config().config_mutation_id {
+        scuba.add("repo_config_mutation_id", mutation_id);
     }
     scuba.add_metadata(&metadata);
 

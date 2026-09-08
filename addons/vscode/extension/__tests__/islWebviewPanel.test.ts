@@ -8,7 +8,8 @@
 import type {Repository} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import * as vscode from 'vscode';
-import {cwdForOpenISLCommand} from '../islWebviewPanel';
+import {encodeSaplingDiffUri} from '../DiffContentProvider';
+import {cwdForOpenISLCommand, initialCwdForISL} from '../islWebviewPanel';
 
 jest.mock('vscode', () => {
   const actualVscode = jest.requireActual('../../__mocks__/vscode');
@@ -46,6 +47,25 @@ describe('cwdForOpenISLCommand', () => {
     expect(cwdForOpenISLCommand(fileUri)).toBe(fileUri.fsPath);
   });
 
+  it('resolves the repo root from a sapling-diff Uri (diff view)', () => {
+    const mockRepo = {info: {repoRoot}} as unknown as Repository;
+    jest.spyOn(repositoryCache, 'cachedRepositoryForPath').mockReturnValue(mockRepo);
+
+    const diffUri = encodeSaplingDiffUri(vscode.Uri.file(`${repoRoot}/path/to/file.ts`), 'abc123');
+    expect(cwdForOpenISLCommand(diffUri)).toBe(repoRoot);
+  });
+
+  it('returns undefined for a webview Uri (webview tab, e.g. the Home Page)', () => {
+    jest.spyOn(repositoryCache, 'cachedRepositoryForPath').mockReturnValue(undefined);
+
+    // A webview tab's resource Uri path is a panel id, not a folder.
+    const webviewUri = vscode.Uri.from({
+      scheme: 'webview-panel',
+      path: 'webview-panel/webview-Home Page-aae7a9ea-c65c-4592-8ff5-af1fd255020f',
+    });
+    expect(cwdForOpenISLCommand(webviewUri)).toBeUndefined();
+  });
+
   it('returns undefined with no argument (keybinding)', () => {
     expect(cwdForOpenISLCommand(undefined)).toBeUndefined();
   });
@@ -53,5 +73,43 @@ describe('cwdForOpenISLCommand', () => {
   it('returns undefined for an argument without a rootUri', () => {
     expect(cwdForOpenISLCommand({})).toBeUndefined();
     expect(cwdForOpenISLCommand({rootUri: undefined})).toBeUndefined();
+  });
+});
+
+describe('initialCwdForISL', () => {
+  it('reopens with the most recently selected cwd', () => {
+    expect(
+      initialCwdForISL(
+        undefined,
+        undefined,
+        '/workspace/second',
+        '/workspace/first',
+        '/process/cwd',
+      ),
+    ).toBe('/workspace/second');
+  });
+
+  it('prefers an explicitly requested cwd', () => {
+    expect(
+      initialCwdForISL(
+        '/workspace/requested',
+        undefined,
+        '/workspace/recent',
+        '/workspace/first',
+        '/process/cwd',
+      ),
+    ).toBe('/workspace/requested');
+  });
+
+  it('prefers a focused environment over the remembered cwd', () => {
+    expect(
+      initialCwdForISL(
+        undefined,
+        '/workspace/focused',
+        '/workspace/recent',
+        '/workspace/first',
+        '/process/cwd',
+      ),
+    ).toBe('/workspace/focused');
   });
 });

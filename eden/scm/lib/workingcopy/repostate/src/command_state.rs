@@ -13,6 +13,8 @@ use serde::Deserialize;
 
 use crate::MergeState;
 
+pub const SUBTREE_COPY_STATE_FILE: &str = "subtree-copy-state";
+
 #[derive(Debug, Clone)]
 pub struct State {
     // This is not read outside of `Debug` and `Clone` at the moment, but it doesn't feel like
@@ -90,7 +92,7 @@ impl State {
             self.abort
         );
         if self.abort_lossy {
-            let _ = write!(s, " - WARNING: will destroy uncommitted changes");
+            let _ = write!(s, " (WARNING: will destroy uncommitted changes)");
         }
 
         s
@@ -125,13 +127,23 @@ impl std::error::Error for Conflict {}
 // So, put more specific/exclusive states first.
 pub static STATES: &[State] = &[
     State {
+        // A subtree copy has updated the working copy and is waiting to be committed.
+        command: "subtree copy",
+        description: "subtree copy in progress",
+        state_file: SUBTREE_COPY_STATE_FILE,
+        allows: &[Operation::Commit, Operation::GotoClean],
+        proceed: "commit",
+        abort: "goto . --clean",
+        abort_lossy: true,
+    },
+    State {
         // Interrupted "histedit" due to conflicts.
         command: "histedit",
         description: "histedit in progress",
         state_file: "histedit-state",
-        // By design, "histedit" allows committing mid-operation. Commit will
-        // still be rejected if there are unresolved conflicts.
-        allows: &[Operation::Commit],
+        // By design, "histedit" allows committing and amending mid-operation.
+        // Both will still be rejected if there are unresolved conflicts.
+        allows: &[Operation::Commit, Operation::Amend],
         proceed: "histedit --continue",
         abort: "histedit --abort",
         abort_lossy: false,
@@ -210,6 +222,7 @@ pub static UNRESOLVED_CONFLICTS: State = State {
 pub enum Operation {
     GotoClean,
     Commit,
+    Amend,
     Other,
 }
 
@@ -265,6 +278,26 @@ mod test {
             "goto --merge in progress
 (use 'sl goto --continue' to continue or
      'sl goto --clean' to abort - WARNING: will destroy uncommitted changes)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_subtree_copy_state_allows_commit_and_clean_goto() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+
+        std::fs::File::create(tmp.path().join(SUBTREE_COPY_STATE_FILE))?;
+
+        assert!(try_operation(tmp.path(), Operation::Commit).is_ok());
+        assert!(try_operation(tmp.path(), Operation::GotoClean).is_ok());
+        let err = try_operation(tmp.path(), Operation::Other).unwrap_err();
+        let err: Conflict = err.downcast().unwrap();
+        assert_eq!(
+            format!("{err}"),
+            "subtree copy in progress
+(use 'sl commit' to continue or
+     'sl goto . --clean' to abort - WARNING: will destroy uncommitted changes)"
         );
 
         Ok(())

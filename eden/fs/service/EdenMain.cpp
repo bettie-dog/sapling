@@ -282,9 +282,7 @@ void EdenMain::registerStandardBackingStores() {
         return std::make_shared<FilteredBackingStore>(
             std::move(saplingBackingStore),
             std::move(hgSparseFilter),
-            reloadableConfig,
-            reloadableConfig->getEdenConfig()
-                ->filteredfsOptimizeUnfiltered.getValue());
+            reloadableConfig);
       });
 
   registerBackingStore(
@@ -509,7 +507,11 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
   auto startupStatusChannel = std::make_shared<StartupStatusChannel>();
   auto logPath = getLogPath(edenConfig->edenDir.getValue());
   auto startupLogger = daemonizeIfRequested(
-      logPath, privHelper.get(), originalCommandLine, startupStatusChannel);
+      logPath,
+      privHelper.get(),
+      originalCommandLine,
+      startupStatusChannel,
+      edenConfig->disclaimTccResponsibility.getValue());
   std::optional<EdenServer> server;
   auto prepareFuture = folly::Future<folly::Unit>::makeEmpty();
   try {
@@ -556,6 +558,29 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
     if (daemonMemoryPriority.has_value()) {
       privHelper->setMemoryPriorityForProcessBlocking(
           daemonPid, daemonMemoryPriority.value());
+    }
+
+    // Also protect the privhelper process when explicitly configured.
+    const auto privhelperMemoryPriority =
+        edenConfig->privHelperTargetMemoryPriority.getValue();
+    if (privhelperMemoryPriority.has_value()) {
+      auto privhelperPid = privHelper->getPid();
+      if (privhelperPid > 0) {
+        try {
+          privHelper->setMemoryPriorityForProcessBlocking(
+              privhelperPid, privhelperMemoryPriority.value());
+        } catch (const std::exception& ex) {
+          XLOGF(
+              WARN,
+              "Cannot set privhelper memory priority to {}: {}",
+              privhelperMemoryPriority.value(),
+              ex.what());
+        }
+      } else {
+        XLOG(
+            WARN,
+            "Cannot set privhelper memory priority: privhelper pid unknown");
+      }
     }
 
 #ifdef __linux__

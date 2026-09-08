@@ -386,7 +386,7 @@ async fn refs_update(
 
     let diversion_mode = PushDiversionMode::resolve(&request_context, &acl_provider).await?;
 
-    // Normal RL Land Service diversion: submitLand + poll.
+    // Diversion: one synchronous submit_manifest_land to Multi-Repo Land.
     // Branch creates/moves are diverted; other refs (deletes, tags, etc.)
     // are handled by the normal git server path below.
     // NOTE: When diversion is active and the push contains both divertable and
@@ -452,19 +452,8 @@ async fn refs_update(
         .await?
     };
 
-    // For emergency pushes, send a best-effort notification to the RL Land Service.
-    #[cfg(fbcode_build)]
-    if matches!(diversion_mode, PushDiversionMode::EmergencyPush)
-        && results.iter().any(|(_, r)| r.is_ok())
-    {
-        super::rl_land_service_diversion::fire_and_forget_submit_land(
-            &results,
-            &request_context,
-            _multi_repo_land_service_address,
-        )
-        .await;
-    }
-
+    // An emergency push leaves manifest pins stale; the reconciler re-pins
+    // within its interval.
     Ok(results)
 }
 

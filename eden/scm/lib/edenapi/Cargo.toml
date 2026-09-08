@@ -14,9 +14,9 @@ name = "edenapi"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 itertools = "0.15.0"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
@@ -37,6 +37,6 @@ sapling-version = { version = "0.1.0", path = "../version" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_cbor = "0.11.2"
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 url = "2.5.8"

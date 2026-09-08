@@ -860,6 +860,9 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
         nullptr,
         context->getRequestInfo(),
         context->getCancellationToken());
+    if (!ctx->isDryRun()) {
+      ctx->inhibitInodeGC();
+    }
 
     /**
      * This will update the timestamp for the entire mount,
@@ -1192,6 +1195,47 @@ void EdenMount::updateInodePressurePolicy() {
       gcPeriodMax.count());
 }
 
+// Below this many invalidations, rerunning GC is cheap enough that stall
+// tracking isn't worthwhile.
+constexpr uint64_t kPressureGcStallMinInvalidated = 10'000;
+
+void EdenMount::recordPressureGcOutcome(
+    uint64_t numInvalidated,
+    uint64_t inodesBefore,
+    uint64_t inodesAfter) {
+  // GC flushes the invalidation queue between invalidating entries and
+  // sweeping, and the kernel FORGETs triggered by the invalidations arrive
+  // quickly in practice, so most of a run's invalidations should be dropped
+  // from the inode count by the run's own sweep. Concurrent lookups can
+  // offset some of the drop, but a healthy run reclaims far more than 10%;
+  // should a run be misjudged anyway, the cost is one cycle at the regular
+  // GC cadence.
+  auto numDropped =
+      static_cast<int64_t>(inodesBefore) - static_cast<int64_t>(inodesAfter);
+  bool stalled = numInvalidated >= kPressureGcStallMinInvalidated &&
+      numDropped <= static_cast<int64_t>(numInvalidated / 10);
+
+  if (pressureGcStalled_.exchange(stalled, std::memory_order_relaxed) !=
+      stalled) {
+    if (stalled) {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} invalidated {} inodes but only dropped "
+          "{}; the kernel may no longer hold the invalidated entries. "
+          "Falling back to the regular GC period.",
+          getPath(),
+          numInvalidated,
+          numDropped);
+    } else {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} is reclaiming inodes again, resuming "
+          "the pressure-based GC period",
+          getPath());
+    }
+  }
+}
+
 std::optional<int64_t> EdenMount::getCheckoutProgress() const {
   auto parentLock = parentState_.rlock();
   if (!std::holds_alternative<ParentCommitState::CheckoutInProgress>(
@@ -1228,6 +1272,26 @@ FuseChannel* FOLLY_NULLABLE EdenMount::getFuseChannel() const {
   return nullptr;
 #endif
 }
+
+#ifndef _WIN32
+std::shared_ptr<FuseChannel> EdenMount::getFuseChannelShared() const {
+  auto channel = channel_.load().getStdShared();
+  auto* fuseChannel = dynamic_cast<FuseChannel*>(channel.get());
+  if (fuseChannel == nullptr) {
+    return {};
+  }
+  return {std::move(channel), fuseChannel};
+}
+
+std::shared_ptr<UnboundedQueueExecutor>
+EdenMount::getInodeGCInvalidationExecutor() const {
+  folly::call_once(inodeGCInvalidationExecutorOnce_, [this] {
+    inodeGCInvalidationExecutor_ =
+        std::make_shared<UnboundedQueueExecutor>(1, "inode-gc-inval");
+  });
+  return inodeGCInvalidationExecutor_;
+}
+#endif
 
 PrjfsChannel* FOLLY_NULLABLE EdenMount::getPrjfsChannel() const {
 #ifdef _WIN32
@@ -1721,6 +1785,10 @@ folly::Try<EdenMount::CheckoutSetup> EdenMount::beginCheckout(
     setup.ctx->getFetchContext()->setDetachedExecutor(
         fetchContext->getDetachedExecutor());
   } // parentState_ wlock released here.
+
+  if (!setup.ctx->isDryRun()) {
+    setup.ctx->inhibitInodeGC();
+  }
 
   // Eagerly register the first fault check so unblock() can find it.
   // See struct comment for details. Done OUTSIDE the wlock scope so
@@ -2541,6 +2609,15 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
           throw;
         }
 
+        if (ctxPtr->isCancelled()) {
+          promise->setException(folly::OperationCancelled{});
+          {
+            auto lockedCachePtr = scmStatusCache_.wlock();
+            (*lockedCachePtr)->dropPromise(key, curSequenceID);
+          }
+          co_return std::make_unique<ScmStatus>(callback->extractStatus());
+        }
+
         bool shouldInsert = true;
 
         ScmStatus newStatus = callbackPtr->peekStatus();
@@ -2712,7 +2789,10 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       edenConfig->fuseUseIoUring.getValue(),
       edenConfig->fuseIoUringKernelReleaseRegex.getValue(),
       edenConfig->fuseIoUringQueueDepth.getValue(),
-      edenConfig->fuseIoUringDisableIoWait.getValue());
+      edenConfig->fuseIoUringDisableIoWait.getValue(),
+      edenConfig->experimentalFuseIoUringSkipSelfWakeup.getValue(),
+      edenConfig->fuseIoUringPreCreateQueues.getValue(),
+      edenConfig->fuseNumInvalidationThreads.getValue());
 }
 } // namespace
 #endif
@@ -2723,12 +2803,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
     std::optional<folly::File> connectedSocket = std::nullopt) {
   auto edenConfig = mount->getEdenConfig();
   auto nfsServer = mount->getServerState()->getNfsServer();
-  auto iosize = edenConfig->nfsIoSize.getValue();
   auto mountPath = mount->getPath();
   // Make sure that we are running on the EventBase while registering
   // the mount point.
   return via(nfsServer->getEventBase(),
-             [mount, mountPath, nfsServer, iosize, edenConfig]() {
+             [mount, mountPath, nfsServer, edenConfig]() {
                return nfsServer->registerMount(
                    mountPath,
                    mount->getRootInode()->getNodeId(),
@@ -2742,9 +2821,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                        edenConfig->nfsRequestTimeout.getValue()),
                    mount->getServerState()->getNotifier(),
                    mount->getCheckoutConfig()->getCaseSensitive(),
-                   iosize,
+                   edenConfig->nfsReadIoSize.getValue(),
+                   edenConfig->nfsWriteIoSize.getValue(),
                    edenConfig->nfsTraceBusCapacity.getValue(),
-                   edenConfig->nfsFastPathRPCs.getValue());
+                   edenConfig->nfsFastPathRPCs.getValue(),
+                   mount->getServerState()->getReloadableConfig());
              })
       .thenValue([mount,
                   nfsServer,
@@ -2799,7 +2880,6 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
 
         if (shouldBeOrIsNfsChannel()) {
           NFSMountOptions options;
-          options.iosize = edenConfig->nfsIoSize.getValue();
           options.useReaddirplus = edenConfig->useReaddirplus.getValue();
           options.useSoftMount = edenConfig->useSoftMounts.getValue();
           options.readOnly = readOnly;
@@ -3276,20 +3356,68 @@ std::optional<TreePrefetchLease> EdenMount::tryStartTreePrefetch(
   }
 }
 
-std::optional<EdenMount::WorkingCopyGCLease> EdenMount::tryStartWorkingCopyGC(
-    TreeInodePtr inode) {
-  bool expectedInProgress = false;
-  if (!workingCopyGCInProgress_.compare_exchange_strong(
-          expectedInProgress, true, std::memory_order_acq_rel)) {
+std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
+  auto mount = shared_from_this();
+  auto state = inodeGCState_.wlock();
+  if (state->gcRunning || state->inhibitorCount != 0) {
     return std::nullopt;
   }
 
-  return EdenMount::WorkingCopyGCLease{
-      &workingCopyGCInProgress_, std::move(inode)};
+  state->cancellationSource = folly::CancellationSource{};
+  auto cancellationToken = state->cancellationSource.getToken();
+  state->gcRunning = true;
+  return InodeGCLease{
+      std::move(mount),
+      /*representsRunningGc=*/true,
+      std::move(cancellationToken)};
 }
 
-bool EdenMount::isWorkingCopyGCRunning() const {
-  return workingCopyGCInProgress_.load(std::memory_order_acquire);
+bool EdenMount::isInodeGCRunning() const {
+  return inodeGCState_.rlock()->gcRunning;
+}
+
+EdenMount::InodeGCLease EdenMount::stealInodeGCLease() {
+  auto mount = shared_from_this();
+  folly::CancellationSource cancellationSource;
+  {
+    auto state = inodeGCState_.wlock();
+    cancellationSource = state->cancellationSource;
+    ++state->inhibitorCount;
+  }
+  // Cancellation callbacks may run inline, so request cancellation only after
+  // reserving GC admission and releasing the state lock.
+  cancellationSource.requestCancellation();
+  return InodeGCLease{
+      std::move(mount),
+      /*representsRunningGc=*/false,
+      folly::CancellationToken{}};
+}
+
+EdenMount::InodeGCLease::~InodeGCLease() {
+  release();
+}
+
+EdenMount::InodeGCLease::InodeGCLease(InodeGCLease&& other) noexcept
+    : mount_{std::move(other.mount_)},
+      representsRunningGc_{other.representsRunningGc_},
+      cancellationToken_{std::move(other.cancellationToken_)} {}
+
+void EdenMount::InodeGCLease::release() noexcept {
+  if (mount_) {
+    mount_->releaseInodeGCLease(representsRunningGc_);
+    mount_.reset();
+  }
+}
+
+void EdenMount::releaseInodeGCLease(bool representsRunningGc) noexcept {
+  auto state = inodeGCState_.wlock();
+  if (representsRunningGc) {
+    XDCHECK(state->gcRunning);
+    state->gcRunning = false;
+  } else {
+    XDCHECK_GT(state->inhibitorCount, 0u);
+    --state->inhibitorCount;
+  }
 }
 
 void EdenMount::treePrefetchFinished() noexcept {

@@ -9,7 +9,7 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 auto_impl = "1.3.0"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_git_mapping" }
@@ -25,15 +25,15 @@ context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context"
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
 encoding_rs = "0.8"
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
-gix-actor = "0.41.1"
+gix-actor = "0.41.2"
 gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
-http = "1.4.2"
+http = "1.5.0"
 http-body-util = "0.1.4"
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"] }
 hyper-proxy2 = { version = "0.1", features = ["rustls"], default-features = false }
@@ -56,7 +56,7 @@ serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw
 smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 tls = { version = "0.1.0", path = "../../cmdlib/mononoke_app/tls" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

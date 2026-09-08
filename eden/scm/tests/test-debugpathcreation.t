@@ -1,0 +1,178 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+  $ enable debugpathcreation
+  $ setconfig subtree.allow-any-source-commit=true
+  $ setconfig subtree.min-path-depth=1
+  $ newclientrepo
+
+  $ mkdir -p foo1/subdir
+  $ echo aaa > foo1/a.txt
+  $ echo bbb > foo1/subdir/b.txt
+  $ sl commit -Aqm 'add foo1'
+  $ A=$(sl log -r . -T '{node}')
+
+Later changes do not affect the directory's origin:
+
+  $ echo ccc >> foo1/a.txt
+  $ sl commit -qm 'modify foo1'
+  $ sl debugpathcreation foo1
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation foo1/a.txt
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Follow ordinary directory copies, including from a nested subdirectory:
+
+  $ sl copy -q foo1 foo2
+  $ sl commit -qm 'copy foo1 to foo2'
+  $ B=$(sl log -r . -T '{node}')
+  $ sl debugpathcreation foo2
+  tracing backward: f20c904112ff copied 'foo1' to 'foo2'
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation foo2/subdir
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+JSON output captures the origin and the trace normally printed to stderr:
+
+  $ sl debugpathcreation -Tjson foo2
+  [tracing backward: f20c904112ff copied 'foo1' to 'foo2'
+  
+   {
+    "origin": "75ae72b66962696c45e82d2a43e69188d9930209",
+    "path": "foo2",
+    "trace": [{"commit": "*", "destination": "foo2", "source": "foo1", "subtree": false}] (glob)
+   }
+  ]
+
+A path that is its own origin has an empty trace:
+
+  $ sl debugpathcreation -Tjson foo1
+  [
+   {
+    "origin": "75ae72b66962696c45e82d2a43e69188d9930209",
+    "path": "foo1",
+    "trace": []
+   }
+  ]
+
+Follow chained directory renames:
+
+  $ sl rename -q foo2 foo3
+  $ sl commit -qm 'rename foo2 to foo3'
+  $ sl -q debugpathcreation foo3
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation foo3/subdir
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation foo3/a.txt
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation --rev "$B" foo2
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation --rev "$B" foo2/a.txt
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+  $ echo 1 > foo3/1.txt
+  $ echo 2 > foo3/2.txt
+  $ echo 3 > foo3/3.txt
+  $ echo 4 > foo3/4.txt
+  $ echo 5 > foo3/5.txt
+  $ echo 6 > foo3/6.txt
+  $ echo 7 > foo3/7.txt
+  $ echo 8 > foo3/8.txt
+  $ sl commit -Aqm 'add more files to foo3'
+
+Allow a few new files in a copied directory:
+
+  $ sl copy -q foo3 mixed
+  $ echo new > mixed/new.txt
+  $ sl add -q mixed/new.txt
+  $ sl commit -qm 'copy foo3 and add a file'
+  $ sl -q debugpathcreation mixed
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Allow copied files to be deleted before committing:
+
+  $ sl copy -q foo3 pruned
+  $ sl forget -q pruned/a.txt
+  $ rm pruned/a.txt
+  $ sl commit -qm 'copy foo3 without one file'
+  $ sl -q debugpathcreation pruned
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation pruned/subdir
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Do not infer a directory copy when fewer than 90% of destination files map:
+
+  $ sl copy -q foo3 weak-mapping
+  $ sl forget -q weak-mapping/1.txt weak-mapping/2.txt
+  $ echo new1 > weak-mapping/1.txt
+  $ echo new2 > weak-mapping/2.txt
+  $ sl add -q weak-mapping/1.txt weak-mapping/2.txt
+  $ sl commit -qm 'copy foo3 with too many new files'
+  $ sl debugpathcreation weak-mapping
+  f03bffcc5680263863bbbeb1c026f3ebf99287ce
+  $ sl --config debugpathcreation.similarity-percent=80 -q debugpathcreation weak-mapping
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Reject invalid similarity percentages:
+
+  $ sl --config debugpathcreation.similarity-percent=50 debugpathcreation weak-mapping
+  abort: debugpathcreation.similarity-percent must be greater than 50 and at most 100
+  [255]
+  $ sl --config debugpathcreation.similarity-percent=101 debugpathcreation weak-mapping
+  abort: debugpathcreation.similarity-percent must be greater than 50 and at most 100
+  [255]
+
+Warn but continue when source and destination sizes differ by more than 10%:
+
+  $ sl copy -q foo3 weak-size
+  $ sl forget -q weak-size/1.txt weak-size/2.txt
+  $ rm weak-size/1.txt weak-size/2.txt
+  $ sl commit -qm 'copy too little of foo3'
+  $ sl -q debugpathcreation weak-size
+  warning: inferred directory copy from 'foo3' to 'weak-size' despite dissimilar file counts (10 source, 8 destination)
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+JSON output captures the warning in the trace entry instead of writing to stderr:
+
+  $ sl debugpathcreation -Tjson weak-size
+  [warning: inferred directory copy from 'foo3' to 'weak-size' despite dissimilar file counts (10 source, 8 destination)
+  tracing backward: 396a951855ff copied 'foo3' to 'weak-size'
+  tracing backward: c964940e9a7a copied 'foo2' to 'foo3'
+  tracing backward: f20c904112ff copied 'foo1' to 'foo2'
+  
+   {
+    "origin": "75ae72b66962696c45e82d2a43e69188d9930209",
+    "path": "weak-size",
+    "trace": [{"commit": "*", "destination": "weak-size", "source": "foo3", "subtree": false, "warning": "warning: inferred directory copy from 'foo3' to 'weak-size' despite dissimilar file counts (10 source, 8 destination)"}, * (glob)
+   }
+  ]
+
+Follow explicit subtree-copy metadata:
+
+  $ sl subtree copy -r "$A" --from-path foo1 --to-path subtree -m 'subtree copy foo1'
+  copying foo1 to subtree
+  $ sl debugpathcreation subtree
+  tracing backward: 5fa5d1947ca7 subtree copied 'foo1' to 'subtree'
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation subtree/subdir
+  75ae72b66962696c45e82d2a43e69188d9930209
+  $ sl -q debugpathcreation subtree/subdir/b.txt
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Follow an individual file copy:
+
+  $ sl copy -q foo3/a.txt copied.txt
+  $ sl commit -qm 'copy a file'
+  $ sl -q debugpathcreation copied.txt
+  75ae72b66962696c45e82d2a43e69188d9930209
+
+Reject paths that do not exist:
+
+  $ sl debugpathcreation missing
+  abort: path 'missing' does not exist in commit * (glob)
+  [255]
+  $ sl debugpathcreation .
+  abort: repository root is not supported
+  [255]

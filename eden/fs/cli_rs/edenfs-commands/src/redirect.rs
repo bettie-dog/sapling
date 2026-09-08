@@ -245,14 +245,12 @@ impl RedirectCmd {
             force_remount_bind_mounts,
             strict,
             force,
-            #[cfg(fbcode_build)]
-            crate::get_enable_xplatlogger_events(),
         )
         .await
         .with_context(|| {
             format!(
                 "Could not add redirection {} of type {}",
-                &repo_path.display(),
+                repo_path.display(),
                 redir_type,
             )
         })?;
@@ -273,7 +271,7 @@ impl RedirectCmd {
         let mut checkout_config = CheckoutConfig::parse_config(&config_dir).with_context(|| {
             format!(
                 "Failed to parse checkout config using config dir {}",
-                &config_dir.display()
+                config_dir.display()
             )
         })?;
         // Remove the redirection targets from the config so that proj-fs pre-delete notification does not block deletion on symlink
@@ -340,11 +338,30 @@ impl RedirectCmd {
         // provide a way to remove bogus redirection paths.  After we've deployed
         // the improved `add` validation for a while, we can use it here also.
         if let Some(redir) = redirs.get(repo_path) {
+            if redir.source == REPO_SOURCE {
+                // The deletion of a repo-defined redirection cannot be
+                // persisted: the persistence step only writes user-sourced
+                // entries, and this CLI cannot edit the source-controlled
+                // redirection file. Accepting it would tear the redirection
+                // down only for `redirect fixup` (which the daemon runs on
+                // every mount) to silently bring it back.
+                eprintln!(
+                    "error: {} is defined by {} and cannot be removed using \
+                    `edenfsctl redirect del {}`. To temporarily unmount it, use \
+                    `edenfsctl redirect unmount`; to remove it permanently, \
+                    delete it from {}.",
+                    repo_path.display(),
+                    REPO_SOURCE,
+                    repo_path.display(),
+                    REPO_SOURCE
+                );
+                return Ok(1);
+            }
             let mut checkout_config =
                 CheckoutConfig::parse_config(&config_dir).with_context(|| {
                     format!(
                         "Failed to parse checkout config using config dir {}",
-                        &config_dir.display()
+                        config_dir.display()
                     )
                 })?;
             // Remove the redirection target from the config so that proj-fs pre-delete notification does not block deletion on symlink
@@ -390,7 +407,7 @@ impl RedirectCmd {
             println!(
                 "error: {} is defined by {} and cannot be removed using `edenfsctl redirect del {}`",
                 repo_path.display(),
-                &effective_redir.source,
+                effective_redir.source,
                 repo_path.display()
             );
             return Ok(1);
@@ -570,7 +587,7 @@ impl RedirectCmd {
                         format!(
                             "Failed to execute apfs_helper cmd: `{} {}`.",
                             APFS_HELPER,
-                            shlex::join(args.iter().copied()),
+                            shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
                         )
                     })?;
                 if !output.status.success() {
@@ -597,8 +614,6 @@ impl RedirectCmd {
 #[async_trait]
 impl Subcommand for RedirectCmd {
     async fn run(&self) -> Result<ExitCode> {
-        #[cfg(fbcode_build)]
-        crate::init_enable_xplatlogger_events().await;
         match self {
             Self::List { mount, json } => self.list(mount.to_owned(), *json).await,
             Self::Add {

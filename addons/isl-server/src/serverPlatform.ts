@@ -12,6 +12,7 @@ import type {
   RepoRelativePath,
   ServerToClientMessage,
 } from 'isl/src/types';
+import {Internal} from './Internal';
 import {Repository} from './Repository';
 import type {RepositoryContext} from './serverTypes';
 
@@ -27,6 +28,8 @@ export interface ServerPlatform {
   platformName: string;
   /** Override the analytics Session ID. Should be globally unique. */
   sessionId?: string;
+  /** Whether this platform is running inside Basecamp. */
+  isBasecamp?: boolean;
   handleMessageFromClient(
     this: ServerPlatform,
     repo: Repository | undefined,
@@ -97,6 +100,29 @@ export function makeBrowserServerPlatform(extraCwds?: string[]): ServerPlatform 
           }
           break;
         }
+        case 'platform/fillCommitMessageWithAI': {
+          // Generate a commit message on the server (where `sl web` runs -- a devserver/OnDemand with
+          // the `dm` CLI), so this works in standalone ISL, not only inside the VS Code Devmate host.
+          const cwd = repo?.info.repoRoot;
+          if (cwd == null || Internal.fillCommitMessageWithAI == null) {
+            break;
+          }
+          Internal.fillCommitMessageWithAI(cwd)
+            .then((generated: {title: string; description: string} | undefined) => {
+              if (generated != null) {
+                postMessage({
+                  type: 'updateDraftCommitMessage',
+                  title: generated.title,
+                  description: generated.description,
+                  mode: 'commit',
+                });
+              }
+            })
+            .catch((err: Error) => {
+              ctx.logger.error('failed to generate commit message with AI:', err);
+            });
+          break;
+        }
       }
     },
   };
@@ -151,9 +177,7 @@ async function openFile(
 /**
  * Because the ISL server is likely running in the background and is
  * no longer attached to a terminal, this is designed for the case
- * where the user opens the file in a windowed editor (hence
- * `windowsHide: false`, which is the default for
- * `child_process.spawn()`, but not for `execa()`):
+ * where the user opens the file in a windowed editor:
  *
  * - For users using a simple one-window-per-file graphical text
  *   editor, like notepad.exe, this is relatively straightforward.
@@ -172,7 +196,11 @@ function spawnInBackground(repo: Repository | undefined, args: Array<string>) {
   const proc = spawn(args[0], args.slice(1), {
     detached: true,
     stdio: 'ignore',
-    windowsHide: false,
+    // The openers we pick on Windows (explorer.exe, notepad.exe) are GUI
+    // programs that put up their own window; a console for them is pure
+    // noise, and `stdio: 'ignore'` means nothing could read or write it
+    // anyway. No-op on other platforms.
+    windowsHide: true,
     windowsVerbatimArguments: true,
   });
   // Silent error. Don't crash the server process.

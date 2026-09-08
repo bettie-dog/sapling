@@ -19,27 +19,52 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
+        "//eden/common/telemetry:log_info",
         "//eden/common/testharness:temp_file",
         "//eden/common/utils:system_error",
         "//eden/common/utils:user_info",
+        "//eden/common/utils/test:scoped_env_var",
         "//eden/fs/privhelper:conn",
         "//eden/fs/privhelper:interface",
         "//eden/fs/privhelper:privhelper",
         "//eden/fs/privhelper:server",
+        "//eden/fs/telemetry:structured_logger",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry:xplat_logger",
         "//folly:conv",
         "//folly:exception",
         "//folly:file",
         "//folly:file_util",
+        "//folly:portability",
         "//folly:range",
+        "//folly:synchronized",
         "//folly/futures:core",
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
         "//folly/io/async:event_base_thread",
+        "//folly/json:dynamic",
+        "//folly/portability:fcntl",
+        "//folly/synchronization:baton",
+        "//folly/synchronization:saturating_semaphore",
         "//folly/test:test_utils",
         "//folly/testing:test_util",
     ],
     external_deps = [
         ("boost", None, "boost_filesystem"),
+    ],
+)
+
+cpp_unittest(
+    name = "pin_scan",
+    srcs = ["PinScanTest.cpp"],
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
+    network_access = network_access_utils.none(),
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/fs/privhelper:pin_scan",
+        "//folly/testing:test_util",
     ],
 )
 

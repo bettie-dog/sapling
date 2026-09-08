@@ -5,13 +5,40 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {nextTick} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import clientToServerAPI from '../ClientToServerAPI';
 import {resetTestMessages, simulateMessageFromServer} from '../testUtils';
 
 describe('ClientToServer', () => {
   beforeEach(() => {
     resetTestMessages();
+  });
+
+  describe('onSetup', () => {
+    it('disposes the active setup before rerunning or unsubscribing', () => {
+      const cleanup = jest.fn();
+      const setup = jest.fn(() => cleanup);
+      const dispose = clientToServerAPI.onSetup(setup);
+
+      expect(setup).toHaveBeenCalledTimes(1);
+
+      clientToServerAPI.cwdChanged();
+
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(setup).toHaveBeenCalledTimes(2);
+
+      resetTestMessages();
+
+      expect(cleanup).toHaveBeenCalledTimes(2);
+      expect(setup).toHaveBeenCalledTimes(3);
+
+      dispose();
+
+      expect(cleanup).toHaveBeenCalledTimes(3);
+
+      clientToServerAPI.cwdChanged();
+      expect(setup).toHaveBeenCalledTimes(3);
+    });
   });
 
   describe('nextMessageMatching', () => {

@@ -39,7 +39,6 @@ using namespace facebook::eden;
 using namespace std::chrono_literals;
 
 namespace {
-constexpr auto kFutureTimeout = 10s;
 constexpr auto materializationTimeoutLimit = 1000ms;
 
 std::string testIdHex{
@@ -266,8 +265,11 @@ TEST_P(TreeInodeTestBase, fuseReaddirReturnsSelfAndParentBeforeEntries) {
   ASSERT_EQ(4, result.size());
   EXPECT_EQ(".", result[0].name);
   EXPECT_EQ("..", result[1].name);
-  EXPECT_EQ("file", result[2].name);
-  EXPECT_EQ(".eden", result[3].name);
+  // The remaining entries are listed in inode-number order, which depends
+  // on allocation order during mount setup and is not guaranteed.
+  std::vector<std::string> names{result[2].name, result[3].name};
+  std::sort(names.begin(), names.end());
+  EXPECT_EQ((std::vector<std::string>{".eden", "file"}), names);
 }
 
 TEST_P(TreeInodeTestBase, fuseReaddirOffsetsAreNonzero) {
@@ -297,50 +299,27 @@ TEST_P(TreeInodeTestBase, fuseReaddirRespectsOffset) {
   maybeEnableCoroutines(mount);
 
   auto root = mount.getEdenMount()->getRootInode();
+  auto listFrom = [&](uint64_t offset) {
+    return root
+        ->fuseReaddir(
+            FuseDirList{4096}, offset, ObjectFetchContext::getNullContext())
+        .extract();
+  };
 
-  const auto resultA =
-      root->fuseReaddir(
-              FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
-          .extract();
-  ASSERT_EQ(4, resultA.size());
-  EXPECT_EQ(".", resultA[0].name);
-  EXPECT_EQ("..", resultA[1].name);
-  EXPECT_EQ("file", resultA[2].name);
-  EXPECT_EQ(".eden", resultA[3].name);
+  const auto all = listFrom(0);
+  ASSERT_EQ(4, all.size());
+  EXPECT_EQ(".", all[0].name);
+  EXPECT_EQ("..", all[1].name);
 
-  const auto resultB = root->fuseReaddir(
-                               FuseDirList{4096},
-                               resultA[0].offset,
-                               ObjectFetchContext::getNullContext())
-                           .extract();
-  ASSERT_EQ(3, resultB.size());
-  EXPECT_EQ("..", resultB[0].name);
-  EXPECT_EQ("file", resultB[1].name);
-  EXPECT_EQ(".eden", resultB[2].name);
-
-  const auto resultC = root->fuseReaddir(
-                               FuseDirList{4096},
-                               resultB[0].offset,
-                               ObjectFetchContext::getNullContext())
-                           .extract();
-  ASSERT_EQ(2, resultC.size());
-  EXPECT_EQ("file", resultC[0].name);
-  EXPECT_EQ(".eden", resultC[1].name);
-
-  const auto resultD = root->fuseReaddir(
-                               FuseDirList{4096},
-                               resultC[0].offset,
-                               ObjectFetchContext::getNullContext())
-                           .extract();
-  ASSERT_EQ(1, resultD.size());
-  EXPECT_EQ(".eden", resultD[0].name);
-
-  const auto resultE = root->fuseReaddir(
-                               FuseDirList{4096},
-                               resultD[0].offset,
-                               ObjectFetchContext::getNullContext())
-                           .extract();
-  EXPECT_EQ(0, resultE.size());
+  // Every entry's offset resumes the listing immediately after that entry,
+  // regardless of the order the entries were assigned inode numbers in.
+  for (size_t i = 0; i < all.size(); ++i) {
+    const auto rest = listFrom(all[i].offset);
+    ASSERT_EQ(all.size() - i - 1, rest.size());
+    for (size_t j = 0; j < rest.size(); ++j) {
+      EXPECT_EQ(all[i + 1 + j].name, rest[j].name);
+    }
+  }
 }
 
 TEST_P(TreeInodeTestBase, fuseReaddirIgnoresWildOffsets) {
@@ -758,14 +737,18 @@ TEST_P(TreeInodeTestBase, addNewMaterializationsToInodeTraceBus) {
   EXPECT_FALSE(queue.try_dequeue_for(materializationTimeoutLimit).has_value());
 }
 
-void collectResults(
-    TestMount& testMount,
-    std::vector<std::pair<PathComponent, ImmediateFuture<VirtualInode>>>
-        results) {
-  testMount.drainServerExecutor();
-  for (auto& result : results) {
-    std::move(result.second).get(kFutureTimeout);
-  }
+// Awaits getChildren on the mount's server executor, the same executor EdenFS
+// schedules this work on. blockingWait's executor overload both schedules the
+// task and drives the executor until it completes, so the now_task is awaited
+// to completion in place rather than detached onto a future.
+std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>
+getChildrenOnServerExecutor(
+    TestMount& mount,
+    const TreeInodePtr& dir,
+    bool loadInodes) {
+  return folly::coro::blockingWait(
+      dir->getChildren(ObjectFetchContext::getNullContext(), loadInodes),
+      mount.getServerExecutor().get());
 }
 
 TEST_P(TreeInodeTestBase, getOrFindChildrenSimple) {
@@ -775,11 +758,12 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenSimple) {
   maybeEnableCoroutines(mount);
   auto somedir = mount.getTreeInode("somedir"_relpath);
 
-  auto result =
-      somedir->getChildren(ObjectFetchContext::getNullContext(), false);
+  auto result = getChildrenOnServerExecutor(mount, somedir, false);
   EXPECT_EQ(1, result.size());
   EXPECT_THAT(result, testing::Contains(testing::Key("foo.txt"_pc)));
-  collectResults(mount, std::move(result));
+  for (auto& [_name, child] : result) {
+    ASSERT_TRUE(child.hasValue());
+  }
 }
 
 TEST_P(TreeInodeTestBase, getOrFindChildrenLoadInodes) {
@@ -791,13 +775,14 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenLoadInodes) {
   auto somedir = mount.getTreeInode("somedir"_relpath);
 
   somedir->unloadChildrenNow();
-  auto result =
-      somedir->getChildren(ObjectFetchContext::getNullContext(), true);
+  auto result = getChildrenOnServerExecutor(mount, somedir, true);
 
   EXPECT_EQ(2, result.size());
   EXPECT_THAT(result, testing::Contains(testing::Key("bar.txt"_pc)));
   EXPECT_THAT(result, testing::Contains(testing::Key("foo.txt"_pc)));
-  collectResults(mount, std::move(result));
+  for (auto& [_name, child] : result) {
+    ASSERT_TRUE(child.hasValue());
+  }
 }
 
 TEST_P(TreeInodeTestBase, getOrFindChildrenMaterializedLoadedChild) {
@@ -809,13 +794,14 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenMaterializedLoadedChild) {
   somedir->mknod("newfile.txt"_pc, S_IFREG | 0740, 0, InvalidationRequired::No);
   EXPECT_TRUE(somedir->isMaterialized());
 
-  auto result =
-      somedir->getChildren(ObjectFetchContext::getNullContext(), false);
+  auto result = getChildrenOnServerExecutor(mount, somedir, false);
 
   EXPECT_EQ(2, result.size());
   EXPECT_THAT(result, testing::Contains(testing::Key("foo.txt"_pc)));
   EXPECT_THAT(result, testing::Contains(testing::Key("newfile.txt"_pc)));
-  collectResults(mount, std::move(result));
+  for (auto& [_name, child] : result) {
+    ASSERT_TRUE(child.hasValue());
+  }
 }
 
 TEST_P(TreeInodeTestBase, getOrFindChildrenMaterializedUnloadedChild) {
@@ -831,14 +817,15 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenMaterializedUnloadedChild) {
   }
 
   somedir->unloadChildrenNow();
-  auto result =
-      somedir->getChildren(ObjectFetchContext::getNullContext(), false);
+  auto result = getChildrenOnServerExecutor(mount, somedir, false);
 
   EXPECT_EQ(3, result.size());
   EXPECT_THAT(result, testing::Contains(testing::Key("foo.txt"_pc)));
   EXPECT_THAT(result, testing::Contains(testing::Key("newfile.txt"_pc)));
   EXPECT_THAT(result, testing::Contains(testing::Key("zoo.txt"_pc)));
-  collectResults(mount, std::move(result));
+  for (auto& [_name, child] : result) {
+    ASSERT_TRUE(child.hasValue());
+  }
 }
 
 TEST_P(TreeInodeTestBase, getOrFindChildrenRemovedChild) {
@@ -859,14 +846,15 @@ TEST_P(TreeInodeTestBase, getOrFindChildrenRemovedChild) {
   mount.drainServerExecutor();
   std::move(fut).get(0ms);
 
-  auto result =
-      somedir->getChildren(ObjectFetchContext::getNullContext(), false);
+  auto result = getChildrenOnServerExecutor(mount, somedir, false);
 
   EXPECT_EQ(1, result.size());
   EXPECT_THAT(
       result, testing::Not(testing::Contains(testing::Key("foo.txt"_pc))));
   EXPECT_THAT(result, testing::Contains(testing::Key("newfile.txt"_pc)));
-  collectResults(mount, std::move(result));
+  for (auto& [_name, child] : result) {
+    ASSERT_TRUE(child.hasValue());
+  }
 }
 
 TEST_P(

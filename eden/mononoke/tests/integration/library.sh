@@ -32,7 +32,7 @@ export LLVM_PROFILE_FILE="$TESTTMP/default_%p.profraw"
 
 # Suppress diagnostic info logs from repo initialization facets that would
 # otherwise appear in test output and break .t file expectations.
-export RUST_LOG="${RUST_LOG:-info,repo_factory=WARN,dbbookmarks=WARN,warm_bookmarks_cache=WARN,sqlphases=WARN}"
+export RUST_LOG="${RUST_LOG:-info,repo_factory=WARN,dbbookmarks=WARN,warm_bookmarks_cache=WARN}"
 
 function urlencode {
   python_fn urlencode "$@"
@@ -270,6 +270,7 @@ function mononoke_admin {
   GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
+    --log-level INFO \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
     --tracing-test-format \
     "$@"
@@ -816,6 +817,28 @@ function start_and_wait_for_land_service {
   wait_for_land_service
 }
 
+function add_repo_manifest_mapping_entry {
+  # Routes a member (repo, branch) to a manifest branch — the store the
+  # manifest tailer maintains in production.
+  # Schema copied verbatim from
+  # repo_attributes/repo_manifest_mapping/schemas/sqlite-repo-manifest-mapping.sql
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" <<'EOSQL'
+CREATE TABLE IF NOT EXISTS `repo_manifest_mapping` (
+  `manifest_repo_id` INTEGER NOT NULL,
+  `manifest_branch` VARBINARY(255) NOT NULL,
+  `repo_name` VARBINARY(255) NOT NULL,
+  `repo_branch` VARBINARY(255) NOT NULL,
+  PRIMARY KEY (`manifest_repo_id`, `manifest_branch`, `repo_name`, `repo_branch`)
+);
+CREATE INDEX IF NOT EXISTS `reverse_idx` ON `repo_manifest_mapping` (`repo_name`, `repo_branch`);
+EOSQL
+  local manifest_branch=${2//"'"/"''"}
+  local repo_name=${3//"'"/"''"}
+  local repo_branch=${4//"'"/"''"}
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
+    "INSERT OR REPLACE INTO repo_manifest_mapping (manifest_repo_id, manifest_branch, repo_name, repo_branch) VALUES ($1, CAST('$manifest_branch' AS BLOB), CAST('$repo_name' AS BLOB), CAST('$repo_branch' AS BLOB))"
+}
+
 function multi_repo_land_service {
   # Ensure the git_repositories_source_of_truth tables exist. These are normally
   # created by gitimport but MLR tests may use testtool_drawdag instead.
@@ -885,44 +908,6 @@ function multi_repo_land_service_client {
   "$MONONOKE_MULTI_REPO_LAND_SERVICE_CLIENT" \
     --host "$(multi_repo_land_service_address)" \
     "$@"
-}
-
-function mock_rl_land_service {
-  rm -f "$TESTTMP/mock_rl_land_service_addr.txt"
-  GLOG_minloglevel=5 \
-    THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
-    THRIFT_TLS_SRV_KEY="$TEST_CERTDIR/localhost.key" \
-    THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/client0.crt" \
-    THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/client0.key" \
-    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
-    THRIFT_TLS_TICKETS="$TEST_CERTDIR/server.pem.seeds" \
-    "$MOCK_RL_LAND_SERVICE" "$@" \
-    --host "$LOCALIP" \
-    --port 0 \
-    --bound-address-file "$TESTTMP/mock_rl_land_service_addr.txt" \
-    --backend-address "$(multi_repo_land_service_address)" \
-    >> "$TESTTMP/mock_rl_land_service.out" 2>&1 &
-  export MOCK_RL_LAND_SERVICE_PID=$!
-  echo "$MOCK_RL_LAND_SERVICE_PID" >> "$DAEMON_PIDS"
-}
-
-MOCK_RL_LAND_SERVICE_DEFAULT_START_TIMEOUT=60
-
-function wait_for_mock_rl_land_service {
-  export MOCK_RL_LAND_SERVICE_PORT
-  wait_for_server "Mock RL land service" MOCK_RL_LAND_SERVICE_PORT "$TESTTMP/mock_rl_land_service.out" \
-    "${MOCK_RL_LAND_SERVICE_START_TIMEOUT:-"$MOCK_RL_LAND_SERVICE_DEFAULT_START_TIMEOUT"}" "$TESTTMP/mock_rl_land_service_addr.txt" \
-    sleep 5
-}
-
-function mock_rl_land_service_address {
-  # shellcheck disable=SC2119
-  echo -n "$(mononoke_host):$MOCK_RL_LAND_SERVICE_PORT"
-}
-
-function start_and_wait_for_mock_rl_land_service {
-  mock_rl_land_service "$@"
-  wait_for_mock_rl_land_service
 }
 
 function _megarepo_async_worker_cmd {

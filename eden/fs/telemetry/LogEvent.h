@@ -273,6 +273,40 @@ struct DaemonStop : public EdenFSEvent {
   }
 };
 
+struct PrivhelperShutdown : public EdenFSEvent {
+  int64_t exit_code = 0;
+  int64_t exit_signal = 0;
+
+  PrivhelperShutdown(int64_t exit_code, int64_t exit_signal)
+      : exit_code(exit_code), exit_signal(exit_signal) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("exit_code", exit_code);
+    event.addInt("exit_signal", exit_signal);
+  }
+
+  const char* getType() const override {
+    return "privhelper_shutdown";
+  }
+};
+
+struct PrivhelperRequestStall : public EdenFSEvent {
+  std::string method;
+  double duration = 0.0; // seconds
+
+  PrivhelperRequestStall(std::string method, double duration)
+      : method(std::move(method)), duration(duration) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("method", method);
+    event.addDouble("duration", duration);
+  }
+
+  const char* getType() const override {
+    return "privhelper_request_stall";
+  }
+};
+
 struct FinishedCheckout : public EdenFSEvent {
   std::string mode;
   double duration = 0.0;
@@ -521,6 +555,23 @@ struct NfsParsingError : public EdenFSEvent {
   }
 };
 
+struct TccInvalidationDenied : public EdenFSEvent {
+  int err;
+  std::string path;
+
+  TccInvalidationDenied(int err, std::string path)
+      : err(err), path(std::move(path)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("errno", err);
+    event.addString("path", path);
+  }
+
+  const char* getType() const override {
+    return "tcc_invalidation_denied";
+  }
+};
+
 struct TooManyNfsClients : public EdenFSEvent {
   void populate(DynamicEvent& /*event*/) const override {}
 
@@ -716,6 +767,20 @@ struct SilentDaemonExit : public EdenFSEvent {
 
   const char* getType() const override {
     return "silent_daemon_exit";
+  }
+};
+
+struct PrivHelperExit : public EdenFSEvent {
+  std::string reason;
+
+  explicit PrivHelperExit(std::string reason) : reason(std::move(reason)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("reason", reason);
+  }
+
+  const char* getType() const override {
+    return "privhelper_exit";
   }
 };
 

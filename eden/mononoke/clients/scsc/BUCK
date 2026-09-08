@@ -1,4 +1,5 @@
 load("@fbcode//clifoundation/cli_target/buck_defs:cli.bzl", "cli")
+load("@fbcode//clifoundation/cli_target/buck_defs:dotslash.bzl", "dotslash")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("//registry:defs.bzl", "rpm")
 
@@ -26,7 +27,6 @@ rust_binary(
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:maplit",
         "fbsource//third-party/rust:num",
-        "fbsource//third-party/rust:percent-encoding",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:strum",
@@ -36,31 +36,36 @@ rust_binary(
         "fbsource//third-party/rust:tokio-util",
         "fbsource//third-party/rust:unicode-truncate",
         "fbsource//third-party/rust:unicode-width",
+        "//artillery/artillery2/api/cpp/cli_lite/rust:art_cli_lite_rs",
+        "//cli/rust/cli:cli",
         "//common/rust/cpp_log_spew:cpp_log_spew",
         "//common/rust/gflags:gflags",
-        "//common/rust/identity:identity",
         "//common/rust/shed/bounded_traversal:bounded_traversal",
-        "//common/rust/shed/cached_config:cached_config",
         "//common/rust/shed/cloned:cloned",
         "//common/rust/shed/fbinit:fbinit",
-        "//common/rust/shed/fbinit:fbinit-tokio",
         "//common/rust/shed/hostcaps:hostcaps",
         "//eden/mononoke/clients/scsc/raw_client_lib:scs_client_raw",
         "//eden/mononoke/cmdlib/base_app:base_app",
         "//eden/mononoke/cmdlib/commit_id_types:commit_id_types",
-        "//eden/mononoke/common/permission_checker:permission_checker",
-        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/topo_sort:topo_sort",
         "//eden/mononoke/scs/if:source_control-rust",
         "//eden/mononoke/scs/if:source_control-rust-clients",
-        "//eden/mononoke/scs/if:source_control-rust-thriftclients",
-        "//scm/scmquery/client:scmqueryclient-rust-test-support",
-        "//scm/scmquery/if:scmquery_types-rust",
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:linux": [
+            "fbsource//third-party/rust:percent-encoding",
             "//common/rust/build_info:build_info",
+            "//common/rust/identity:identity",
+            # Linux-only: these are `compatible_with = ["ovr_config//os:linux"]`,
+            # or transitively depend on srclients, which is. The code guarded by
+            # them is gated on `#[cfg(target_os = "linux")]`.
+            "//common/rust/shed/cached_config:cached_config",
             "//common/rust/thrift/srclient:srclient",
+            "//eden/mononoke/common/permission_checker:permission_checker",
+            "//eden/mononoke/common/rust/justknobs_ext:justknobs",
+            "//eden/mononoke/scs/if:source_control-rust-thriftclients",
+            "//scm/scmquery/client:scmqueryclient-rust-test-support",
+            "//scm/scmquery/if:scmquery_types-rust",
             "//tupperware/api/if:common-rust",
             "//tupperware/api/if:tupperware-rust",
             "//tupperware/api/if:tupperware-rust-srclients",
@@ -86,30 +91,33 @@ rpm.builder(
     summary = "Source Control Service Client",
 )
 
-cli.deployer(
+dotslash.builder(
     name = "scsc.clideployer",
-    distribution = cli.distribution(
-        bump_diffs = cli.bump_diffs(
-            destinations = [
-                cli.destination(
-                    branch = "master",
-                    paths = [
-                        "fbcode/scm/service/client/scsc",
-                        "tools/scm/scsc",
-                    ],
-                    repository = cli.repository.FBSOURCE,
-                ),
-                cli.destination(
-                    branch = "master",
-                    paths = [
-                        "chef/cookbooks/secure/fb_mercurial_client/files/default/scsc",
-                        "chef/itchef/cookbooks/core/cpe_mercurial/files/default/scsc",
-                    ],
-                    repository = cli.repository.OPSFILES,
-                ),
-            ],
-        ),
+    conveyor = cli.conveyor(
+        frequency = cli.frequency.WEEKLY,
+        holiday_countries = [
+            cli.holiday_country.UNITED_STATES,
+        ],
+        timezone = "US/Pacific",
     ),
+    destinations = [
+        cli.destination(
+            branch = "master",
+            paths = [
+                "fbcode/scm/service/client/scsc",
+                "tools/scm/scsc",
+            ],
+            repository = cli.repository.FBSOURCE,
+        ),
+        cli.destination(
+            branch = "master",
+            paths = [
+                "chef/cookbooks/secure/fb_mercurial_client/files/default/scsc",
+                "chef/itchef/cookbooks/core/cpe_mercurial/files/default/scsc",
+            ],
+            repository = cli.repository.OPSFILES,
+        ),
+    ],
     metadata = cli.metadata(
         binary_name = "scsc",
         criticality = cli.criticality(
@@ -118,39 +126,19 @@ cli.deployer(
         description = "Mononoke Source Control Service Client",
         executable = ":scsc",
     ),
-    packaging = cli.packaging(
-        dotslash = cli.dotslash(
-            platforms = [
-                cli.platform.linux(
-                    architectures = [
-                        cli.architecture.AARCH64,
-                        cli.architecture.X86_64,
-                    ],
-                ),
-                cli.platform.macos(
-                    architectures = [
-                        cli.architecture.AARCH64,
-                    ],
-                ),
-                cli.platform.windows(),
+    platforms = [
+        cli.platform.linux(
+            architectures = [
+                cli.architecture.AARCH64,
+                cli.architecture.X86_64,
             ],
         ),
-    ),
-    release = cli.release(
-        artifact_ci_config = cli.artifact_ci_config(
-            relevant_target_directories = [
-                "//eden/mononoke/clients/scsc/...",
+        cli.platform.macos(
+            architectures = [
+                cli.architecture.AARCH64,
             ],
         ),
-        conveyor = cli.conveyor(
-            frequency = cli.frequency.WEEKLY,
-            holiday_countries = [
-                cli.holiday_country.UNITED_STATES,
-            ],
-            timezone = "US/Pacific",
-        ),
-        srconveyor = cli.srconveyor(
-            rollout = cli.rollout.AT_ONCE,
-        ),
-    ),
+        cli.platform.windows(),
+    ],
+    schedule_name = "scsc",
 )

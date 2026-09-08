@@ -13,8 +13,8 @@ license = "MIT"
 name = "revlogindex"
 
 [dependencies]
-async-trait = "0.1.91"
-bit-vec = "0.9"
+async-trait = "0.1.92"
+bit-vec = "0.10.1"
 byteorder = "1.5"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-dag = { version = "0.1.0", path = "../dag" }
@@ -24,7 +24,7 @@ sapling-minibytes = { version = "0.1.0", path = "../minibytes" }
 sapling-nonblocking = { version = "0.1.0", path = "../nonblocking" }
 sapling-radixbuf = { version = "0.1.0", path = "../radixbuf" }
 sapling-util = { version = "0.1.0", path = "../util" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 
 [dev-dependencies]
 anyhow = "1.0.104"

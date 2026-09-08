@@ -201,6 +201,10 @@ struct Repo {
   1: string name;
 }
 
+struct RepoExistsResponse {
+  1: bool exists;
+}
+
 /// This structure can be bigger and contain more detailed repository info.
 struct RepoInfo {
   1: string name;
@@ -909,6 +913,11 @@ struct ListReposParams {
   /// If provided, list repos with the matching identity schemes only.
   /// Otherwise, list all repos.
   1: optional set<CommitIdentityScheme> identity_schemes;
+}
+
+struct RepoExistsParams {
+  /// Plain name rather than a RepoSpecifier, to keep the method global.
+  1: string repo_name;
 }
 
 struct RepoResolveBookmarkParams {
@@ -1678,6 +1687,7 @@ struct RunAsIdentity {
 }
 
 /// The set of identities to run hooks as. See `CommitRunHooksParams.run_as`.
+@hack.MigrationBlockingLegacyJSONSerialization
 union RunAsIdentities {
   /// A list of plain type/data identities. Sufficient for hooks that match
   /// on identity type and data only.
@@ -1697,6 +1707,18 @@ struct CommitRunHooksParams {
   /// (instead of the calling client's identities). Does not affect
   /// repository access control, which still uses the caller's identity.
   3: optional RunAsIdentities run_as;
+  /// If set, hooks evaluate the commit as if it carried this message instead
+  /// of the stored one. Lets callers preview the outcome for a commit whose
+  /// message will be regenerated before landing (e.g. from live review
+  /// state). Only affects this dry run's reported verdicts; a real push
+  /// always evaluates the pushed commit.
+  4: optional string override_commit_message;
+  /// If set, the response includes rejections from hooks configured as
+  /// log-only instead of showing them as accepted. Lets callers preview what
+  /// a hook would do once enforcing while it is still being rolled out.
+  /// Does not make anything enforce: it only changes what this dry run
+  /// reports.
+  5: optional bool include_log_only_rejections;
 }
 
 /// Parameters for checking commit rate limits.
@@ -2031,6 +2053,11 @@ struct RepoCreationRequest {
   4: optional CustomAclParams custom_acl;
   /// Size bucket (allows for provisioning the right amount of resources for the new repo)
   5: RepoSizeBucket size_bucket;
+  /// Short branch name (e.g. "main", not a full ref like "refs/heads/main")
+  /// that the repo's HEAD symref points at from creation. When unset, no HEAD
+  /// symref is written; clones of the repo will have no default branch until
+  /// one is created manually (mononoke_admin git-symref).
+  6: optional string default_branch;
 }
 
 struct CreateReposParams {
@@ -3037,6 +3064,9 @@ struct DeriveBoundariesParams {
   5: bool use_predecessor_derivation;
   /// Optional config name to select an alternative derived data configuration.
   6: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  7: optional string mapping_key_prefix;
 }
 
 /// Result for derive_boundaries request
@@ -3069,6 +3099,9 @@ struct DeriveSliceParams {
   3: list<DeriveSliceSegment> segments;
   /// Optional config name to select an alternative derived data configuration.
   4: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  5: optional string mapping_key_prefix;
 }
 
 /// Result for derive_slice request
@@ -3120,6 +3153,17 @@ struct DeriveBackfillParams {
   /// Whether to enqueue a MarkTypeEnabled node per repo (cascade-dependent on the
   /// repo's backfill leaves) that records the type as enabled once backfill succeeds.
   10: optional bool auto_enable;
+  /// Optional mapping key prefix to derive under, overriding whatever the selected
+  /// config holds in `mapping_key_prefixes` for this type. Set it to backfill into a
+  /// fresh key namespace (e.g. "r5.") while production keeps serving from the old
+  /// one, then land the same prefix in config to cut over. Unset (the default)
+  /// derives under the config's own prefix, preserving the previous behavior.
+  ///
+  /// The prefix must match the one later written to the repo's config, otherwise the
+  /// backfilled data is unreachable and will be silently re-derived. Because of that
+  /// this is rejected together with `auto_enable`, whose enablement path cannot write
+  /// a prefix.
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill request
@@ -3161,6 +3205,9 @@ struct DeriveBackfillRepoParams {
   /// Whether to enqueue a MarkTypeEnabled node (cascade-dependent on this repo's
   /// backfill leaves) that records the type as enabled once backfill succeeds.
   10: bool auto_enable;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill_repo request
@@ -3299,6 +3346,7 @@ stateful client exception HookRejectionsException {
 
 /// Identifies the restricted resource that an authorization check denied:
 /// either a path, or a manifest id (as a hex string).
+@hack.MigrationBlockingLegacyJSONSerialization
 union RestrictedPathAccess {
   1: string path;
   2: string manifest_id;
@@ -3324,6 +3372,18 @@ service SourceControlService extends fb303_core.BaseService {
 
   /// Get a list of all repositories.
   list<Repo> list_repos(1: ListReposParams params) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Check whether a repository exists.
+  ///
+  /// Deliberately global: callers ask this about repos that may not exist, and
+  /// a RepoSpecifier would make clients shard-route on the repo name, failing
+  /// in service routing before reaching a server. Answered from the tier-wide
+  /// repo list, so any task can answer for any repo.
+  RepoExistsResponse repo_exists(1: RepoExistsParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
@@ -4064,6 +4124,10 @@ service SourceControlService extends fb303_core.BaseService {
   /// Repository management methods
   /// ==============================
 
+  /// Create the requested repos in Mononoke. For each request that sets
+  /// `default_branch`, the repo's HEAD symref is written to point at that
+  /// branch at creation time (and deleted again if the creation fails or is
+  /// aborted).
   CreateReposToken create_repos(1: CreateReposParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,

@@ -280,6 +280,7 @@ def _check_permission_denied_paths(req, ret):
 
 def dispatch(req):
     "run the command specified in req.args"
+    hintutil.clear()
     if req.ferr:
         ferr = req.ferr
     elif req.ui:
@@ -665,7 +666,7 @@ def _parse(ui, args):
         ui.log(
             "command_info",
             positional_args=args,
-            option_names=specifiedopts,
+            option_names=list(specifiedopts),
             option_values=[cmdoptions.get(o) for o in specifiedopts],
         )
 
@@ -684,6 +685,24 @@ def _parse(ui, args):
         n = o[1]
         options[n] = cmdoptions[n]
         del cmdoptions[n]
+
+    if (
+        options.get("quiet")
+        and specifiedopts.get("quiet", 0) == 1
+        and ui.agent()
+        and not ui.plain()
+        and ui.configbool("agent", "ignore-quiet", True)
+    ):
+        # A lone --quiet from an agent is ignored: output can contain
+        # important details. --quiet --quiet forces quiet.
+        options["quiet"] = False
+        options["agent_quiet_ignored"] = True
+        ui.write_err(
+            _(
+                "note: --quiet ignored for agents since output can contain "
+                "important details (pass --quiet --quiet to force quiet)\n"
+            )
+        )
 
     return (cmd, cmd and entry[0] or None, args, options, cmdoptions, aliases)
 
@@ -1073,11 +1092,14 @@ def _dispatch(req):
 def _initblackbox(req, repo, cmdtype):
     """Initialize the native blackbox logging at the shared repo path.
 
-    This might choose to disable logging if the blackbox extension is disabled
-    via '--config=extensions.blackbox=!' or '--config=blackbox.track=', and
-    the command is read-only. (In other words, read-write commands will always
-    be logged)
+    This might choose to disable logging if 'blackbox.enable' is false, or if
+    the blackbox extension is disabled via '--config=extensions.blackbox=!' or
+    '--config=blackbox.track=' and the command is read-only. (In other words,
+    read-write commands will always be logged)
     """
+    if not repo.ui.configbool("blackbox", "enable", True):
+        return
+
     # See "class command" in registrar.py for valid command types.
     # Enforce blackbox logging for non-readonly commands, so if an automation
     # runs commands like `hg commit --config extensions.blackbox=!`, we still

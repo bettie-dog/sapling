@@ -34,6 +34,7 @@ from eden.fs.cli.doctor.check_filesystems import (
     check_hg_status_match_hg_diff,
     check_loaded_content,
     check_materialized_are_accessible,
+    DEFAULT_MAX_MODIFIED_FILES_FOR_HG_DIFF,
 )
 from eden.fs.cli.doctor.check_redirections import check_redirections
 from eden.fs.cli.doctor.facebook.internal_consts import get_netinfo_link
@@ -221,6 +222,8 @@ Unmounting and remounting {path}...<green>fixed<reset>
         mock_check_hg: MagicMock,
         mock_check_nfs: MagicMock,
         mock_check_inode: MagicMock,
+        *,
+        fast: bool = False,
     ) -> Tuple[doctor.ProblemFixer, TestOutput, EdenCheckout]:
         instance = FakeEdenInstance(self.make_temporary_directory())
         checkout = instance.create_test_mount("path1")
@@ -260,9 +263,17 @@ Unmounting and remounting {path}...<green>fixed<reset>
             set(),
             check_network.NetworkChecker(),
             False,
-            False,
+            fast,
         )
+        if fast:
+            mock_check_hg_status.assert_not_called()
+        else:
+            mock_check_hg_status.assert_called_once()
         return fixer, out, checkout
+
+    def test_fast_skips_hg_status_and_diff_check(self) -> None:
+        _, out, _ = self.setUpEdenNetworkTest(fast=True)
+        self.assertEqual(out.getvalue(), "")
 
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
     def test_end_to_end_test_with_various_scenarios(
@@ -421,7 +432,12 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
             out=out,
         )
 
-        self.assertEqual("EdenFS is not in use.\n", out.getvalue())
+        self.assertEqual(
+            "EdenFS daemon is not running. No Eden checkouts are configured, "
+            "so this is not considered an issue. If you need Eden checkouts, "
+            "create one with 'fbclone <repo> --eden'.\n",
+            out.getvalue(),
+        )
         self.assertEqual(0, exit_code)
 
     @patch("eden.fs.cli.util.HealthStatus.is_healthy")
@@ -2354,7 +2370,7 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             status=ScmStatus(entries={b"foo/bar": ScmFileStatus.MODIFIED})
         )
         mock_subprocess_run.return_value = subprocess.CompletedProcess(
-            stdout='{"foo/bar": {"adds": 2, "isbinary": false, "removes": 0}}',
+            stdout=b'{"foo/bar": {"adds": 2, "isbinary": false, "removes": 0}}',
             args=["hg", "diff", "--per-file-stat-json"],
             returncode=0,
         )
@@ -2381,7 +2397,7 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             status=ScmStatus(entries={b"foo/bar": ScmFileStatus.MODIFIED})
         )
         mock_subprocess_run.return_value = subprocess.CompletedProcess(
-            stdout="{}", args=["hg", "diff", "--stat"], returncode=0
+            stdout=b"{}", args=["hg", "diff", "--stat"], returncode=0
         )
 
         tracker = ProblemCollector(instance)
@@ -2393,6 +2409,186 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             tracker.problems[0].description(),
             f"{Path('foo/bar')} is present as modified in `sl status` but not in `sl diff`",
         )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("subprocess.run")
+    def test_hg_diff_is_scoped_to_modified_files(
+        self,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_subprocess_run,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_getScmStatusV2,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(
+                entries={
+                    b"foo/bar": ScmFileStatus.MODIFIED,
+                    b"untracked": ScmFileStatus.ADDED,
+                }
+            )
+        )
+
+        patterns: List[str] = []
+
+        def fake_run(
+            args: List[str], **kwargs: Any
+        ) -> "subprocess.CompletedProcess[bytes]":
+            self.assertEqual(args[-1], "listfile0:-")
+            patterns.extend(os.fsdecode(p) for p in kwargs["input"].split(b"\0"))
+            return subprocess.CompletedProcess(
+                stdout=b'{"foo/bar": {"adds": 2, "isbinary": false, "removes": 0}}',
+                args=args,
+                returncode=0,
+            )
+
+        mock_subprocess_run.side_effect = fake_run
+
+        tracker = ProblemCollector(instance)
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+
+        self.assertEqual(tracker.problems, [])
+        self.assertEqual(patterns, ["path:foo/bar"])
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("eden.fs.cli.doctor.check_filesystems.get_hg_diff")
+    def test_hg_diff_runs_at_modified_file_limit(
+        self,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_get_hg_diff,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_getScmStatusV2,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        modified_paths = {
+            Path(f"path{index}")
+            for index in range(DEFAULT_MAX_MODIFIED_FILES_FOR_HG_DIFF)
+        }
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(
+                entries={bytes(path): ScmFileStatus.MODIFIED for path in modified_paths}
+            )
+        )
+        mock_get_hg_diff.return_value = modified_paths
+
+        tracker = ProblemCollector(instance)
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+
+        self.assertEqual(tracker.problems, [])
+        mock_get_hg_diff.assert_called_once()
+        self.assertEqual(mock_get_hg_diff.call_args.args[0], checkout)
+        self.assertEqual(mock_getScmStatusV2.call_count, 2)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("eden.fs.cli.doctor.check_filesystems.get_hg_diff")
+    def test_hg_diff_skipped_above_modified_file_limit(
+        self,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_get_hg_diff,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_getScmStatusV2,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(
+                entries={
+                    f"path{index}".encode(): ScmFileStatus.MODIFIED
+                    for index in range(DEFAULT_MAX_MODIFIED_FILES_FOR_HG_DIFF + 1)
+                }
+            )
+        )
+
+        tracker = ProblemCollector(instance)
+        with self.assertLogs(
+            "eden.fs.cli.doctor.check_filesystems", level="INFO"
+        ) as logs:
+            # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            check_hg_status_match_hg_diff(tracker, instance, checkout)
+
+        self.assertEqual(tracker.problems, [])
+        self.assertIn(
+            "1001 modified files exceed the configured limit of 1000",
+            "\n".join(logs.output),
+        )
+        mock_get_hg_diff.assert_not_called()
+        mock_getScmStatusV2.assert_called_once()
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("eden.fs.cli.doctor.check_filesystems.get_hg_diff")
+    def test_hg_diff_limit_ignores_non_modified_entries(
+        self,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_get_hg_diff,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_getScmStatusV2,
+    ) -> None:
+        # EdenFS reports untracked files as ADDED and missing files as REMOVED.
+        # Neither shows up in `sl diff`, so neither may count against the limit.
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        entries = {
+            f"added{index}".encode(): ScmFileStatus.ADDED
+            for index in range(DEFAULT_MAX_MODIFIED_FILES_FOR_HG_DIFF)
+        }
+        entries[b"removed"] = ScmFileStatus.REMOVED
+        entries[b"modified"] = ScmFileStatus.MODIFIED
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(entries=entries)
+        )
+        mock_get_hg_diff.return_value = {Path("modified")}
+
+        tracker = ProblemCollector(instance)
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+
+        self.assertEqual(tracker.problems, [])
+        mock_get_hg_diff.assert_called_once_with(checkout, ["modified"])
+        self.assertEqual(mock_getScmStatusV2.call_count, 2)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("eden.fs.cli.doctor.check_filesystems.get_hg_diff")
+    def test_hg_diff_modified_file_limit_can_be_disabled(
+        self,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_get_hg_diff,
+        # pyre-fixme[2]: Parameter must be annotated.
+        mock_getScmStatusV2,
+    ) -> None:
+        instance = FakeEdenInstance(
+            self.make_temporary_directory(),
+            config={"doctor.max-modified-files-for-hg-diff": "0"},
+        )
+        checkout = instance.create_test_mount("path1")
+        modified_paths = {
+            Path(f"path{index}")
+            for index in range(DEFAULT_MAX_MODIFIED_FILES_FOR_HG_DIFF + 1)
+        }
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(
+                entries={bytes(path): ScmFileStatus.MODIFIED for path in modified_paths}
+            )
+        )
+        mock_get_hg_diff.return_value = modified_paths
+
+        tracker = ProblemCollector(instance)
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+
+        self.assertEqual(tracker.problems, [])
+        mock_get_hg_diff.assert_called_once()
+        self.assertEqual(mock_get_hg_diff.call_args.args[0], checkout)
+        self.assertEqual(mock_getScmStatusV2.call_count, 2)
 
     def test_ignored_problems_config(self) -> None:
         tmp_dir = self.make_temporary_directory()

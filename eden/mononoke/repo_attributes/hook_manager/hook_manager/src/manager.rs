@@ -51,12 +51,16 @@ use tracing::debug;
 
 use crate::BookmarkHook;
 use crate::BypassDecision;
+use crate::BypassIdentitySource;
 use crate::ChangesetHook;
+use crate::CheckedBypassIdentities;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
+use crate::HookExecutionPurpose;
 use crate::HookOutcome;
 use crate::HookRepo;
+use crate::LogOnlyRejections;
 use crate::PushAuthoredBy;
 use crate::errors::HookManagerError;
 
@@ -83,19 +87,37 @@ pub struct HookManager {
     employee_service: Option<Arc<dyn MononokeEmployeeService + Send + Sync>>,
 }
 
+/// Outcome of resolving a bypass against the hook's permission group.
+///
+/// Every variant that ran a membership check carries the `CheckedBypassIdentities`
+/// it ran against, so the decision can be logged and explained in terms of
+/// *whose* membership was tested — not just which group was required. `check`
+/// is `None` only when the hook has no bypass permission checker configured.
 enum BypassAuthorizationResult {
     /// No bypass was attempted — run the hook normally.
     NoBypass,
     /// Bypass was attempted and authorized — skip the hook.
-    Bypassed(String),
+    Bypassed {
+        reason: String,
+        check: Option<CheckedBypassIdentities>,
+    },
     /// Bypass was attempted but the user is not in the required group.
-    /// Contains the group name for the rejection message.
-    UnauthorizedUser(String),
+    /// Contains the bypass reason, the group name, and the identities checked,
+    /// for logging and the rejection message.
+    UnauthorizedUser {
+        reason: String,
+        group: String,
+        check: CheckedBypassIdentities,
+    },
     /// Bypass was attempted and the pusher is in the required group, but the
     /// pusher is an agent. Restricting a bypass to a permission group makes
     /// using it a human judgement call, so the bypass is refused. Contains the
     /// bypass reason and the group name for logging and the rejection message.
-    UnauthorizedAgent { reason: String, group: String },
+    UnauthorizedAgent {
+        reason: String,
+        group: String,
+        check: Option<CheckedBypassIdentities>,
+    },
 }
 
 impl HookManager {
@@ -198,6 +220,26 @@ impl HookManager {
         self.employee_service = Some(service);
     }
 
+    /// Test-only: resolve the eager bypass decision for a registered hook.
+    /// `hooks` is private to this module, and the decision is otherwise only
+    /// observable through the Scuba columns it produces.
+    #[cfg(test)]
+    pub(crate) async fn compute_bypass_decision_for_test(
+        &self,
+        hook_name: &str,
+        ctx: &CoreContext,
+        maybe_pushvars: Option<&HashMap<String, Bytes>>,
+        cs_msg: Option<&str>,
+        changeset_author: Option<&str>,
+    ) -> Result<BypassDecision> {
+        let hook = self
+            .hooks
+            .get(hook_name)
+            .ok_or_else(|| HookManagerError::NoSuchHook(hook_name.to_string()))?;
+        self.compute_bypass_decision(hook, ctx, maybe_pushvars, cs_msg, changeset_author)
+            .await
+    }
+
     pub fn register_bookmark_hook(
         &mut self,
         hook_name: &str,
@@ -270,16 +312,29 @@ impl HookManager {
             .await?;
         Ok(match decision {
             BypassAuthorizationResult::NoBypass => BypassDecision::NoBypass,
-            BypassAuthorizationResult::Bypassed(reason) => BypassDecision::Authorized {
+            BypassAuthorizationResult::Bypassed { reason, check } => BypassDecision::Authorized {
                 reason,
                 permission_group: permission_group.map(|g| g.to_string()),
+                check,
             },
-            BypassAuthorizationResult::UnauthorizedUser(group) => {
-                BypassDecision::UnauthorizedUser { group }
-            }
-            BypassAuthorizationResult::UnauthorizedAgent { reason, group } => {
-                BypassDecision::UnauthorizedAgent { reason, group }
-            }
+            BypassAuthorizationResult::UnauthorizedUser {
+                reason,
+                group,
+                check,
+            } => BypassDecision::UnauthorizedUser {
+                reason,
+                group,
+                check,
+            },
+            BypassAuthorizationResult::UnauthorizedAgent {
+                reason,
+                group,
+                check,
+            } => BypassDecision::UnauthorizedAgent {
+                reason,
+                group,
+                check,
+            },
         })
     }
 
@@ -309,13 +364,16 @@ impl HookManager {
             .await?;
 
         Ok(match result {
-            BypassAuthorizationResult::Bypassed(reason) if ctx.metadata().likely_an_agent() => {
+            BypassAuthorizationResult::Bypassed { reason, check }
+                if ctx.metadata().likely_an_agent() =>
+            {
                 BypassAuthorizationResult::UnauthorizedAgent {
                     reason,
                     group: hook
                         .get_bypass_permission_group()
                         .unwrap_or("unknown")
                         .to_string(),
+                    check,
                 }
             }
             result => result,
@@ -363,9 +421,10 @@ impl HookManager {
                     hook,
                     ctx.metadata().identities(),
                     bypass_reason.clone(),
+                    BypassIdentitySource::ClientIdentities,
                 )
                 .await?;
-            if matches!(result, BypassAuthorizationResult::Bypassed(_)) {
+            if matches!(result, BypassAuthorizationResult::Bypassed { .. }) {
                 return Ok(result);
             }
         }
@@ -391,19 +450,31 @@ impl HookManager {
         hook: &Hook,
         identity_set: &MononokeIdentitySet,
         bypass_reason: String,
+        source: BypassIdentitySource,
     ) -> Result<BypassAuthorizationResult> {
         let checker = match hook.get_bypass_permission_checker() {
             Some(checker) => checker,
-            None => return Ok(BypassAuthorizationResult::Bypassed(bypass_reason)),
+            None => {
+                return Ok(BypassAuthorizationResult::Bypassed {
+                    reason: bypass_reason,
+                    check: None,
+                });
+            }
         };
 
+        let check = CheckedBypassIdentities::new(source, identity_set);
         if checker.is_member(identity_set).await {
-            Ok(BypassAuthorizationResult::Bypassed(bypass_reason))
+            Ok(BypassAuthorizationResult::Bypassed {
+                reason: bypass_reason,
+                check: Some(check),
+            })
         } else {
             let group_name = hook.get_bypass_permission_group().unwrap_or("unknown");
-            Ok(BypassAuthorizationResult::UnauthorizedUser(
-                group_name.to_string(),
-            ))
+            Ok(BypassAuthorizationResult::UnauthorizedUser {
+                reason: bypass_reason,
+                group: group_name.to_string(),
+                check,
+            })
         }
     }
 
@@ -425,8 +496,17 @@ impl HookManager {
         let author_identity = match changeset_author.and_then(extract_identity_from_author) {
             Some(author_identity) => author_identity,
             None => {
+                // The identities checked here belong to the pusher, not the
+                // author -- for a bot-authored commit pushed by a service they
+                // are unrelated. `CommitAuthorFallbackToClient` is what makes
+                // that visible instead of looking like a plain author check.
                 return self
-                    .check_bypass_group_membership(hook, ctx.metadata().identities(), bypass_reason)
+                    .check_bypass_group_membership(
+                        hook,
+                        ctx.metadata().identities(),
+                        bypass_reason,
+                        BypassIdentitySource::CommitAuthorFallbackToClient,
+                    )
                     .await;
             }
         };
@@ -437,10 +517,11 @@ impl HookManager {
                 hook,
                 &std::iter::once(author_identity).collect(),
                 bypass_reason.clone(),
+                BypassIdentitySource::CommitAuthor,
             )
             .await?;
 
-        if matches!(result, BypassAuthorizationResult::UnauthorizedUser(_))
+        if matches!(result, BypassAuthorizationResult::UnauthorizedUser { .. })
             && is_user
             && justknobs::eval(
                 "scm/mononoke:resolve_unixname_from_employee_service_for_hook_bypass",
@@ -455,6 +536,7 @@ impl HookManager {
                         hook,
                         &std::iter::once(identity).collect(),
                         bypass_reason,
+                        BypassIdentitySource::CommitAuthorResolvedUnixname,
                     )
                     .await;
             }
@@ -600,6 +682,10 @@ impl HookManager {
         if let Some(cri) = ctx.metadata().client_request_info() {
             scuba.add_client_request_info(cri);
         }
+        scuba.add(
+            "originating_purpose",
+            HookExecutionPurpose::LandAttempt.as_str(),
+        );
 
         for hook_name in hooks {
             let hook = self
@@ -636,6 +722,7 @@ impl HookManager {
                 cross_repo_push_source,
                 push_authored_by,
                 annotated_tags,
+                maybe_pushvars,
                 hook.get_config().log_only,
                 bypass,
             ) {
@@ -654,10 +741,12 @@ impl HookManager {
         maybe_pushvars: Option<&HashMap<String, Bytes>>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         // When the hooks are being run as a different set of identities than the
         // caller's (e.g. `commit_run_hooks` with `run_as`), this holds the
         // caller's real identities for audit logging. `None` for real pushes.
         run_as_original_identities: Option<&MononokeIdentitySet>,
+        log_only_rejections: LogOnlyRejections,
     ) -> Result<Vec<HookOutcome>, Error> {
         debug!("Running hooks for bookmark {:?}", bookmark);
 
@@ -673,6 +762,7 @@ impl HookManager {
         if let Some(cri) = ctx.metadata().client_request_info() {
             scuba.add_client_request_info(cri);
         }
+        scuba.add("originating_purpose", purpose.as_str());
 
         if let Some(user) = user_option {
             scuba.add("user", user);
@@ -785,7 +875,9 @@ impl HookManager {
                     scuba,
                     cross_repo_push_source,
                     push_authored_by,
-                    hook.get_config().log_only,
+                    purpose,
+                    maybe_pushvars,
+                    log_only_rejections.suppresses(hook.get_config().log_only),
                     bypass_by_cs,
                 )
             })
@@ -824,6 +916,10 @@ impl HookManager {
 
 /// Append a note to a rejection telling the pusher their bypass was ignored
 /// because they are not in the permission group. The hook's own reason is kept.
+///
+/// The identities actually tested are deliberately not named here -- they go to
+/// the `scm_hooks` Scuba table (`bypass_identities_checked`,
+/// `bypass_identity_source`) for debugging instead of into the pusher's output.
 pub(crate) fn annotate_unauthorized_rejection(
     outcome: HookOutcome,
     group_name: &str,
@@ -1036,6 +1132,8 @@ impl<'a> HookInstance<'a> {
         changesets: Vec<&'a BonsaiChangeset>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
+        maybe_pushvars: Option<&'a HashMap<String, Bytes>>,
         log_only: bool,
         bypass_by_cs: Arc<HashMap<ChangesetId, BypassDecision>>,
     ) -> HooksOutcome<'a> {
@@ -1054,6 +1152,8 @@ impl<'a> HookInstance<'a> {
                 changesets,
                 cross_repo_push_source,
                 push_authored_by,
+                purpose,
+                maybe_pushvars,
                 hook_name,
                 scuba,
                 log_only,
@@ -1061,17 +1161,19 @@ impl<'a> HookInstance<'a> {
             ),
         }
     }
-    pub(crate) async fn run_hook(
+    pub(crate) async fn run_hook<'cs>(
         self,
         ctx: &CoreContext,
         repo: &HookRepo,
         bookmark: &BookmarkKey,
         hook_name: &str,
         scuba: MononokeScubaSampleBuilder,
-        cs: &BonsaiChangeset,
+        cs: &'cs BonsaiChangeset,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         annotated_tags: Option<&AnnotatedTags>,
+        maybe_pushvars: Option<&'cs HashMap<String, Bytes>>,
         log_only: bool,
         bypass: BypassDecision,
     ) -> Result<HookOutcome, Error> {
@@ -1097,6 +1199,8 @@ impl<'a> HookInstance<'a> {
                 cs,
                 cross_repo_push_source,
                 push_authored_by,
+                purpose,
+                maybe_pushvars,
                 hook_name,
                 scuba,
                 log_only,
@@ -1192,6 +1296,7 @@ impl Hook {
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
         annotated_tags: Option<&'cs AnnotatedTags>,
+        maybe_pushvars: Option<&'cs HashMap<String, Bytes>>,
         log_only: bool,
         bypass: BypassDecision,
     ) -> Vec<impl Future<Output = Result<HookOutcome, Error>> + 'cs> {
@@ -1207,7 +1312,9 @@ impl Hook {
                 to,
                 cross_repo_push_source,
                 push_authored_by,
+                HookExecutionPurpose::LandAttempt,
                 annotated_tags,
+                maybe_pushvars,
                 log_only,
                 bypass,
             )),
@@ -1228,6 +1335,8 @@ impl Hook {
         scuba: MononokeScubaSampleBuilder,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
+        maybe_pushvars: Option<&'a HashMap<String, Bytes>>,
         log_only: bool,
         bypass_by_cs: Arc<HashMap<ChangesetId, BypassDecision>>,
     ) -> HooksOutcome<'cs> {
@@ -1242,6 +1351,8 @@ impl Hook {
                     changesets,
                     cross_repo_push_source,
                     push_authored_by,
+                    purpose,
+                    maybe_pushvars,
                     log_only,
                     bypass_by_cs,
                 ),
@@ -1268,7 +1379,9 @@ impl Hook {
                                         cs,
                                         cross_repo_push_source,
                                         push_authored_by,
+                                        purpose,
                                         None,
+                                        maybe_pushvars,
                                         log_only,
                                         bypass.clone(),
                                     )

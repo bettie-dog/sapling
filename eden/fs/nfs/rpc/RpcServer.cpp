@@ -37,18 +37,18 @@ FsChannelInfo RpcStopData::extractTakeoverInfo() {
 }
 
 void RpcConnectionHandler::getReadBuffer(void** bufP, size_t* lenP) {
-  // TODO(xavierd): Should maxSize be configured to be at least the
-  // configured NFS iosize?
-  constexpr size_t maxSize = 64 * 1024;
+  // TODO(xavierd): Should kDefaultReadBufferAllocationSize be configured to be
+  // at least the configured NFS iosize?
   constexpr size_t minReadSize = 4 * 1024;
 
-  // We want to issue a recv(2) of at least minReadSize, and bound it to
-  // the available writable size of the readBuf_ to minimize allocation
-  // cost. This guarantees reading large buffers, and minimize the number
-  // of calls to tryConsumeReadBuffer.
+  // We want to issue a recv(2) of at least minReadSize, and to reuse whatever
+  // the readBuf_ already has room for before allocating again, to minimize
+  // allocation cost. This guarantees reading large buffers, and minimize the
+  // number of calls to tryConsumeReadBuffer.
   auto minSize = std::max(readBuf_.tailroom(), minReadSize);
 
-  auto [buf, len] = readBuf_.preallocate(minSize, maxSize);
+  auto [buf, len] =
+      readBuf_.preallocate(minSize, kDefaultReadBufferAllocationSize);
   *lenP = len;
   *bufP = buf;
 }
@@ -552,7 +552,16 @@ void RpcConnectionHandler::dispatchAndReply(
               finalizeFragment(std::move(iobufQueue)), std::move(timeline)};
         }
 
-        if (auto auth = proc_->checkAuthentication(call.cbody);
+        // Parse the AUTH_SYS credential once, and share the result with
+        // checkAuthentication and dispatchRpc. Processors whose
+        // credential-consuming features are all off skip the parse
+        // entirely (see shouldParseAuthSysCreds).
+        std::optional<authsys_parms> authSysCreds;
+        if (proc_->shouldParseAuthSysCreds()) {
+          authSysCreds = parseAuthSysCreds(call.cbody.cred);
+        }
+
+        if (auto auth = proc_->checkAuthentication(call.cbody, authSysCreds);
             auth != auth_stat::AUTH_OK) {
           serializeAuthError(ser, auth, call.xid);
           timeline.handlerDone = std::chrono::steady_clock::now();
@@ -568,7 +577,8 @@ void RpcConnectionHandler::dispatchAndReply(
               call.xid,
               call.cbody.prog,
               call.cbody.vers,
-              call.cbody.proc);
+              call.cbody.proc,
+              authSysCreds);
         });
 
         return std::move(fut).thenTry(
@@ -664,6 +674,25 @@ void RpcServer::connectionAccepted(
   XLOGF(DBG7, "Accepted connection from: {}", clientAddr.describe());
   auto socket = AsyncSocket::newSocket(evb_, fd);
   auto& state = state_.get();
+
+  // EOF on any connection with a handler stops the server (see readEOF), so
+  // a server that only supports a single client must refuse further
+  // connections rather than accept them: otherwise any process able to
+  // connect to this socket takes the server down by disconnecting again.
+  const bool isExtraConnection = !state.connectionHandlers.empty();
+  if (isExtraConnection) {
+    proc_->onExtraConnection();
+  }
+  if (!proc_->acceptsMultipleConnections() && isExtraConnection) {
+    proc_->onExtraConnectionRefused();
+    XLOGF_EVERY_MS(
+        WARN,
+        60000,
+        "Refusing connection from {}: this server already has its single supported client",
+        clientAddr.describe());
+    return;
+  }
+
   state.connectionHandlers.push_back(
       RpcConnectionHandler::create(
           proc_,
@@ -674,14 +703,13 @@ void RpcServer::connectionAccepted(
           maximumInFlightRequests_,
           highNfsRequestsLogInterval_));
 
-  // At this point we could stop accepting connections with this callback for
-  // nfsd3 because we only support one connected client, and we do not support
-  // reconnects. BUT its tricky to unregister the accept callback.
-  // to unregister and is fine to keep it around for now and just clean it up on
-  // shutdown.
+  // The accept callback stays registered even for single-client (nfsd3)
+  // servers: additional connection attempts are refused above rather than
+  // by unregistering the callback, which is tricky to do safely here. The
+  // callback is cleaned up on shutdown.
   //
-  // TODO: Is it really tricky to unregister the accept callback? We could call
-  // stopAccepting() here and removeAcceptCallback.
+  // TODO: Is it really tricky to unregister the accept callback? We could
+  // call stopAccepting() here and removeAcceptCallback.
 }
 
 void RpcServer::acceptError(const std::exception& ex) noexcept {
@@ -692,8 +720,13 @@ void RpcServer::acceptStopped() noexcept {
   state_.get().acceptStopped = true;
 }
 
+bool RpcServerProcessor::shouldParseAuthSysCreds() {
+  return true;
+}
+
 auth_stat RpcServerProcessor::checkAuthentication(
-    const call_body& /*call_body*/) {
+    const call_body& /*call_body*/,
+    const std::optional<authsys_parms>& /*authSysCreds*/) {
   // Completely ignore authentication.
   // TODO: something reasonable here
   return auth_stat::AUTH_OK;
@@ -705,12 +738,15 @@ ImmediateFuture<folly::Unit> RpcServerProcessor::dispatchRpc(
     uint32_t /*xid*/,
     uint32_t /*progNumber*/,
     uint32_t /*progVersion*/,
-    uint32_t /*procNumber*/) {
+    uint32_t /*procNumber*/,
+    const std::optional<authsys_parms>& /*authSysCreds*/) {
   return folly::unit;
 }
 
 void RpcServerProcessor::onShutdown(RpcStopData) {}
 void RpcServerProcessor::clientConnected() {}
+void RpcServerProcessor::onExtraConnection() {}
+void RpcServerProcessor::onExtraConnectionRefused() {}
 
 std::shared_ptr<RpcServer> RpcServer::create(
     std::shared_ptr<RpcServerProcessor> proc,

@@ -13,12 +13,14 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/InodePtr.h"
+#include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/takeover/gen-cpp2/takeover_types.h"
@@ -342,6 +344,17 @@ class InodeMap {
       bool isUnlinked,
       const InodeMapLock& lock);
 
+  /**
+   * Return whether unloading this tree would preserve it in unloadedInodes_.
+   *
+   * This reads the tree's contents without acquiring its lock, so the caller
+   * must guarantee that no other thread can acquire the inode: its pointer
+   * acquire count is zero and its parent's contents lock is held.
+   */
+  bool hasRememberedChildForUnload(
+      const TreeInode& inode,
+      const InodeMapLock& lock) const;
+
   /////////////////////////////////////////////////////////////////////////
   // The following public APIs should only be used by TreeInode
   /////////////////////////////////////////////////////////////////////////
@@ -435,6 +448,22 @@ class InodeMap {
    */
   std::vector<InodeNumber> getReferencedInodes() const;
 
+  struct UnloadedInodeGcCandidate {
+    InodeNumber inodeNumber;
+    PathComponent name;
+  };
+
+  struct UnloadedInodeGcEntry {
+    PathComponent name;
+    EdenTimestamp lastFsRequestTime;
+    uint32_t numFsReferences;
+  };
+
+  /** Return copies of unloaded child state for one inode GC scan batch. */
+  std::vector<UnloadedInodeGcEntry> getUnloadedChildrenForGc(
+      InodeNumber parent,
+      const std::vector<UnloadedInodeGcCandidate>& candidates) const;
+
  private:
   friend class InodeMapLock;
 
@@ -454,7 +483,8 @@ class InodeMap {
     UnloadedInode(
         InodeNumber parentNum,
         PathComponentPiece entryName,
-        mode_t mode);
+        mode_t mode,
+        EdenTimestamp lastFsRequestTime);
 
     UnloadedInode(
         InodeNumber parentNum,
@@ -462,13 +492,8 @@ class InodeMap {
         bool isUnlinked,
         mode_t mode,
         std::optional<ObjectId> id,
-        uint32_t fsRefcount);
-    UnloadedInode(
-        TreeInode* parent,
-        PathComponentPiece entryName,
-        bool isUnlinked,
-        std::optional<ObjectId> id,
-        uint32_t fsRefcount);
+        uint32_t fsRefcount,
+        EdenTimestamp lastFsRequestTime);
     UnloadedInode(
         FileInode* inode,
         TreeInode* parent,
@@ -504,6 +529,8 @@ class InodeMap {
      * If the entry is materialized, this field is not set.
      */
     std::optional<ObjectId> const id;
+
+    EdenTimestamp const lastFsRequestTime;
 
     /**
      * A list of promises waiting on this inode to be loaded.
@@ -701,6 +728,10 @@ class InodeMap {
       PathComponentPiece name,
       bool isUnlinked,
       const folly::Synchronized<Members>::LockedPtr& lock);
+
+  bool hasRememberedChildForUnload(
+      const TreeInode& inode,
+      const folly::Synchronized<Members>::LockedPtr& lock) const;
 
   void insertLoadedInode(
       const folly::Synchronized<Members>::LockedPtr& data,

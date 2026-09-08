@@ -17,8 +17,12 @@ use bookmarks::BookmarksRef;
 use bytes::Bytes;
 use context::CoreContext;
 use fbinit::FacebookInit;
+use futures::FutureExt;
 use futures::TryFutureExt;
 use hook_manager_testlib::HookTestRepo;
+use justknobs::test_helpers::JustKnobsInMemory;
+use justknobs::test_helpers::KnobVal;
+use justknobs::test_helpers::with_just_knobs_async;
 use maplit::hashmap;
 use metaconfig_types::ComparableRegex;
 use metaconfig_types::HookManagerParams;
@@ -46,11 +50,14 @@ use crate::ChangesetHook;
 use crate::CrossRepoPushSource;
 use crate::FileChangeType;
 use crate::HookExecution;
+use crate::HookExecutionPurpose;
 use crate::HookManager;
 use crate::HookRejectionInfo;
 use crate::HookRepo;
+use crate::LogOnlyRejections;
 use crate::PathContent;
 use crate::PushAuthoredBy;
+use crate::Pushvars;
 
 #[derive(Clone)]
 struct FindFilesChangesetHook {
@@ -67,6 +74,7 @@ impl ChangesetHook for FindFilesChangesetHook {
         _changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error> {
         let path = to_mpath(self.filename.as_str());
         let res = repo
@@ -107,6 +115,7 @@ impl ChangesetHook for FileChangesChangesetHook {
         changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error> {
         let parent = changeset.parents().next();
         let (added, changed, removed) = if let Some(parent) = parent {
@@ -150,6 +159,7 @@ impl ChangesetHook for LatestChangesChangesetHook {
         _changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error> {
         let paths = self.0.keys().cloned().collect();
         let res = repo
@@ -378,7 +388,9 @@ async fn run_changeset_hooks_with_mgr(
             None,
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
             None,
+            LogOnlyRejections::Suppress,
         )
         .await
         .unwrap();
@@ -479,4 +491,79 @@ async fn test_hook_file_content_provider_limit_file_size(fb: FacebookInit) -> Re
     );
     assert_eq!(hook_repo.get_file_text(&ctx, large_id).await?, None,);
     Ok(())
+}
+
+fn skip_binary_blob_fetch(enabled: bool) -> JustKnobsInMemory {
+    JustKnobsInMemory::new(hashmap! {
+        "scm/mononoke:enable_hook_skip_binary_blob_fetch".to_string() => KnobVal::Bool(enabled),
+    })
+}
+
+/// get_file_text is the text-hook entry point, so binary content must come back as None while
+/// get_file_bytes still hands it over for the non-hook callers that want raw bytes. The knob
+/// only decides whether the blob is fetched to find that out, so both settings must agree.
+async fn check_get_file_text_skips_binary(fb: FacebookInit) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: HookTestRepo = test_repo_factory::TestRepoFactory::new(fb)?.build().await?;
+
+    // A NUL byte is exactly what ContentMetadataV2::is_binary keys off.
+    let binary_content = b"before\0after".to_vec();
+    let root_id = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("text", "no null bytes here")
+        .add_file("binary", binary_content.clone())
+        .commit()
+        .await?;
+    let root = root_id.load(&ctx, repo.repo_blobstore()).await?;
+    let text_id = root
+        .file_changes_map()
+        .get(&to_mpath("text"))
+        .unwrap()
+        .content_id()
+        .unwrap();
+    let binary_id = root
+        .file_changes_map()
+        .get(&to_mpath("binary"))
+        .unwrap()
+        .content_id()
+        .unwrap();
+    let hook_repo = HookRepo::build_from(&repo);
+
+    assert_eq!(
+        hook_repo.get_file_text(&ctx, text_id).await?,
+        Some(Bytes::from_static(b"no null bytes here")),
+        "text content should be returned to text hooks",
+    );
+    assert_eq!(
+        hook_repo.get_file_text(&ctx, binary_id).await?,
+        None,
+        "binary content should be withheld from text hooks",
+    );
+    assert_eq!(
+        hook_repo.get_file_bytes(&ctx, binary_id).await?,
+        Some(Bytes::from(binary_content)),
+        "get_file_bytes should still return binary content unchanged",
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_hook_file_content_provider_skips_binary(fb: FacebookInit) -> Result<(), Error> {
+    with_just_knobs_async(
+        skip_binary_blob_fetch(true),
+        check_get_file_text_skips_binary(fb).boxed(),
+    )
+    .await
+}
+
+/// Turning the knob back off is the rollback, so the fallback has to keep working: fetch the
+/// bytes, then drop the ones that contain a null byte.
+#[mononoke::fbinit_test]
+async fn test_hook_file_content_provider_skips_binary_knob_disabled(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    with_just_knobs_async(
+        skip_binary_blob_fetch(false),
+        check_get_file_text_skips_binary(fb).boxed(),
+    )
+    .await
 }

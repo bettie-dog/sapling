@@ -24,6 +24,7 @@ use futures::try_join;
 use futures_watchdog::WatchdogExt;
 use hooks::HookOutcome;
 use hooks::HookResult;
+use hooks::LogOnlyRejections;
 use itertools::Either;
 use mononoke_api::BookmarkKey;
 use mononoke_api::CandidateSelectionHintArgs;
@@ -57,7 +58,6 @@ use source_control as thrift;
 use super::commit_restricted_paths;
 use crate::commit_id::map_commit_identities;
 use crate::commit_id::map_commit_identity;
-use crate::diff::RemoteDiffError;
 use crate::from_request::FromRequest;
 use crate::from_request::check_range_and_convert;
 use crate::from_request::validate_timestamp;
@@ -832,20 +832,9 @@ impl SourceControlServiceImpl {
             .and_then(|config| config.remote_diff_config.clone());
         let diff_router = self.diff_router(remote_diff_config.as_ref());
         if diff_router.should_use_remote_commit_compare(repo_name) {
-            let remote_params = params.clone();
-            match diff_router
-                .remote_commit_compare(&ctx, repo_name, commit.id.clone(), remote_params)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(RemoteDiffError::RequestError(e)) => return Err(e),
-                Err(RemoteDiffError::InfraError(reason)) => {
-                    let mut scuba = ctx.scuba().clone();
-                    scuba.add("diff_fallback", reason);
-                    scuba.add("diff_fallback_method", "commit_compare");
-                    scuba.log_with_msg("Diff service fallback to local", None);
-                }
-            }
+            return diff_router
+                .remote_commit_compare(&ctx, repo_name, commit.id.clone(), params)
+                .await;
         }
 
         let (repo, base_changeset, other_changeset) = match &params.other_commit_id {
@@ -1280,13 +1269,40 @@ impl SourceControlServiceImpl {
         commit: thrift::CommitSpecifier,
         params: thrift::CommitRunHooksParams,
     ) -> Result<thrift::CommitRunHooksResponse, scs_errors::ServiceError> {
-        let (_repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let (_repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
         let pushvars: Option<HashMap<String, Bytes>> = params
             .pushvars
             .map(|p| p.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect());
         let run_as = params.run_as.map(run_as_identities).transpose()?;
+        // Both fields only shape this dry run's reported verdicts; a real
+        // push never reads them. Log their use for rollout analysis.
+        let log_only_rejections = if params.include_log_only_rejections.unwrap_or(false) {
+            LogOnlyRejections::Report
+        } else {
+            LogOnlyRejections::Suppress
+        };
+        if params.override_commit_message.is_some()
+            || log_only_rejections == LogOnlyRejections::Report
+        {
+            let mut scuba = ctx.scuba().clone();
+            scuba.add(
+                "override_commit_message_set",
+                params.override_commit_message.is_some(),
+            );
+            scuba.add(
+                "include_log_only_rejections",
+                log_only_rejections == LogOnlyRejections::Report,
+            );
+            scuba.log_with_msg("commit_run_hooks dry-run overrides", None);
+        }
         let outcomes = changeset
-            .run_hooks(params.bookmark, pushvars.as_ref(), run_as)
+            .run_hooks(
+                params.bookmark,
+                pushvars.as_ref(),
+                run_as,
+                params.override_commit_message,
+                log_only_rejections,
+            )
             .await?;
 
         let mut outcomes_map = BTreeMap::new();

@@ -239,6 +239,95 @@ TEST(
   EXPECT_TRUE(inodeMap->lookupInode(newIno).get());
 }
 
+TEST(UnloadLastAccessedBefore, cancellationStopsUnloading) {
+  FakeTreeBuilder builder;
+  builder.setFile("src/file.txt", "contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  testMount.getInode("src/file.txt"_relpath).reset();
+
+  testMount.getClock().advance(120s);
+  auto cutoff = testMount.getClock().getRealtime();
+
+  auto countsBefore = inodeMap->getInodeCounts();
+  folly::CancellationSource cancellationSource;
+  cancellationSource.requestCancellation();
+
+  EXPECT_EQ(
+      0,
+      edenMount->getRootInode()->unloadChildrenLastAccessedBefore(
+          cutoff, cancellationSource.getToken()));
+  auto countsAfterCancellation = inodeMap->getInodeCounts();
+  EXPECT_EQ(countsBefore.treeCount, countsAfterCancellation.treeCount);
+  EXPECT_EQ(countsBefore.fileCount, countsAfterCancellation.fileCount);
+  EXPECT_GT(
+      edenMount->getRootInode()->unloadChildrenLastAccessedBefore(cutoff), 0);
+}
+
+TEST(UnloadLastAccessedBefore, preservesLastFsRequestTimeAcrossReload) {
+  FakeTreeBuilder builder;
+  builder.setFile("file.txt", "contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  auto inode = testMount.getInode("file.txt"_relpath);
+  auto inodeNumber = inode->getNodeId();
+  inode->incFsRefcount();
+  auto lastFsRequestTime = inode->getLastFsRequestTime();
+
+  testMount.getClock().advance(120s);
+  auto cutoff = testMount.getClock().getRealtime();
+  inode.reset();
+
+  EXPECT_GT(
+      edenMount->getRootInode()->unloadChildrenLastAccessedBefore(cutoff), 0);
+  EXPECT_FALSE(inodeMap->lookupLoadedInode(inodeNumber));
+  EXPECT_GT(inodeMap->getInodeCounts().unloadedInodeCount, 0);
+
+  auto reloaded = inodeMap->lookupInode(inodeNumber).get();
+  EXPECT_EQ(lastFsRequestTime, reloaded->getLastFsRequestTime());
+}
+
+TEST(UnloadLastAccessedBefore, getsUnloadedChildrenForGcInOneBatch) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/file.txt", "contents");
+  builder.setFile("dir/other.txt", "other contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  auto dir = testMount.getTreeInode("dir"_relpath);
+  auto file = testMount.getInode("dir/file.txt"_relpath);
+  auto other = testMount.getInode("dir/other.txt"_relpath);
+  auto dirNumber = dir->getNodeId();
+  auto fileNumber = file->getNodeId();
+  auto otherNumber = other->getNodeId();
+  file->incFsRefcount();
+  other->incFsRefcount();
+  auto expectedLastFsRequestTime = file->getLastFsRequestTime();
+
+  testMount.getClock().advance(120s);
+  auto cutoff = testMount.getClock().getRealtime();
+  file.reset();
+  other.reset();
+  EXPECT_GT(
+      edenMount->getRootInode()->unloadChildrenLastAccessedBefore(cutoff), 0);
+
+  const std::vector<InodeMap::UnloadedInodeGcCandidate> candidates{
+      {fileNumber, PathComponent{"file.txt"_pc}},
+      {otherNumber, PathComponent{"wrong-name.txt"_pc}},
+      {InodeNumber{999'999}, PathComponent{"missing.txt"_pc}}};
+  auto children = inodeMap->getUnloadedChildrenForGc(dirNumber, candidates);
+
+  ASSERT_EQ(1, children.size());
+  EXPECT_EQ("file.txt"_pc, children.front().name);
+  EXPECT_EQ(expectedLastFsRequestTime, children.front().lastFsRequestTime);
+  EXPECT_EQ(1, children.front().numFsReferences);
+}
+
 TEST(UnloadUnreferencedByFuse, inodesReferencedByFuseAreNotUnloaded) {
   FakeTreeBuilder builder;
   builder.mkdir("src");
@@ -265,6 +354,69 @@ TEST(UnloadUnreferencedByFuse, inodesReferencedByFuseAreNotUnloaded) {
   EXPECT_EQ(2, counts.treeCount);
   EXPECT_EQ(1, counts.fileCount);
   EXPECT_EQ(0, counts.unloadedInodeCount);
+}
+
+TEST(UnloadUnreferencedByFuse, cancellationStopsUnloading) {
+  FakeTreeBuilder builder;
+  builder.mkdir("src");
+  builder.setFile("src/file.txt", "contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  auto inode = testMount.getInode("src/file.txt"_relpath);
+  auto inodeNumber = inode->getNodeId();
+  inode->incFsRefcount();
+  inode.reset();
+  inodeMap->decFsRefcount(inodeNumber, 1);
+
+  auto countsBefore = inodeMap->getInodeCounts();
+  folly::CancellationSource cancellationSource;
+  cancellationSource.requestCancellation();
+
+  EXPECT_EQ(
+      0,
+      edenMount->getRootInode()->unloadChildrenUnreferencedByFs(
+          cancellationSource.getToken()));
+  auto countsAfterCancellation = inodeMap->getInodeCounts();
+  EXPECT_EQ(countsBefore.treeCount, countsAfterCancellation.treeCount);
+  EXPECT_EQ(countsBefore.fileCount, countsAfterCancellation.fileCount);
+  EXPECT_EQ(
+      countsBefore.unloadedInodeCount,
+      countsAfterCancellation.unloadedInodeCount);
+  EXPECT_GT(edenMount->getRootInode()->unloadChildrenUnreferencedByFs(), 0);
+}
+
+TEST(UnloadUnreferencedByFuse, inodeGcKeepsTreesWithRememberedChildrenLoaded) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/file.txt", "contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+  auto dir = testMount.getTreeInode("dir"_relpath);
+  auto file = testMount.getInode("dir/file.txt"_relpath);
+  auto dirNumber = dir->getNodeId();
+  auto fileNumber = file->getNodeId();
+  file->incFsRefcount();
+
+  testMount.getClock().advance(120s);
+  auto cutoff = testMount.getClock().getRealtime();
+  file.reset();
+  dir.reset();
+  EXPECT_GT(
+      edenMount->getRootInode()->unloadChildrenLastAccessedBefore(cutoff), 0);
+  ASSERT_FALSE(inodeMap->lookupLoadedInode(dirNumber));
+  ASSERT_FALSE(inodeMap->lookupLoadedInode(fileNumber));
+
+  dir = testMount.getTreeInode("dir"_relpath);
+  dir.reset();
+  auto result =
+      edenMount->getRootInode()->unloadChildrenUnreferencedByFsForInodeGC();
+
+  EXPECT_EQ(1, result.zeroFsRefTreesRetained);
+  EXPECT_TRUE(inodeMap->lookupLoadedInode(dirNumber));
+  EXPECT_FALSE(inodeMap->lookupLoadedInode(fileNumber));
 }
 
 #endif

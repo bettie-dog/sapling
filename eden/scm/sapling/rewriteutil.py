@@ -10,6 +10,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2 or any later version.
 
+from contextlib import contextmanager
 
 from bindings import agentdetect
 
@@ -17,8 +18,23 @@ from . import error, mutation, node, slacl
 from .i18n import _
 from .node import short
 
+_SPLIT_IN_PROGRESS = "rewriteutil.split-in-progress"
+_OBSOLETE_REWRITE_APPROVALS = "rewriteutil.obsolete-rewrite-approvals"
 
-def precheck(repo, revs, action="rewrite", checkobsolete=True, checkmerge=True):
+
+def copycommitmessage(repo, message, operation, source):
+    """Allow extensions to adjust a copied commit's message.
+
+    ``source`` is the commit being copied.
+    """
+    return message
+
+
+def precheckmessage(repo, predecessors, message):
+    """Allow extensions to validate a rewrite's final message upfront."""
+
+
+def precheck(repo, revs, action="rewrite", checkmerge=True):
     """check if revs can be rewritten
     action is used to control the error message.
 
@@ -40,33 +56,244 @@ def precheck(repo, revs, action="rewrite", checkobsolete=True, checkmerge=True):
 
     slacl.abort_if_restricted(repo, (repo[rev] for rev in revs))
 
-    if (
-        checkobsolete
-        and mutation.enabled(repo)
-        and not repo.ui.plain()
-        and repo.ui.configbool("commit", "reject-modifying-obsolete", True)
-    ):
-        obsrevs = repo.revs("%ld and obsolete()", revs)
-        if obsrevs:
-            msg = _("changing an old version of a commit will diverge your stack")
-            details = []
-            for rev in obsrevs:
-                ctx = repo[rev]
-                fates = mutation.fate(repo, ctx.node())
-                for succs, op in fates:
-                    succids = ", ".join(short(s) for s in succs)
-                    details.append("- %s -> %s (%s)" % (short(ctx.node()), succids, op))
-                if not fates:
-                    details.append("- %s is obsolete" % short(ctx.node()))
-            if details:
-                msg += ":\n" + "\n".join(details)
-            hint = _("run '@prog@ sl' for the latest commit graph view")
-            if agentdetect.is_agent():
-                raise error.Abort(msg, hint=hint)
-            else:
-                repo.ui.warn(_("warning: %s\n") % msg)
-                choice = repo.ui.promptchoice(
-                    _("proceed with %s (Yn)? $$ &Yes $$ &No") % action, default=0
-                )
-                if choice != 0:
-                    raise error.Abort(_("aborted by user"))
+    _record_obsolete_approvals(repo, _checkobsolete(repo, [repo[rev] for rev in revs]))
+
+
+def _record_obsolete_approvals(repo, approved):
+    if not approved:
+        return
+    if _OBSOLETE_REWRITE_APPROVALS not in repo.volatile_state:
+        repo.volatile_state[_OBSOLETE_REWRITE_APPROVALS] = set()
+        repo.ui.atexit(
+            lambda: repo.volatile_state.pop(_OBSOLETE_REWRITE_APPROVALS, None)
+        )
+    approvals = repo.volatile_state[_OBSOLETE_REWRITE_APPROVALS]
+    approvals.update(ctx.node() for ctx in approved)
+
+
+def actormetric(prefix, suffix):
+    """Metric name split by whether an agent or a human drove the command."""
+    actor = "agent_" if agentdetect.is_agent() else "human_"
+    return prefix + actor + suffix
+
+
+def _hasvisibledescendant(repo, ctx):
+    # wdir() is a virtual descendant of the checked-out commit, not an
+    # existing committed stack.
+    descendants = repo.nodes(
+        "limit((((%n::) - %n) - hidden()) - wdir(), 1)",
+        ctx.node(),
+        ctx.node(),
+    )
+    return next(iter(descendants), None) is not None
+
+
+# Boolean configs the mode configs replaced, still honored for rollback.
+_LEGACY_BOOLEAN_CONFIGS = {
+    ("commit", "modify-obsolete-mode"): ("commit", "reject-modifying-obsolete"),
+}
+
+
+def _obsolete_mode(repo, config):
+    default = "abort" if agentdetect.is_agent() else "warn"
+    mode = repo.ui.config(config[0], config[1])
+    if mode is None:
+        legacy = _LEGACY_BOOLEAN_CONFIGS.get(config)
+        if legacy is not None and repo.ui.config(legacy[0], legacy[1]) is not None:
+            return default if repo.ui.configbool(legacy[0], legacy[1]) else "ignore"
+        return default
+    # Unrecognized values (e.g. "off") disable the guard so emergency
+    # rollback configs fail open.
+    return mode if mode in ("warn", "prompt", "abort") else "ignore"
+
+
+def _checkobsolete(
+    repo,
+    contexts,
+    message=None,
+    hint=None,
+    allow_public_successors=False,
+    allow_visible_descendants=False,
+    mode_config=("commit", "modify-obsolete-mode"),
+):
+    if not mutation.enabled(repo):
+        return []
+
+    obsolete_contexts = [ctx for ctx in contexts if ctx.obsolete()]
+    if not obsolete_contexts:
+        return []
+
+    # Counters are namespaced by the guard: commit.obsolete.* for rewrite and
+    # commit guards, checkout.obsolete.* for the goto guard.
+    prefix = mode_config[0] + ".obsolete."
+
+    # All bypasses below come before the per-context fate and visibility
+    # queries, so automation, explicit opt-ins, and disabled modes only pay
+    # for the obsolete() checks. Their counters may therefore include
+    # contexts the allowances would have exempted anyway.
+    if repo.ui.plain():
+        repo.ui.metrics.inc(prefix + "automation_allowed", 1)
+        return obsolete_contexts
+
+    # allowdivergence is the established opt-in for operations that
+    # deliberately rewrite obsolete commits.
+    if repo.ui.configbool("experimental", "evolution.allowdivergence"):
+        repo.ui.metrics.inc(prefix + "config_allowed", 1)
+        return obsolete_contexts
+
+    mode = _obsolete_mode(repo, mode_config)
+    if mode == "ignore":
+        repo.ui.metrics.inc(prefix + "mode_ignored", 1)
+        return obsolete_contexts
+
+    ispublic = mutation.getispublicfunc(repo) if allow_public_successors else None
+    obsolete = []
+    for ctx in obsolete_contexts:
+        if allow_visible_descendants and _hasvisibledescendant(repo, ctx):
+            continue
+        fates = mutation.fate(repo, ctx.node())
+        # After every successor lands, working on top of the old draft is a
+        # routine post-land state rather than new divergence. A fate with no
+        # successors (e.g. a prune) is not "landed", so it does not qualify.
+        if (
+            allow_public_successors
+            and fates
+            and all(
+                successors and all(ispublic(successor) for successor in successors)
+                for successors, _operation in fates
+            )
+        ):
+            continue
+        obsolete.append((ctx, fates))
+    if not obsolete:
+        return []
+
+    if message is None:
+        message = _("changing an old version of a commit will diverge your stack")
+    details = []
+    for ctx, fates in obsolete:
+        for successors, operation in fates:
+            successor_ids = ", ".join(short(successor) for successor in successors)
+            details.append(
+                "- %s -> %s (%s)" % (short(ctx.node()), successor_ids, operation)
+            )
+        if not fates:
+            details.append("- %s is obsolete" % short(ctx.node()))
+    if details:
+        message += ":\n" + "\n".join(details)
+
+    if hint is None:
+        hint = _(
+            "switch to the newer version listed above, or run '@prog@ graft' "
+            "with the old commit hash to deliberately fork it; '@prog@ sl' "
+            "shows the latest graph"
+        )
+    if mode == "abort":
+        repo.ui.metrics.inc(actormetric(prefix, "rejected"), 1)
+        raise error.Abort(message, hint=hint)
+
+    repo.ui.warn(_("warning: %s\n") % message)
+    if mode == "prompt":
+        choice = repo.ui.promptchoice(_("proceed (Yn)? $$ &Yes $$ &No"), default=0)
+        if choice != 0:
+            repo.ui.metrics.inc(actormetric(prefix, "prompt_no"), 1)
+            raise error.Abort(_("aborted by user"))
+        repo.ui.metrics.inc(actormetric(prefix, "prompt_yes"), 1)
+        return [ctx for ctx, _fates in obsolete]
+
+    repo.ui.metrics.inc(actormetric(prefix, "warned"), 1)
+    return [ctx for ctx, _fates in obsolete]
+
+
+@contextmanager
+def splitting(repo):
+    # Intermediate split commits lack mutation metadata. Mark the split in
+    # progress so hooks can defer validation until the terminal split commit.
+    if _SPLIT_IN_PROGRESS in repo.volatile_state:
+        raise error.ProgrammingError("split is already in progress")
+    repo.volatile_state[_SPLIT_IN_PROGRESS] = True
+    try:
+        yield
+    finally:
+        repo.volatile_state.pop(_SPLIT_IN_PROGRESS)
+
+
+def issplitting(repo):
+    return _SPLIT_IN_PROGRESS in repo.volatile_state
+
+
+def _localcontexts(repo, nodes):
+    return [
+        repo[commit_node]
+        for commit_node in repo.changelog.filternodes(nodes, local=True)
+    ]
+
+
+def commitcheck(repo, ctx):
+    """Run extension checks for one commit being written."""
+    mutinfo = ctx.mutinfo() or {}
+    predecessors = _localcontexts(
+        repo, mutation.nodesfrominfo(mutinfo.get("mutpred")) or []
+    )
+    split_successors = _localcontexts(
+        repo, mutation.nodesfrominfo(mutinfo.get("mutsplit")) or []
+    )
+    # An approval covers the whole command: one approved predecessor may be
+    # rewritten into several successors (e.g. a split), each reaching here.
+    approvals = repo.volatile_state.get(_OBSOLETE_REWRITE_APPROVALS, set())
+    unapproved_predecessors = [
+        predecessor
+        for predecessor in predecessors
+        if predecessor.node() not in approvals
+    ]
+    # Record approvals granted here too, so rewrite paths without a command
+    # precheck also prompt at most once per predecessor.
+    _record_obsolete_approvals(repo, _checkobsolete(repo, unapproved_predecessors))
+    predecessor_parents = {
+        parent.node()
+        for predecessor in predecessors
+        for parent in predecessor.parents()
+    }
+    _checkobsolete(
+        repo,
+        [
+            parent
+            for parent in ctx.parents()
+            if parent.node() != node.nullid and parent.node() not in predecessor_parents
+        ],
+        _("creating a child of an old version of a commit will diverge your stack"),
+        _(
+            "switch to the newer version listed above first -- '@prog@ goto' "
+            "carries uncommitted changes along, or use '@prog@ shelve' and "
+            "'@prog@ unshelve' to move them"
+        ),
+        allow_public_successors=not predecessors,
+        allow_visible_descendants=not predecessors,
+    )
+    return predecessors, split_successors
+
+
+def gotocheck(repo, targets):
+    """Guard checkouts of hidden obsolete commits.
+
+    Depending on `checkout.obsolete-mode` and whether the caller is an agent,
+    this warns, prompts, or aborts; visible obsolete commits are not guarded.
+    """
+    hidden_nodes = set(repo.nodes("%ln & hidden()", [ctx.node() for ctx in targets]))
+    hidden_targets = [ctx for ctx in targets if ctx.node() in hidden_nodes]
+    if not hidden_targets:
+        return
+    target_args = " ".join(short(ctx.node()) for ctx in hidden_targets)
+    _checkobsolete(
+        repo,
+        hidden_targets,
+        _("checking out an old version of a commit risks diverging your stack"),
+        _(
+            "check out the newer version listed above instead, or run "
+            "'@prog@ unhide %s' to explicitly allow checking out this old commit"
+        )
+        % target_args,
+        allow_public_successors=True,
+        allow_visible_descendants=True,
+        mode_config=("checkout", "obsolete-mode"),
+    )

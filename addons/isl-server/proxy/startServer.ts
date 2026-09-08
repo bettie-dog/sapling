@@ -360,6 +360,12 @@ function callStartServer(args: StartServerArgs): Promise<StartServerResult> {
         // terminate because the child process will keep stdout from the
         // parent process open, so jq will continue to read from it.
         stdio: 'ignore' as IOType,
+        // The forked child is `node.exe`, a console program. When the parent
+        // has no console of its own to lend it -- which is the case whenever
+        // run-proxy is launched from a GUI host rather than a terminal --
+        // Windows gives the child a fresh, visible one that lives as long as
+        // the ISL server does. No-op on other platforms.
+        windowsHide: true,
       };
       const pathToChildModule = path.join(path.dirname(__filename), 'child');
       const child = child_process.fork(pathToChildModule, [], options);
@@ -764,20 +770,22 @@ function maybeOpenURL(url: URL): void {
   }
 
   let openCommand: string;
-  let shell = false;
-  let args: string[] = [href];
+  const args: string[] = [href];
   switch (process.platform) {
     case 'darwin': {
       openCommand = '/usr/bin/open';
       break;
     }
     case 'win32': {
-      // START ["title"] command
-      openCommand = 'start';
-      // Trust `href`. Use naive quoting.
-      args = ['"ISL"', `"${href}"`];
-      // START is a shell (cmd.exe) builtin, not a standalone exe.
-      shell = true;
+      // START is a cmd.exe builtin, so using it costs a whole shell process
+      // just to hand the URL off to the default browser -- and cmd.exe is a
+      // console program, which is how ISL ends up flashing a terminal on
+      // Windows. explorer.exe performs the same ShellExecute dispatch, is a
+      // real executable so it needs no shell, and is a GUI program so it
+      // never asks for a console. It exits immediately (with a non-zero
+      // status) once the browser has been handed the URL; nothing here reads
+      // the exit code.
+      openCommand = 'explorer.exe';
       break;
     }
     default: {
@@ -791,15 +799,14 @@ function maybeOpenURL(url: URL): void {
   // machine, but then set up tunneling to reach the server from another host.
   const child = child_process.spawn(openCommand, args, {
     detached: true,
-    shell,
     stdio: 'ignore' as IOType,
     windowsHide: true,
     windowsVerbatimArguments: true,
   });
 
-  // While `/usr/bin/open` on macOS and `start` on Windows are expected to be
-  // available, xdg-open is not guaranteed, so report an appropriate error in
-  // this case.
+  // While `/usr/bin/open` on macOS and `explorer.exe` on Windows are expected
+  // to be available, xdg-open is not guaranteed, so report an appropriate
+  // error in this case.
   child.on('error', (error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') {
       // eslint-disable-next-line no-console

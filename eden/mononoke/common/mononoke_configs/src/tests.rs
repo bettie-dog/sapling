@@ -12,21 +12,26 @@ use std::time::Duration;
 
 use cached_config::ModificationTime;
 use cached_config::TestSource;
+use metaconfig_parser::config::load_configs_from_raw;
 use metaconfig_types::CommonConfig;
 use mononoke_macros::mononoke;
+use repos::RawAllowlistIdentity;
 use repos::RawBlobstoreConfig;
 use repos::RawBlobstoreDisabled;
 use repos::RawCommitIdentityScheme;
+use repos::RawCommonConfig;
 use repos::RawDbLocal;
 use repos::RawMetadataConfig;
+use repos::RawRedactionConfig;
 use repos::RawRepoConfig;
+use repos::RawRepoConfigs;
 use repos::RawStorageConfig;
 use repos::TierRepoEntry;
 
 use super::*;
 
 const TEST_TIER: &str = "scs";
-const TEST_STORAGE: &str = "test_storage";
+pub(crate) const TEST_STORAGE: &str = "test_storage";
 
 fn empty_configs() -> MononokeConfigs {
     MononokeConfigs {
@@ -38,7 +43,6 @@ fn empty_configs() -> MononokeConfigs {
             storage: HashMap::new(),
         })),
         update_receivers: Arc::new(ArcSwap::from_pointee(vec![])),
-        config_info: Arc::new(ArcSwap::from_pointee(None)),
         maybe_config_updater: None,
         maybe_liveness_updater: None,
         maybe_manifest_handle: None,
@@ -224,7 +228,7 @@ fn test_remove_repo_config_handle_preserves_legacy_only_entry() {
 // --- batch_load_repo_configs_checked / load_all_repo_configs_checked ---
 
 /// A minimal valid RawStorageConfig so a RepoSpec referencing it parses.
-fn test_raw_storage_config() -> RawStorageConfig {
+pub(crate) fn test_raw_storage_config() -> RawStorageConfig {
     RawStorageConfig {
         metadata: RawMetadataConfig::local(RawDbLocal {
             local_db_path: "/tmp/test_db".to_string(),
@@ -236,7 +240,7 @@ fn test_raw_storage_config() -> RawStorageConfig {
 }
 
 /// JSON for a RepoSpec that parses successfully (references TEST_STORAGE).
-fn valid_repo_spec_json(repo_id: i32, repo_name: &str) -> String {
+pub(crate) fn valid_repo_spec_json(repo_id: i32, repo_name: &str) -> String {
     let spec = RepoSpec {
         repo_id,
         repo_name: repo_name.to_string(),
@@ -424,4 +428,293 @@ fn test_load_all_repo_configs_checked_unions_and_partitions() {
     let failed: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(loaded, ["good/repo"]);
     assert_eq!(failed, ["bad/repo"]);
+}
+
+// A split-loaded repo must record the source-reported config version;
+// mutation id is not plumbed yet and must stay None.
+#[mononoke::test]
+fn test_get_or_load_repo_config_records_config_version() {
+    let spec_path = "test/repos/good";
+    let manifest_path = "test/manifest";
+    let manifest = TierManifest {
+        repos: vec![entry("good/repo", 1, spec_path)],
+        storage: HashMap::from([(TEST_STORAGE.to_string(), test_raw_storage_config())]),
+        ..Default::default()
+    };
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+
+    let source = TestSource::new();
+    source.insert_config(
+        manifest_path,
+        &manifest_json,
+        ModificationTime::UnixTimestamp(0),
+    );
+    source.insert_config_with_version(
+        spec_path,
+        &valid_repo_spec_json(1, "good/repo"),
+        ModificationTime::UnixTimestamp(0),
+        "config-version-7",
+    );
+    let store = ConfigStore::new(Arc::new(source), Duration::from_secs(1), None);
+
+    let mut cfg = empty_configs();
+    cfg.maybe_manifest_handle = Some(
+        store
+            .get_config_handle::<TierManifest>(manifest_path.to_string())
+            .unwrap(),
+    );
+    cfg.config_store = Some(store);
+    cfg.tier_name = Some(TEST_TIER.to_string());
+
+    let config = cfg
+        .get_or_load_repo_config("good/repo")
+        .expect("split-loaded repo must load");
+
+    assert_eq!(
+        config.config_version.as_deref(),
+        Some("config-version-7"),
+        "split-loaded repo must record the source-reported config version"
+    );
+    assert_eq!(
+        config.config_mutation_id, None,
+        "mutation id is not plumbed yet and must stay None"
+    );
+
+    // The cached fast path must serve the same provenance.
+    let cached = cfg
+        .get_or_load_repo_config("good/repo")
+        .expect("cached repo must load");
+    assert_eq!(
+        cached.config_version.as_deref(),
+        Some("config-version-7"),
+        "the cached entry must carry the same recorded config version"
+    );
+}
+
+// --- Sourcing `common`/`storage` from the manifest ---
+
+/// A default `RawCommonConfig` is not parsable: two required fields fail conversion.
+pub(crate) fn test_raw_common_config(trusted_tier: &str) -> RawCommonConfig {
+    RawCommonConfig {
+        trusted_parties_hipster_tier: Some(trusted_tier.to_string()),
+        internal_identity: RawAllowlistIdentity {
+            identity_type: "SERVICE_IDENTITY".to_string(),
+            identity_data: "internal".to_string(),
+        },
+        redaction_config: RawRedactionConfig {
+            blobstore: TEST_STORAGE.to_string(),
+            redaction_sets_location: "test/redaction_sets".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+pub(crate) fn test_storage_map() -> HashMap<String, RawStorageConfig> {
+    HashMap::from([(TEST_STORAGE.to_string(), test_raw_storage_config())])
+}
+
+/// Asserted parsable, else the tests below pass via the fallback branch instead.
+fn parseable_manifest(trusted_tier: &str) -> TierManifest {
+    let manifest = TierManifest {
+        common: test_raw_common_config(trusted_tier),
+        storage: test_storage_map(),
+        ..Default::default()
+    };
+    assert!(
+        parse_manifest_common_and_storage(&manifest).is_ok(),
+        "fixture must parse, else the tests below pass for the wrong reason"
+    );
+    manifest
+}
+
+/// The cutover-safety equivalence; must hold while the file-backed blob path exists.
+#[mononoke::test]
+fn test_manifest_and_blob_agree_on_common_and_storage() {
+    let common = test_raw_common_config("test_trusted_tier");
+
+    let (blob_configs, blob_storage) = load_configs_from_raw(RawRepoConfigs {
+        common: common.clone(),
+        storage: test_storage_map(),
+        ..Default::default()
+    })
+    .expect("blob parses");
+
+    let (manifest_common, manifest_storage) = parse_manifest_common_and_storage(&TierManifest {
+        common,
+        storage: test_storage_map(),
+        ..Default::default()
+    })
+    .expect("manifest parses");
+
+    assert_eq!(
+        blob_configs.common, manifest_common,
+        "common must be identical from either source"
+    );
+    assert_eq!(
+        blob_storage, manifest_storage,
+        "storage must be identical from either source"
+    );
+}
+
+// --- Manifest-mode startup semantics (manifest_path ⇒ manifest authoritative) ---
+
+/// Configerator-style tier config path; `tier_name` derives to `scs`.
+const TEST_CONFIG_PATH: &str = "configerator://scm/mononoke/repos/tiers/scs";
+/// The store-relative path the legacy blob would be read from.
+const TEST_BLOB_PATH: &str = "scm/mononoke/repos/tiers/scs";
+const TEST_MANIFEST_PATH: &str = "scm/mononoke/repos/tiers/scs_manifest";
+
+/// Legacy tier blob whose `common` carries `trusted_tier`, to tell the two sources apart.
+pub(crate) fn valid_blob_json(trusted_tier: &str) -> String {
+    serde_json::to_string(&RawRepoConfigs {
+        common: test_raw_common_config(trusted_tier),
+        storage: test_storage_map(),
+        ..Default::default()
+    })
+    .expect("RawRepoConfigs serializes")
+}
+
+/// Runtime handle for `MononokeConfigs::new` to spawn tasks onto; tests never drive them.
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("test runtime builds")
+}
+
+// Blob path deliberately absent from the store, so `Ok` proves the blob was never touched.
+#[mononoke::test]
+fn test_manifest_mode_constructs_without_blob_path() {
+    let manifest_json = serde_json::to_string(&parseable_manifest("manifest_tier")).unwrap();
+    let store = make_store(&[(TEST_MANIFEST_PATH, manifest_json.as_str())]);
+    let rt = test_runtime();
+
+    let cfg = MononokeConfigs::new(
+        TEST_CONFIG_PATH,
+        &store,
+        Some(TEST_MANIFEST_PATH),
+        rt.handle().clone(),
+    )
+    .expect("manifest mode must construct without the legacy blob path registered");
+
+    assert_eq!(
+        cfg.repo_configs().common.trusted_parties_hipster_tier,
+        Some("manifest_tier".to_string()),
+        "common must be sourced from the manifest",
+    );
+    assert!(
+        cfg.storage_configs().storage.contains_key(TEST_STORAGE),
+        "storage must be sourced from the manifest",
+    );
+    assert!(
+        cfg.repo_configs().repos.is_empty(),
+        "manifest mode starts with no repos; they are batch-loaded on demand",
+    );
+    assert!(
+        cfg.auto_update_enabled(),
+        "the unified watcher must still be spawned in manifest mode",
+    );
+}
+
+// Fail-closed startup: an unparsable manifest aborts construction despite a valid blob.
+#[mononoke::test]
+fn test_manifest_mode_fails_closed_on_unparsable_manifest() {
+    // Default RawCommonConfig is unparsable (required fields fail conversion).
+    let bad_manifest = TierManifest {
+        storage: test_storage_map(),
+        ..Default::default()
+    };
+    assert!(
+        parse_manifest_common_and_storage(&bad_manifest).is_err(),
+        "fixture must be unparsable, else this test passes for the wrong reason"
+    );
+    let manifest_json = serde_json::to_string(&bad_manifest).unwrap();
+    let blob_json = valid_blob_json("blob_tier");
+    let store = make_store(&[
+        (TEST_MANIFEST_PATH, manifest_json.as_str()),
+        (TEST_BLOB_PATH, blob_json.as_str()),
+    ]);
+    let rt = test_runtime();
+
+    let result = MononokeConfigs::new(
+        TEST_CONFIG_PATH,
+        &store,
+        Some(TEST_MANIFEST_PATH),
+        rt.handle().clone(),
+    );
+
+    assert!(
+        result.is_err(),
+        "manifest mode must fail closed on an unparsable manifest instead of \
+         falling back to the blob",
+    );
+}
+
+// manifest_path=None is the only path that reads the legacy blob.
+#[mononoke::test]
+fn test_no_manifest_serves_legacy_blob() {
+    let blob_json = valid_blob_json("blob_tier");
+    let store = make_store(&[(TEST_BLOB_PATH, blob_json.as_str())]);
+    let rt = test_runtime();
+
+    let cfg = MononokeConfigs::new(TEST_CONFIG_PATH, &store, None, rt.handle().clone())
+        .expect("blob-backed path must construct");
+
+    assert_eq!(
+        cfg.repo_configs().common.trusted_parties_hipster_tier,
+        Some("blob_tier".to_string()),
+        "without a manifest the blob is the only source",
+    );
+}
+
+// The bootstrap pass is the sole seeder of the watcher's manifest snapshot:
+// a manifest repo must become served with zero config changes after startup.
+#[mononoke::test]
+fn test_watcher_bootstrap_serves_manifest_repos_without_a_change() {
+    let spec_path = "test/repos/good";
+    let manifest = TierManifest {
+        repos: vec![TierRepoEntry {
+            repo_name: "good/repo".to_string(),
+            repo_id: 1,
+            config_path: spec_path.to_string(),
+            is_deep_sharded: false,
+            ..Default::default()
+        }],
+        storage: test_storage_map(),
+        common: test_raw_common_config("manifest_tier"),
+        ..Default::default()
+    };
+    assert!(
+        parse_manifest_common_and_storage(&manifest).is_ok(),
+        "fixture must parse, else construction fails closed and the test \
+         cannot observe the bootstrap"
+    );
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+    let spec_json = valid_repo_spec_json(1, "good/repo");
+    let store = make_store(&[
+        (TEST_MANIFEST_PATH, manifest_json.as_str()),
+        (spec_path, spec_json.as_str()),
+    ]);
+    let rt = test_runtime();
+
+    let cfg = MononokeConfigs::new(
+        TEST_CONFIG_PATH,
+        &store,
+        Some(TEST_MANIFEST_PATH),
+        rt.handle().clone(),
+    )
+    .expect("manifest mode must construct");
+
+    // Poll: the bootstrap needs no config fire, only scheduling on the watcher task.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !cfg.repo_configs().repos.contains_key("good/repo") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bootstrap pass never subscribed+served the manifest repo; \
+             without it every per-repo reload defers forever"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

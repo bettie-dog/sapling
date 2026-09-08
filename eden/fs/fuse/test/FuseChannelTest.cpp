@@ -10,18 +10,22 @@
 #include "eden/fs/fuse/IoUringFuseTransport.h"
 
 #include <folly/Random.h>
+#include <folly/ScopeGuard.h>
 #include <folly/executors/GlobalExecutor.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 #if EDEN_HAVE_FUSE_IO_URING
 #include <fcntl.h>
 #include <folly/File.h>
+#include <sys/eventfd.h>
+#include <sys/resource.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #endif
 #include <cerrno>
 #include <system_error>
+#include <thread>
 
-#include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/EdenConfig.h"
@@ -29,7 +33,7 @@
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/test/CapturingScribeLogger.h"
+#include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/TestDispatcher.h"
 
@@ -48,6 +52,7 @@ folly::Logger straceLogger{"eden.strace"};
 // to pass even when the system is under fairly heavy CPU load.
 constexpr auto kTimeout = 1s;
 constexpr size_t kTraceBusCapacity = 25000;
+constexpr size_t kTestInvalidationQueueLimit = 4;
 
 fuse_entry_out genRandomLookupResponse(uint64_t nodeid) {
   fuse_entry_out response;
@@ -82,7 +87,9 @@ class FuseChannelTest : public ::testing::Test {
       size_t numThreads = 2,
       uint32_t fuseMaxPages = 0,
       bool useIoUring = false,
-      std::string ioUringKernelReleaseRegex = {}) {
+      std::string ioUringKernelReleaseRegex = {},
+      bool ioUringPreCreateQueues = false,
+      size_t numInvalidationThreads = 4) {
     auto testDispatcher = std::make_unique<TestDispatcher>(stats_.copy());
     dispatcher_ = testDispatcher.get();
     return makeFuseChannel(
@@ -111,7 +118,11 @@ class FuseChannelTest : public ::testing::Test {
         /*fuseMaxPages=*/fuseMaxPages,
         /*useIoUring=*/useIoUring,
         std::move(ioUringKernelReleaseRegex),
-        /*ioUringQueueDepth=*/8);
+        /*ioUringQueueDepth=*/8,
+        /*ioUringDisableIoWait=*/true,
+        /*ioUringSkipSelfWakeup=*/false,
+        ioUringPreCreateQueues,
+        numInvalidationThreads);
   }
 
   FuseChannel::StopFuture performInit(
@@ -153,15 +164,14 @@ class FuseChannelTest : public ::testing::Test {
 
   FakeFuse fuse_;
   EdenStatsPtr stats_ = makeRefPtr<EdenStats>();
-  ErrorLogger noopErrorLogger_{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger_{};
   // Error-logging tests inject capturingErrorLogger_ via errorLoggerOverride_
-  // so they can inspect what got logged to perfpipe_edenfs_errors.
-  std::shared_ptr<CapturingScribeLogger> scribe_ =
-      std::make_shared<CapturingScribeLogger>();
+  // so they can inspect what was sent to XplatLogger.
+  CapturingXplatLogger xplatLogger_;
   std::shared_ptr<EdenConfig> edenConfig_ = EdenConfig::createTestEdenConfig();
   std::shared_ptr<ReloadableConfig> reloadableConfig_ =
       std::make_shared<ReloadableConfig>(edenConfig_);
-  ErrorLogger capturingErrorLogger_{scribe_, SessionInfo{}, reloadableConfig_};
+  ErrorLogger capturingErrorLogger_{reloadableConfig_, &xplatLogger_};
   ErrorLogger* errorLoggerOverride_ = nullptr;
   TestDispatcher* dispatcher_;
   AbsolutePath mountPath_{canonicalPath("/fake/mount/path")};
@@ -304,6 +314,129 @@ TEST_F(FuseChannelTest, testInitDoesNotNegotiateIoUringOnDisallowedKernel) {
       static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
 }
 
+// Lowers RLIMIT_MEMLOCK for the duration of a test and restores it after.
+// Only the soft limit is touched, so this never needs privileges to undo.
+class MemlockSoftLimitGuard {
+ public:
+  explicit MemlockSoftLimitGuard(rlim_t softLimit) {
+    if (getrlimit(RLIMIT_MEMLOCK, &original_) != 0) {
+      return;
+    }
+    rlimit lowered = original_;
+    lowered.rlim_cur = softLimit;
+    lowered_ = setrlimit(RLIMIT_MEMLOCK, &lowered) == 0;
+  }
+
+  ~MemlockSoftLimitGuard() {
+    if (lowered_) {
+      setrlimit(RLIMIT_MEMLOCK, &original_);
+    }
+  }
+
+  bool lowered() const {
+    return lowered_;
+  }
+
+ private:
+  rlimit original_ = {};
+  bool lowered_{false};
+};
+
+// The failure this whole path exists for: a single ring fits, so io_uring
+// looks available, but the full set of queues does not. Eden must notice
+// before it answers FUSE_INIT and mount over /dev/fuse instead -- once the
+// reply advertises io_uring there is no way back.
+TEST_F(FuseChannelTest, testInitFallsBackToDevFuseWhenQueuesDoNotFit) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/true,
+      /*ioUringKernelReleaseRegex=*/"^" + getRunningKernelReleaseForTest(),
+      /*ioUringPreCreateQueues=*/true);
+  // Runs the single-ring probe and memoizes it as available, exactly as it
+  // would be on a host with enough headroom for one ring at mount time.
+  if (folly::StringPiece{channel->getDesiredTransportName()} !=
+      kIoUringFuseTransportName) {
+    GTEST_SKIP()
+        << "FUSE io_uring transport is not available in this test environment";
+  }
+
+  MemlockSoftLimitGuard memlockGuard{0};
+  if (!memlockGuard.lowered()) {
+    GTEST_SKIP() << "could not lower RLIMIT_MEMLOCK";
+  }
+  // CAP_IPC_LOCK bypasses RLIMIT_MEMLOCK entirely, so confirm the limit
+  // actually bites here before relying on it to force the failure.
+  folly::File devNull{"/dev/null", O_RDWR};
+  if (!IoUringFuseTransport::getMaybeSetupError(8, devNull.fd())) {
+    GTEST_SKIP() << "RLIMIT_MEMLOCK is not enforced in this environment";
+  }
+
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      0,
+      FUSE_INIT_EXT,
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+
+  EXPECT_FALSE(channel->usesIoUringTransport());
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  // The kernel must not have been told io_uring was in play.
+  EXPECT_FALSE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+}
+
+// The other half: when the queues do fit, pre-creating them must not change
+// what gets negotiated.
+TEST_F(FuseChannelTest, testInitNegotiatesIoUringWhenQueuesArePreCreated) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/true,
+      /*ioUringKernelReleaseRegex=*/"^" + getRunningKernelReleaseForTest(),
+      /*ioUringPreCreateQueues=*/true);
+  if (folly::StringPiece{channel->getDesiredTransportName()} !=
+      kIoUringFuseTransportName) {
+    GTEST_SKIP()
+        << "FUSE io_uring transport is not available in this test environment";
+  }
+
+  // One queue per logical CPU is about to be created for real, so skip rather
+  // than fail where the environment cannot house them.
+  rlimit memlock = {};
+  const auto queueCount = static_cast<rlim_t>(std::max(get_nprocs_conf(), 1));
+  if (getrlimit(RLIMIT_MEMLOCK, &memlock) == 0 &&
+      memlock.rlim_cur != RLIM_INFINITY &&
+      memlock.rlim_cur < queueCount * 64 * 1024) {
+    GTEST_SKIP() << "RLIMIT_MEMLOCK is too low to pre-create " << queueCount
+                 << " io_uring queues";
+  }
+
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      0,
+      FUSE_INIT_EXT,
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+
+  EXPECT_TRUE(channel->usesIoUringTransport());
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_TRUE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+}
+
 TEST_F(FuseChannelTest, testTakeoverKeepsDevFuseWithoutNegotiatedIoUring) {
   auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/0, true);
   fuse_init_out connInfo = {};
@@ -418,7 +551,7 @@ TEST_F(FuseChannelTest, ioUringDisableIoWaitAppliesNoIoWait) {
 
   IoUringFuseTransport transport{kQueueDepth, /*disableIoWait=*/true};
   IoUringFuseTransport::RingQueue queue;
-  transport.initializeQueue(queue, devNull.fd());
+  transport.createQueueRing(queue, devNull.fd());
 
   if (!(queue.ring.features & IORING_FEAT_NO_IOWAIT)) {
     GTEST_SKIP() << "kernel lacks IORING_FEAT_NO_IOWAIT";
@@ -435,9 +568,45 @@ TEST_F(FuseChannelTest, ioUringDefaultDoesNotDisableIoWait) {
 
   IoUringFuseTransport transport{kQueueDepth};
   IoUringFuseTransport::RingQueue queue;
-  transport.initializeQueue(queue, devNull.fd());
+  transport.createQueueRing(queue, devNull.fd());
 
   EXPECT_FALSE(queue.ring.int_flags & IORING_ENTER_NO_IOWAIT);
+}
+
+TEST_F(FuseChannelTest, ioUringRequestStopWakeupBeforeRingPoolPublished) {
+  constexpr uint32_t kQueueDepth = 4;
+  IoUringFuseTransport transport{kQueueDepth};
+  // requestStopWakeup() can run on the shutdown thread before any worker
+  // thread has called initializeSession()/initializeRingPool(), i.e. before
+  // ringPool_ is published. It must be a safe no-op in that case rather than
+  // racing the plain unique_ptr read.
+  EXPECT_NO_THROW(transport.requestStopWakeup());
+}
+
+TEST_F(FuseChannelTest, ioUringStopWakeupBeforeEventFdPublished) {
+  folly::File devNull{"/dev/null", O_RDWR};
+  constexpr uint32_t kQueueDepth = 4;
+  if (IoUringFuseTransport::getMaybeSetupError(kQueueDepth, devNull.fd())) {
+    GTEST_SKIP() << "io_uring setup unavailable in this environment";
+  }
+
+  IoUringFuseTransport transport{kQueueDepth};
+  IoUringFuseTransport::RingQueue queue;
+
+  // Simulate requestStopWakeup() racing ahead of createQueueRing(): the
+  // queue's eventfd hasn't been published yet, so this must record the
+  // pending wakeup instead of silently dropping it.
+  transport.requestQueueStopWakeup(queue);
+
+  transport.createQueueRing(queue, devNull.fd());
+
+  // createQueueRing() must self-notify the freshly published eventfd,
+  // otherwise the worker could block indefinitely in
+  // io_uring_submit_and_wait() waiting for a wakeup that was already
+  // requested.
+  eventfd_t value = 0;
+  ASSERT_EQ(0, eventfd_read(queue.eventFd.load(), &value));
+  EXPECT_EQ(1, value);
 }
 #endif
 
@@ -572,7 +741,7 @@ TEST_F(FuseChannelTest, testDestroyWithPendingRequests) {
 }
 
 TEST_F(FuseChannelTest, unexpectedErrnoIsLogged) {
-  // EIO is a genuine failure, so it should be logged to perfpipe_edenfs_errors.
+  // EIO is a genuine failure, so it should be logged to edenfs_errors.
   edenConfig_->enableErrorLogging.setValue(true, ConfigSourceType::UserConfig);
   errorLoggerOverride_ = &capturingErrorLogger_;
   auto channel = createChannel();
@@ -586,7 +755,7 @@ TEST_F(FuseChannelTest, unexpectedErrnoIsLogged) {
   EXPECT_EQ(id, received.header.unique);
   EXPECT_NE(0, received.header.error);
 
-  EXPECT_EQ(1, scribe_->messages().size());
+  EXPECT_EQ(1, xplatLogger_.events().size());
 }
 
 TEST_F(FuseChannelTest, expectedErrnoIsNotLogged) {
@@ -604,7 +773,7 @@ TEST_F(FuseChannelTest, expectedErrnoIsNotLogged) {
   EXPECT_EQ(id, received.header.unique);
   EXPECT_NE(0, received.header.error);
 
-  EXPECT_TRUE(scribe_->messages().empty());
+  EXPECT_TRUE(xplatLogger_.events().empty());
 }
 
 TEST_F(FuseChannelTest, interruptLookups) {
@@ -822,4 +991,371 @@ TEST_F(FuseChannelTest, testAllowIdmapNotSetWhenKernelLacksSupport) {
 }
 #endif
 
+TEST_F(FuseChannelTest, flushPreventsLaterDispatchWhileWaiting) {
+  auto channelPtr = createChannel();
+  if (!channelPtr) {
+    FAIL() << "createChannel returned null";
+  }
+  auto& channel = *channelPtr;
+  channel.inflightInvalidations_.store(1, std::memory_order_release);
+
+  channel.invalidationThreads_.emplace_back(
+      [&] { channel.invalidationThread(); });
+  channel.invalidationThreads_.emplace_back(
+      [&] { channel.invalidationThread(); });
+  SCOPE_EXIT {
+    channel.inflightInvalidations_.store(0, std::memory_order_release);
+    {
+      std::lock_guard lock{channel.inflightInvalidationsMutex_};
+      channel.inflightInvalidationsCV_.notify_all();
+    }
+    if (!channel.invalidationThreads_.empty()) {
+      channel.stopInvalidationThread();
+    }
+  };
+
+  auto firstFlush = channel.completeInvalidations();
+
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (channel.invalidationQueue_.lock()->flushInProgress) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(channel.invalidationQueue_.lock()->flushInProgress);
+
+  auto secondFlush = channel.completeInvalidations();
+
+  EXPECT_FALSE(firstFlush.isReady());
+  EXPECT_FALSE(secondFlush.isReady());
+  {
+    auto queue = channel.invalidationQueue_.lock();
+    EXPECT_TRUE(queue->flushInProgress);
+    ASSERT_EQ(1, queue->queue.size());
+    EXPECT_EQ(FuseChannel::InvalidationType::FLUSH, queue->queue.front().type);
+  }
+
+  channel.inflightInvalidations_.store(0, std::memory_order_release);
+  {
+    std::lock_guard lock{channel.inflightInvalidationsMutex_};
+    channel.inflightInvalidationsCV_.notify_all();
+  }
+
+  std::move(firstFlush).get(kTimeout);
+  std::move(secondFlush).get(kTimeout);
+}
+
+TEST_F(FuseChannelTest, stopEntryDrainsQueuedFlushes) {
+  auto channelPtr = createChannel();
+  if (!channelPtr) {
+    FAIL() << "createChannel returned null";
+  }
+  auto& channel = *channelPtr;
+  channel.inflightInvalidations_.store(1, std::memory_order_release);
+
+  channel.invalidationThreads_.emplace_back(
+      [&] { channel.invalidationThread(); });
+  channel.invalidationThreads_.emplace_back(
+      [&] { channel.invalidationThread(); });
+  std::thread stopper;
+  SCOPE_EXIT {
+    channel.inflightInvalidations_.store(0, std::memory_order_release);
+    {
+      std::lock_guard lock{channel.inflightInvalidationsMutex_};
+      channel.inflightInvalidationsCV_.notify_all();
+    }
+    if (stopper.joinable()) {
+      stopper.join();
+    }
+    if (!channel.invalidationThreads_.empty()) {
+      channel.stopInvalidationThread();
+    }
+  };
+
+  auto firstFlush = channel.completeInvalidations();
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (channel.invalidationQueue_.lock()->flushInProgress) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(channel.invalidationQueue_.lock()->flushInProgress);
+
+  auto secondFlush = channel.completeInvalidations();
+  std::atomic<bool> stopFinished{false};
+  stopper = std::thread([&] {
+    channel.stopInvalidationThread();
+    stopFinished.store(true, std::memory_order_release);
+  });
+
+  deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (channel.invalidationQueue_.lock()->state ==
+        FuseChannel::InvalidationQueueState::DRAINING) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(
+      FuseChannel::InvalidationQueueState::DRAINING,
+      channel.invalidationQueue_.lock()->state);
+  EXPECT_FALSE(stopFinished.load(std::memory_order_acquire));
+
+  const auto queueSizeBeforeRejectedEntry =
+      channel.invalidationQueue_.lock()->queue.size();
+  channel.invalidateEntry(InodeNumber{1}, "new"_pc);
+  EXPECT_EQ(
+      queueSizeBeforeRejectedEntry,
+      channel.invalidationQueue_.lock()->queue.size());
+  std::move(channel.completeInvalidations()).get(kTimeout);
+
+  channel.inflightInvalidations_.store(0, std::memory_order_release);
+  {
+    std::lock_guard lock{channel.inflightInvalidationsMutex_};
+    channel.inflightInvalidationsCV_.notify_all();
+  }
+  stopper.join();
+
+  EXPECT_TRUE(stopFinished.load(std::memory_order_acquire));
+  std::move(firstFlush).get(kTimeout);
+  std::move(secondFlush).get(kTimeout);
+  auto queue = channel.invalidationQueue_.lock();
+  EXPECT_EQ(FuseChannel::InvalidationQueueState::STOPPED, queue->state);
+  EXPECT_TRUE(queue->queue.empty());
+}
+
+TEST_F(FuseChannelTest, singleInvalidationThreadUsesSerialFlush) {
+  auto channelPtr = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/false,
+      /*ioUringKernelReleaseRegex=*/{},
+      /*ioUringPreCreateQueues=*/false,
+      /*numInvalidationThreads=*/1);
+  if (!channelPtr) {
+    FAIL() << "createChannel returned null";
+  }
+  auto& channel = *channelPtr;
+  channel.inflightInvalidations_.store(1, std::memory_order_release);
+
+  channel.invalidationThreads_.emplace_back(
+      [&] { channel.invalidationThread(); });
+  SCOPE_EXIT {
+    if (!channel.invalidationThreads_.empty()) {
+      channel.stopInvalidationThread();
+    }
+  };
+
+  auto flush = channel.completeInvalidations();
+  std::move(flush).get(kTimeout);
+  EXPECT_FALSE(channel.invalidationQueue_.lock()->flushInProgress);
+}
+
+TEST_F(FuseChannelTest, zeroInvalidationThreadsUsesOneWorker) {
+  auto channelPtr = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/false,
+      /*ioUringKernelReleaseRegex=*/{},
+      /*ioUringPreCreateQueues=*/false,
+      /*numInvalidationThreads=*/0);
+  if (!channelPtr) {
+    FAIL() << "createChannel returned null";
+  }
+  auto& channel = *channelPtr;
+
+  EXPECT_EQ(1, channel.numInvalidationThreads_);
+}
+
+TEST_F(FuseChannelTest, excessiveInvalidationThreadsAreCapped) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/false,
+      /*ioUringKernelReleaseRegex=*/{},
+      /*ioUringPreCreateQueues=*/false,
+      /*numInvalidationThreads=*/1'000);
+
+  EXPECT_EQ(64, channel->numInvalidationThreads_);
+}
+
+TEST_F(FuseChannelTest, concurrentInvalidationStopsAreSerialized) {
+  auto channel = createChannel();
+  channel->invalidationThreads_.emplace_back(
+      [&] { channel->invalidationThread(); });
+  channel->invalidationThreads_.emplace_back(
+      [&] { channel->invalidationThread(); });
+
+  std::atomic<size_t> ready{0};
+  std::atomic<bool> start{false};
+  auto stop = [&] {
+    ready.fetch_add(1, std::memory_order_release);
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    channel->stopInvalidationThread();
+  };
+  std::thread first{stop};
+  std::thread second{stop};
+  while (ready.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  first.join();
+  second.join();
+
+  EXPECT_TRUE(channel->invalidationThreads_.empty());
+  EXPECT_EQ(
+      FuseChannel::InvalidationQueueState::STOPPED,
+      channel->invalidationQueue_.lock()->state);
+}
+
+TEST_F(FuseChannelTest, invalidationWaitsForQueueCapacity) {
+  auto channel = createChannel();
+  {
+    auto queue = channel->invalidationQueue_.lock();
+    for (size_t i = 0; i < kTestInvalidationQueueLimit; ++i) {
+      queue->queue.emplace_back(InodeNumber{1}, "queued"_pc);
+    }
+  }
+
+  folly::CancellationSource cancellationSource;
+  std::atomic<bool> finished{false};
+  bool enqueued = false;
+  std::thread producer([&] {
+    enqueued = channel->invalidateEntryWithQueueLimit(
+        InodeNumber{1},
+        "new"_pc,
+        kTestInvalidationQueueLimit,
+        cancellationSource.getToken());
+    finished.store(true, std::memory_order_release);
+  });
+  SCOPE_EXIT {
+    cancellationSource.requestCancellation();
+    channel->invalidationCapacityCV_.notify_all();
+    if (producer.joinable()) {
+      producer.join();
+    }
+  };
+
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (channel->invalidationCapacityWaiters_.load(
+             std::memory_order_relaxed) == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(
+      1, channel->invalidationCapacityWaiters_.load(std::memory_order_relaxed));
+  EXPECT_FALSE(finished.load(std::memory_order_acquire));
+
+  {
+    auto queue = channel->invalidationQueue_.lock();
+    queue->queue.pop_front();
+  }
+  channel->invalidationCapacityCV_.notify_one();
+  producer.join();
+
+  EXPECT_TRUE(enqueued);
+  EXPECT_EQ(
+      0, channel->invalidationCapacityWaiters_.load(std::memory_order_relaxed));
+  EXPECT_EQ(
+      kTestInvalidationQueueLimit,
+      channel->invalidationQueue_.lock()->queue.size());
+}
+
+TEST_F(FuseChannelTest, zeroInvalidationQueueCapacityRejectsEntry) {
+  auto channel = createChannel();
+  folly::CancellationSource cancellationSource;
+
+  EXPECT_FALSE(channel->invalidateEntryWithQueueLimit(
+      InodeNumber{1}, "new"_pc, 0, cancellationSource.getToken()));
+}
+
+TEST_F(FuseChannelTest, invalidationQueueWaitIsCancellable) {
+  auto channel = createChannel();
+  {
+    auto queue = channel->invalidationQueue_.lock();
+    for (size_t i = 0; i < kTestInvalidationQueueLimit; ++i) {
+      queue->queue.emplace_back(InodeNumber{1}, "queued"_pc);
+    }
+  }
+
+  folly::CancellationSource cancellationSource;
+  std::atomic<bool> started{false};
+  bool enqueued = true;
+  std::thread producer([&] {
+    started.store(true, std::memory_order_release);
+    enqueued = channel->invalidateEntryWithQueueLimit(
+        InodeNumber{1},
+        "new"_pc,
+        kTestInvalidationQueueLimit,
+        cancellationSource.getToken());
+  });
+  SCOPE_EXIT {
+    cancellationSource.requestCancellation();
+    channel->invalidationCapacityCV_.notify_all();
+    if (producer.joinable()) {
+      producer.join();
+    }
+  };
+
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (!started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(started.load(std::memory_order_acquire));
+  cancellationSource.requestCancellation();
+  producer.join();
+
+  EXPECT_FALSE(enqueued);
+  EXPECT_EQ(
+      kTestInvalidationQueueLimit,
+      channel->invalidationQueue_.lock()->queue.size());
+}
+
+TEST_F(FuseChannelTest, invalidationQueueShutdownUnblocksProducer) {
+  auto channel = createChannel();
+  {
+    auto queue = channel->invalidationQueue_.lock();
+    for (size_t i = 0; i < kTestInvalidationQueueLimit; ++i) {
+      queue->queue.emplace_back(InodeNumber{1}, "queued"_pc);
+    }
+  }
+
+  folly::CancellationSource cancellationSource;
+  std::atomic<bool> started{false};
+  bool enqueued = true;
+  std::thread producer([&] {
+    started.store(true, std::memory_order_release);
+    enqueued = channel->invalidateEntryWithQueueLimit(
+        InodeNumber{1},
+        "new"_pc,
+        kTestInvalidationQueueLimit,
+        cancellationSource.getToken());
+  });
+  SCOPE_EXIT {
+    cancellationSource.requestCancellation();
+    if (producer.joinable()) {
+      producer.join();
+    }
+  };
+
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (!started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(started.load(std::memory_order_acquire));
+
+  channel->stopInvalidationThread();
+  producer.join();
+
+  EXPECT_FALSE(enqueued);
+  EXPECT_EQ(
+      FuseChannel::InvalidationQueueState::STOPPED,
+      channel->invalidationQueue_.lock()->state);
+}
 } // namespace facebook::eden

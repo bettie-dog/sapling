@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -29,11 +30,21 @@
 #include <folly/Exception.h>
 #include <folly/FileUtil.h>
 #include <folly/Indestructible.h>
+#include <folly/Random.h>
+#include <folly/ScopeGuard.h>
 #include <folly/SocketAddress.h>
+#include <folly/String.h>
+#include <folly/portability/Unistd.h>
 
 #include <folly/json/json.h>
 #ifdef __APPLE__
 #include <folly/Subprocess.h> // @manual
+#endif
+#ifdef __linux__
+#include <folly/container/F14Map.h>
+#include <sys/sysmacros.h>
+#include "eden/common/utils/SpawnedProcess.h"
+#include "eden/fs/utils/MountInfoTable.h"
 #endif
 #include <folly/chrono/Conv.h>
 #include <folly/coro/Invoke.h>
@@ -60,7 +71,6 @@
 #include "eden/common/telemetry/RequestMetricsScope.h"
 #include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/telemetry/StructuredLoggerFactory.h"
-#include "eden/common/telemetry/SubprocessScribeLogger.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/FileUtils.h"
@@ -80,9 +90,12 @@
 #include "eden/fs/journal/Journal.h"
 #include "eden/fs/nfs/NfsServer.h"
 #include "eden/fs/notifications/NullNotifier.h"
+#include "eden/fs/privhelper/PinScan.h"
 #include "eden/fs/privhelper/PrivHelper.h"
+#include "eden/fs/privhelper/PrivHelperImpl.h"
 #include "eden/fs/service/EdenCPUThreadPool.h"
 #include "eden/fs/service/EdenServiceHandler.h"
+#include "eden/fs/service/PinScanRunner.h"
 #include "eden/fs/service/StartupLogger.h"
 #include "eden/fs/service/StartupStatusSubscriber.h"
 #include "eden/fs/service/ThriftStreamStartupStatusSubscriber.h"
@@ -383,7 +396,7 @@ folly::Try<folly::dynamic> collectNFSUtilStats() {
     auto nfsStatProc =
         SpawnedProcess({"nfsstat", "-f", "JSON"}, std::move(opts));
     std::string nfsStatOutputString = nfsStatProc.communicate().first;
-    nfsStatProc.waitTimeout(1s);
+    nfsStatProc.waitOrTerminateOrKill(1s, 1s);
     return folly::Try<folly::dynamic>(folly::parseJson(nfsStatOutputString));
   } catch (const std::exception& e) {
     return folly::Try<folly::dynamic>(e);
@@ -484,35 +497,6 @@ std::shared_ptr<folly::Executor> makePrefetchFilesV2Threads(
         edenConfig->numPrefetchThreads.getValue(), "PrefetchFilesV2ThreadPool");
   }
   return nullptr;
-}
-
-std::shared_ptr<ErrorLogger> makeErrorLogger(
-    const EdenConfig& edenConfig,
-    SessionInfo sessionInfo,
-    std::shared_ptr<ReloadableConfig> config,
-    EdenStatsPtr edenStats,
-    IXplatLogger* xplatLogger) {
-  auto scribeBinary = edenConfig.scribeLogger.getValue();
-  auto errorCategory = edenConfig.errorScribeCategory.getValue();
-  std::shared_ptr<ScribeLogger> scribeLogger;
-  if (!scribeBinary.empty() && !errorCategory.empty()) {
-    try {
-      scribeLogger = std::make_shared<SubprocessScribeLogger>(
-          scribeBinary.c_str(), errorCategory);
-    } catch (const std::exception& ex) {
-      edenStats->increment(&TelemetryStats::subprocessLoggerFailure, 1);
-      XLOGF(
-          ERR,
-          "Failed to create scribe logger for ErrorLogger: {}. Error logging is disabled.",
-          folly::exceptionStr(ex));
-    }
-  }
-  return std::make_shared<ErrorLogger>(
-      std::move(scribeLogger),
-      std::move(sessionInfo),
-      std::move(config),
-      xplatLogger,
-      std::move(edenStats));
 }
 
 #ifndef _WIN32
@@ -728,26 +712,21 @@ EdenServer::EdenServer(
           edenStats.copy(),
           config_)},
 #endif
-      errorLogger_{makeErrorLogger(
-          *edenConfig,
-          sessionInfo,
+      errorLogger_{std::make_shared<ErrorLogger>(
           config_,
-          edenStats.copy(),
-#ifdef EDEN_HAVE_LOGGER
-          xplatLogger_.get()
-#else
-          nullptr
-#endif
-              )},
-      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
-          structuredLogger_,
 #ifdef EDEN_HAVE_LOGGER
           xplatLogger_.get(),
 #else
           nullptr,
 #endif
-          config_,
           edenStats.copy())},
+      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
+#ifdef EDEN_HAVE_LOGGER
+          xplatLogger_
+#else
+          nullptr
+#endif
+          )},
       serverState_{make_shared<ServerState>(
           std::move(userInfo),
           std::move(edenStats),
@@ -797,8 +776,7 @@ EdenServer::EdenServer(
       checkoutRevisionExecutor_{
           makeCheckoutRevisionThreads(thriftUseCheckoutExecutor_, edenConfig)},
       thriftUsePrefetchExecutor_{
-          edenConfig->thriftUsePrefetchExecutor.getValue() &&
-          edenConfig->prefetchOptimizations.getValue()},
+          edenConfig->thriftUsePrefetchExecutor.getValue()},
       prefetchFilesV2Executor_{
           makePrefetchFilesV2Threads(thriftUsePrefetchExecutor_, edenConfig)},
       runningMountHealthChecks_{std::make_shared<
@@ -939,6 +917,8 @@ void EdenServer::registerXplatTransforms() {
   // Bind the shared telemetry identity into each transform via a capturing
   // lambda so the generic core stays identity-agnostic.
   const auto& identity = xplatLogger_->getTelemetryIdentity();
+  const auto periodicUsernameProvider =
+      xplatLogger_->getPeriodicUsernameProvider();
   xplatLogger_->registerTransform(
       std::string{xplat_keys::kFileAccessCategory},
       "GeneratedEdenfsFileAccessesLoggerConfig",
@@ -948,8 +928,9 @@ void EdenServer::registerXplatTransforms() {
   xplatLogger_->registerTransform(
       std::string{xplat_keys::kEventsCategory},
       "GeneratedEdenfsEventsLoggerConfig",
-      [identity](const DynamicEvent& event) {
-        return edenfsEventsTransform(identity, event);
+      [identity, periodicUsernameProvider](const DynamicEvent& event) {
+        return edenfsEventsTransform(
+            identity, event, periodicUsernameProvider.get());
       });
   xplatLogger_->registerTransform(
       std::string{xplat_keys::kErrorsCategory},
@@ -2010,7 +1991,10 @@ bool EdenServer::performCleanup() {
       shutdownFuture = std::move(state->shutdownFuture);
     }
     XDCHECK_EQ(state->state, RunState::SHUTTING_DOWN);
-    state->state = RunState::SHUTTING_DOWN;
+    // A no-op today: every path that reaches performCleanup has already
+    // transitioned. Routed through the helper so that a future path which has
+    // not still picks up whatever the helper does.
+    markShuttingDownLocked(*state);
   }
 
 #ifdef EDEN_HAVE_SERVER_OBSERVER
@@ -2073,19 +2057,21 @@ folly::SemiFuture<Unit> EdenServer::performNormalShutdown() {
 void EdenServer::shutdownPrivhelper() {
   // Explicitly stop the privhelper process so we can verify that it
   // exits normally.
+  // stop() returns the privhelper's wait() status: >0 = exit code,
+  // <0 = negated kill signal.
   const auto privhelperExitCode = serverState_->getPrivHelper()->stop();
   if (privhelperExitCode != 0) {
+    int64_t exitCode = 0;
+    int64_t exitSignal = 0;
     if (privhelperExitCode > 0) {
-      XLOG(
-          ERR,
-          "privhelper process exited with unexpected code {}",
-          privhelperExitCode);
+      exitCode = privhelperExitCode;
+      XLOGF(ERR, "privhelper process exited with unexpected code {}", exitCode);
     } else {
-      XLOGF(
-          ERR,
-          "privhelper process was killed by signal {}",
-          privhelperExitCode);
+      exitSignal = -privhelperExitCode;
+      XLOGF(ERR, "privhelper process was killed by signal {}", exitSignal);
     }
+    serverState_->getEdenFsEventsLogger()->logEvent(
+        PrivhelperShutdown{exitCode, exitSignal});
   }
 }
 
@@ -2498,10 +2484,26 @@ void EdenServer::mountFinished(
 
   std::move(shutdownFuture)
       .via(getMainEventBase())
-      .thenTry([unmountPromise = std::move(unmountPromise),
+      .thenTry([this,
+                mountPath = mountPath,
+                unmountPromise = std::move(unmountPromise),
                 takeoverPromise = std::move(takeoverPromise),
                 takeoverData = std::move(takeover)](
                    folly::Try<SerializedInodeMap>&& result) mutable {
+        // Erase the EdenMount from mountPoints_ before fulfilling the
+        // promises. Fulfilling unmountPromise releases the unmountV2
+        // response on another thread, and a caller that was told the
+        // unmount succeeded must not still see the mount in listMounts():
+        // `eden rm` relies on that to delete the checkout's configuration
+        // without leaving the daemon serving a mount that no on-disk
+        // configuration describes.
+        {
+          const auto mountPoints = mountPoints_->wlock();
+          const auto it = mountPoints->find(mountPath);
+          if (it != mountPoints->end()) {
+            mountPoints->erase(it);
+          }
+        }
         if (takeoverPromise) {
           takeoverPromise.value().setWith([&]() mutable {
             takeoverData.value().inodeMap = std::move(result.value());
@@ -2513,14 +2515,6 @@ void EdenServer::mountFinished(
               result.throwUnlessValue();
               return Unit{};
             }));
-      })
-      .ensure([this, mountPath] {
-        // Erase the EdenMount from our mountPoints_ map
-        const auto mountPoints = mountPoints_->wlock();
-        const auto it = mountPoints->find(mountPath);
-        if (it != mountPoints->end()) {
-          mountPoints->erase(it);
-        }
       });
 }
 
@@ -3001,6 +2995,167 @@ void EdenServer::prepareThriftAddress() const {
   server_->useExistingSocket(std::move(sock));
 }
 
+#ifdef __APPLE__
+std::optional<folly::dynamic> EdenServer::getRelaunchCommand() {
+  auto cached = relaunchCommand_.wlock();
+  if (cached->has_value()) {
+    return *cached;
+  }
+
+  const auto argsPath = edenDir_.getDaemonArgsPath();
+  folly::dynamic relaunchArgv = folly::dynamic::array;
+  folly::dynamic relaunchEnv = folly::dynamic::object;
+  try {
+    std::string contents;
+    if (!folly::readFile(argsPath.c_str(), contents)) {
+      XLOGF(
+          DBG2,
+          "no daemon args file at {}; edenfs will not be auto-restarted",
+          argsPath);
+      return std::nullopt;
+    }
+
+    const auto parsed = folly::parseJson(contents);
+    const auto* restartCmd = parsed.get_ptr("restart_cmd");
+    if (!restartCmd || !restartCmd->isArray() || restartCmd->empty()) {
+      XLOGF(
+          WARN,
+          "daemon args file {} has no usable restart_cmd; edenfs will not be auto-restarted",
+          argsPath);
+      return std::nullopt;
+    }
+    for (const auto& arg : *restartCmd) {
+      relaunchArgv.push_back(arg.asString());
+    }
+    if (const auto* env = parsed.get_ptr("env"); env && env->isObject()) {
+      for (const auto& [key, value] : env->items()) {
+        relaunchEnv[key.asString()] = value.asString();
+      }
+    }
+  } catch (const std::exception& ex) {
+    XLOGF(
+        WARN,
+        "failed to read daemon args file {}: {}",
+        argsPath,
+        folly::exceptionStr(ex));
+    return std::nullopt;
+  }
+
+  if (relaunchEnv.empty()) {
+    // The privhelper replaces the child's environment wholesale, so relaunching
+    // with nothing would give the new daemon no PATH, HOME or USER.
+    XLOGF(
+        WARN,
+        "daemon args file {} has an empty environment; edenfs will not be auto-restarted",
+        argsPath);
+    return std::nullopt;
+  }
+
+  *cached = folly::dynamic::object("argv", std::move(relaunchArgv))(
+      "env", std::move(relaunchEnv));
+  return *cached;
+}
+#endif // __APPLE__
+
+void EdenServer::armPrivHelperRestart() {
+#ifdef __APPLE__
+  const auto config = serverState_->getEdenConfig();
+  if (!config->restartEdenfsOnCrash.getValue()) {
+    return;
+  }
+
+  const auto relaunch = getRelaunchCommand();
+  if (!relaunch.has_value()) {
+    return;
+  }
+
+  EdenFsRestartArgs args;
+  args.enabled = true;
+  // Carry forward the budget spent by the privhelper that spawned us, so that
+  // a daemon crashing in a loop is stopped rather than restarted for ever.
+  args.restartCount = static_cast<uint32_t>(std::min<uint64_t>(
+      readEdenFsRestartCounterEnv(kEdenFsRestartCountEnv),
+      std::numeric_limits<uint32_t>::max()));
+  args.firstRestartEpochSec =
+      readEdenFsRestartCounterEnv(kEdenFsFirstRestartAtEnv);
+  args.maxRestarts = config->restartEdenfsMaxCount.getValue();
+  args.windowSeconds = std::max(
+      uint32_t{1},
+      static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                config->restartEdenfsWindow.getValue())
+                                .count()));
+
+  const auto sentinel = edenDir_.getRestartSentinelPath();
+  args.sentinelPath = sentinel.asString();
+  // Never 0: that value is reserved for the absent nonce a sentinel from an
+  // older daemon reads as. Bounded to 63 bits so it survives folly::dynamic's
+  // signed integer as a positive number.
+  args.sentinelNonce = folly::Random::rand64(1, uint64_t{1} << 63);
+  // The sentinel carries the relaunch command as well as arming the privhelper,
+  // so the RPC never has to. Written before the request, so the privhelper
+  // never sees a missing path and concludes that we already disarmed.
+  const folly::dynamic command = folly::dynamic::object(
+      "argv", relaunch->at("argv"))("env", relaunch->at("env"))(
+      "nonce", static_cast<int64_t>(args.sentinelNonce));
+  // Atomically, onto a file created for this write: the root privhelper refuses
+  // a sentinel that anyone but us can write, and a mode passed to open() would
+  // leave whatever an earlier generation left behind in place.
+  if (const int rc = folly::writeFileAtomicNoThrow(
+          sentinel.asString(),
+          folly::toJson(command),
+          folly::WriteFileAtomicOptions().setPermissions(0600));
+      rc != 0) {
+    XLOGF(
+        WARN,
+        "failed to create {}: {}; edenfs will not be auto-restarted",
+        sentinel,
+        folly::errnoStr(rc));
+    return;
+  }
+
+  // Cannot be waited on: the reply is driven by the main EventBase, the thread
+  // we are on. The continuation carries no executor, so it runs inline on
+  // whoever completes the request: that EventBase, or shutdownPrivhelper().
+  folly::futures::detachOnGlobalCPUExecutor(
+      serverState_->getPrivHelper()
+          ->setRestartArgs(args)
+          .thenTry([this](folly::Try<folly::Unit>&& result) {
+            if (result.hasException()) {
+              // Most likely a privhelper too old to know the request. Leave
+              // ourselves disarmed so that shutdown does not try to talk to it
+              // either.
+              XLOGF(
+                  WARN,
+                  "failed to send restart args to the privhelper: {}",
+                  result.exception().what());
+              removeRestartSentinel();
+              return;
+            }
+            privHelperRestartArmed_.store(true, std::memory_order_release);
+          })
+          .semi());
+#endif // __APPLE__
+}
+
+void EdenServer::markShuttingDownLocked(RunStateData& state) {
+  state.state = RunState::SHUTTING_DOWN;
+}
+
+void EdenServer::removeRestartSentinel() {
+  const auto sentinel = edenDir_.getRestartSentinelPath();
+  // A bare unlink() on purpose: one synchronous syscall that touches no event
+  // loop, so it still disarms when the loop is too wedged to deliver the
+  // clean-shutdown notification.
+  if (::unlink(sentinel.c_str()) != 0) {
+    // Captured before anything else can run: formatting the path below is not
+    // guaranteed to leave errno alone.
+    const int err = errno;
+    if (err != ENOENT) {
+      XLOGF(WARN, "failed to unlink {}: {}", sentinel, folly::errnoStr(err));
+    }
+  }
+}
+
 void EdenServer::stop() {
   {
     auto state = runningState_.wlock();
@@ -3011,7 +3166,7 @@ void EdenServer::stop() {
       XLOG(INFO, "stop was called while server was already shutting down");
       return;
     }
-    state->state = RunState::SHUTTING_DOWN;
+    markShuttingDownLocked(*state);
   }
 
   handler_->cancelAllActiveRequests("EdenServer::stop() called");
@@ -3093,7 +3248,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
     // if the takeover was unsuccessful.
     XCHECK(!state->shutdownFuture.valid());
     state->shutdownFuture = takeoverPromise.getFuture();
-    state->state = RunState::SHUTTING_DOWN;
+    markShuttingDownLocked(*state);
   }
 
   return serverState_->getFaultInjector()
@@ -3249,22 +3404,32 @@ void EdenServer::manageOverlay() {
   }
 }
 
-ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
+namespace {
+/**
+ * Directories pinned as process cwds/roots, which pressure GC must not
+ * invalidate (their ancestors are protected by the GC traversal itself; see
+ * TreeInode::FuseGcResult). nullptr means pin information is unavailable, in
+ * which case no directory entries are invalidated at all.
+ */
+using PinnedInodeSet = std::shared_ptr<const folly::F14FastSet<InodeNumber>>;
+
+ImmediateFuture<uint64_t> garbageCollectInodesWithLease(
     EdenMount& mount,
     TreeInodePtr inode,
     std::chrono::system_clock::time_point cutoff,
     const ObjectFetchContextPtr& context,
-    bool pressureBased) {
-  folly::stop_watch<> workingCopyRuntime;
+    bool pressureBased,
+    EdenMount::InodeGCLease lease,
+    folly::CancellationToken shutdownToken,
+    std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+    PinnedInodeSet pinnedInodes) {
+  struct InodeGCResult {
+    uint64_t numInvalidated;
+    size_t numUnloaded;
+    size_t zeroFsRefTreesRetained;
+  };
 
-  auto lease = mount.tryStartWorkingCopyGC(inode);
-  if (!lease) {
-    XLOGF(
-        DBG6,
-        "Not running GC for: {}, another GC is already in progress",
-        mount.getPath());
-    return 0u;
-  }
+  folly::stop_watch<> inodeGCRuntime;
 
   auto mountPath = mount.getPath();
   auto inodeCountsBeforeGC = mount.getInodeMap()->getInodeCounts();
@@ -3276,21 +3441,26 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
       pressureBased ? "pressure-based" : "config-based",
       mountPath,
       totalNumberOfInodesBeforeGC);
-  // Use the member cancellation source for this operation
-
-  auto gcToken = gcCancelSource_.rlock()->getToken();
+  auto gcToken = folly::cancellation_token_merge(
+      shutdownToken, lease.getCancellationToken());
+  auto keepRememberedParentTreesLoaded =
+      pressureBased && mount.getFuseChannel() != nullptr;
   return inode
       // First step of garbage collection varies by platform (e.g., Linux,
       // macOS, Windows)
-      ->handleChildrenNotAccessedRecently(cutoff, context, gcToken)
+      ->handleChildrenNotAccessedRecently(
+          cutoff, context, pressureBased, gcToken, std::move(pinnedInodes))
       // Wait for queued filesystem invalidations to drain before the unload
       // sweep. On FUSE, invalidation-triggered FORGETs may arrive too late for
       // this GC cycle if we start unloading immediately.
       .thenTry(
-          [&mount](folly::Try<uint64_t>&& invalidatedTry)
+          [&mount, gcToken](folly::Try<uint64_t>&& invalidatedTry)
               -> ImmediateFuture<uint64_t> {
             if (invalidatedTry.hasException()) {
               return makeFuture<uint64_t>(invalidatedTry.exception());
+            }
+            if (gcToken.isCancellationRequested()) {
+              return invalidatedTry.value();
             }
             return mount.flushInvalidations().thenValue(
                 [numInvalidated = invalidatedTry.value()](folly::Unit) {
@@ -3298,21 +3468,40 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
                 });
           })
       // Second step of garbage collection deletes all the unreferenced inodes
-      .ensure([inode, lease = std::move(lease)] {
-        inode->unloadChildrenUnreferencedByFs();
-      })
-      .thenTry([workingCopyRuntime,
-                edenFsEventsLogger = serverState_->getEdenFsEventsLogger(),
+      .thenTry(
+          [inode, gcToken, keepRememberedParentTreesLoaded](
+              folly::Try<uint64_t>&& invalidatedTry) -> InodeGCResult {
+            size_t numUnloaded = 0;
+            size_t zeroFsRefTreesRetained = 0;
+            if (!gcToken.isCancellationRequested()) {
+              if (keepRememberedParentTreesLoaded) {
+                auto unloadResult =
+                    inode->unloadChildrenUnreferencedByFsForInodeGC(gcToken);
+                numUnloaded = unloadResult.unloaded;
+                zeroFsRefTreesRetained = unloadResult.zeroFsRefTreesRetained;
+              } else {
+                numUnloaded = inode->unloadChildrenUnreferencedByFs(gcToken);
+              }
+            }
+            return {
+                invalidatedTry.value(), numUnloaded, zeroFsRefTreesRetained};
+          })
+      .ensure([lease = std::move(lease)] {})
+      .thenTry([inodeGCRuntime,
+                edenFsEventsLogger = std::move(edenFsEventsLogger),
+                &mount,
                 mountPath,
                 inodeMap = mount.getInodeMap(),
                 totalNumberOfInodesBeforeGC,
-                pressureBased](folly::Try<uint64_t> invalidatedTry) {
-        auto runtime =
-            std::chrono::duration<double>{workingCopyRuntime.elapsed()};
+                pressureBased](folly::Try<InodeGCResult> resultTry) {
+        auto runtime = std::chrono::duration<double>{inodeGCRuntime.elapsed()};
 
-        bool success = invalidatedTry.hasValue();
+        bool success = resultTry.hasValue();
         int64_t numInvalidated =
-            success ? folly::to_signed(invalidatedTry.value()) : 0;
+            success ? folly::to_signed(resultTry.value().numInvalidated) : 0;
+        size_t numUnloaded = success ? resultTry.value().numUnloaded : 0;
+        size_t zeroFsRefTreesRetained =
+            success ? resultTry.value().zeroFsRefTreesRetained : 0;
         auto inodeCountsAfterGC = inodeMap->getInodeCounts();
         auto totalNumberOfInodesAfterGC = inodeCountsAfterGC.fileCount +
             inodeCountsAfterGC.treeCount +
@@ -3324,17 +3513,22 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
             WorkingCopyGc{
                 runtime.count(), numInvalidated, success, inodeDelta});
         auto shouldLogAtDbg2 = runtime > std::chrono::seconds{5} ||
-            numInvalidated > 10'000 || inodeDelta > 10'000;
+            numInvalidated > 10'000 || inodeDelta > 10'000 ||
+            zeroFsRefTreesRetained > 10'000;
         auto logMessage = [&] {
           return fmt::format(
               "{} GC for: {}, completed in: {} seconds, "
-              "invalidated: {}, inodes before: {}, inodes after: {}",
+              "invalidated: {}, unloaded: {}, "
+              "inodes before: {}, inodes after: {}, "
+              "fsRefCount==0 trees retained: {}",
               pressureBased ? "Pressure-based" : "Config-based",
               mountPath,
               runtime.count(),
               numInvalidated,
+              numUnloaded,
               totalNumberOfInodesBeforeGC,
-              totalNumberOfInodesAfterGC);
+              totalNumberOfInodesAfterGC,
+              zeroFsRefTreesRetained);
         };
         if (shouldLogAtDbg2) {
           XLOG(DBG2) << logMessage();
@@ -3342,8 +3536,134 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
           XLOG(DBG4) << logMessage();
         }
 
-        return invalidatedTry.value();
+        if (success && pressureBased) {
+          mount.recordPressureGcOutcome(
+              resultTry.value().numInvalidated,
+              totalNumberOfInodesBeforeGC,
+              totalNumberOfInodesAfterGC);
+        }
+
+        return resultTry.value().numInvalidated;
       });
+}
+
+#ifdef __linux__
+struct PinScanData {
+  PinScanReport report;
+  folly::F14FastMap<std::string, uint64_t> devByMountPoint;
+};
+
+/**
+ * Run the privhelper's pin scan and map this daemon's mounts to the devices
+ * it reports. Returns std::nullopt if the scan could not be completed, in
+ * which case pressure GC must not invalidate any directory entries.
+ */
+std::optional<PinScanData> runPinnedInodeScan(
+    const folly::CancellationToken& cancellationToken) {
+  std::string helperPath = FLAGS_privhelper_path;
+  if (helperPath.empty()) {
+    helperPath =
+        (executablePath().dirname() + "edenfs_privhelper"_relpath).asString();
+  }
+  auto report = runPinScan(helperPath, cancellationToken);
+  if (!report) {
+    return std::nullopt;
+  }
+  PinScanData data;
+  data.report = std::move(*report);
+
+  auto mounts = getAllMounts();
+  if (mounts.hasError()) {
+    XLOGF(
+        WARN,
+        "unable to map mounts to devices for pin scan: {}",
+        folly::errnoStr(mounts.error()));
+    return std::nullopt;
+  }
+  for (const auto& mount : mounts.value()) {
+    data.devByMountPoint[mount.mountPoint] =
+        makedev(mount.devMajor, mount.devMinor);
+  }
+  return data;
+}
+
+/**
+ * Build the pinned inode set for one mount from scan results. Returns
+ * nullptr (meaning "pins unknown, do not invalidate directories") if the
+ * scan failed or the mount cannot be mapped to a device.
+ */
+PinnedInodeSet buildPinnedInodeSet(EdenMount& mount, const PinScanData* scan) {
+  if (scan == nullptr) {
+    return nullptr;
+  }
+  auto devIter = scan->devByMountPoint.find(mount.getPath().asString());
+  if (devIter == scan->devByMountPoint.end() ||
+      !scan->report.scannedDevices.count(devIter->second)) {
+    // The scanner applies its own mount table filter, so a mount it did not
+    // cover has unknown pins; a mismatch must fail safe, not read as "no
+    // pins".
+    XLOGF_EVERY_MS(
+        WARN,
+        60'000,
+        "pin scan did not cover mount {}; skipping directory invalidation",
+        mount.getPath());
+    return nullptr;
+  }
+  auto pins = std::make_shared<folly::F14FastSet<InodeNumber>>();
+  auto pinsIter = scan->report.pinsByDevice.find(devIter->second);
+  if (pinsIter != scan->report.pinsByDevice.end()) {
+    for (auto ino : pinsIter->second) {
+      pins->insert(InodeNumber{ino});
+    }
+  }
+  return pins;
+}
+#endif // __linux__
+
+} // namespace
+
+ImmediateFuture<uint64_t> EdenServer::garbageCollectInodes(
+    EdenMount& mount,
+    TreeInodePtr inode,
+    std::chrono::system_clock::time_point cutoff,
+    const ObjectFetchContextPtr& context,
+    bool pressureBased) {
+  auto lease = mount.tryStartInodeGC();
+  if (!lease) {
+    XLOGF(
+        DBG6,
+        "Not running GC for: {}, GC is already running or checkout holds its lease",
+        mount.getPath());
+    return ImmediateFuture<uint64_t>{folly::Try<uint64_t>{newEdenError(
+        EBUSY,
+        EdenErrorType::POSIX_ERROR,
+        "inode GC is already running or inhibited by checkout")}};
+  }
+
+  PinnedInodeSet pinnedInodes;
+#ifdef __linux__
+  if (pressureBased && mount.getFuseChannel() != nullptr &&
+      serverState_->getReloadableConfig()
+          ->getEdenConfig()
+          ->pressureBasedGcScanPins.getValue()) {
+    auto scan = runPinnedInodeScan(
+        folly::cancellation_token_merge(
+            gcCancelSource_.rlock()->getToken(),
+            lease->getCancellationToken()));
+    pinnedInodes = buildPinnedInodeSet(mount, scan ? &scan.value() : nullptr);
+  }
+#endif
+
+  return garbageCollectInodesWithLease(
+      mount,
+      std::move(inode),
+      cutoff,
+      context,
+      pressureBased,
+      std::move(*lease),
+      gcCancelSource_.rlock()->getToken(),
+      serverState_->getEdenFsEventsLogger(),
+      std::move(pinnedInodes));
 }
 
 void EdenServer::garbageCollectAllMounts() {
@@ -3373,14 +3693,33 @@ void EdenServer::garbageCollectAllMounts() {
   } else {
     lastPressureBasedGcTimes_.clear();
   }
+
+  struct DueMountGC {
+    EdenMountHandle mountHandle;
+    std::chrono::system_clock::time_point cutoff;
+    EdenMount::InodeGCLease lease;
+  };
+  std::vector<DueMountGC> dueMounts;
   for (auto& mountHandle : mountPoints) {
+    auto& mount = mountHandle.getEdenMount();
     if (pressureBasedGc) {
       // Use the pressure-based policy to compute a dynamic cutoff based on
       // the current inode count for this mount.
-      auto& mount = mountHandle.getEdenMount();
       auto policy = mount.getInodePressurePolicy();
       auto inodeCount = mount.getInodeMap()->getTotalInodeCountFast();
       auto gcPeriod = policy->getGcPeriod(inodeCount);
+      if (config->pressureBasedGcBackoff.getValue() &&
+          mount.isPressureGcStalled()) {
+        // Pressure GC is not reclaiming the inodes it invalidates (e.g.
+        // EdenFS is tracking FS refcounts the kernel no longer holds, so
+        // invalidations produce no FORGETs). Re-invalidating a large set of
+        // stuck inodes at the pressure-derived rate is wasted work, so fall
+        // back to the regular GC cadence until a run makes progress again.
+        gcPeriod = std::max(
+            gcPeriod,
+            std::chrono::duration_cast<std::chrono::seconds>(
+                config->gcPeriod.getValue()));
+      }
       auto lastGcTime = lastPressureBasedGcTimes_.find(mount.getPath());
       if (lastGcTime != lastPressureBasedGcTimes_.end() &&
           steadyNow - lastGcTime->second < gcPeriod) {
@@ -3393,15 +3732,6 @@ void EdenServer::garbageCollectAllMounts() {
                 .count());
         continue;
       }
-      if (mount.isWorkingCopyGCRunning()) {
-        XLOGF(
-            DBG6,
-            "Skipping pressure-based GC for: {}, another GC is already in progress",
-            mount.getPath());
-        continue;
-      }
-      lastPressureBasedGcTimes_[mount.getPath()] = steadyNow;
-
       auto gcCutoffDuration = policy->getGcCutoff(inodeCount);
 
       if constexpr (folly::kIsWindows) {
@@ -3414,8 +3744,7 @@ void EdenServer::garbageCollectAllMounts() {
 
       cutoff = std::chrono::system_clock::now() - gcCutoffDuration;
     } else {
-      auto inodeCountsBeforeGc =
-          mountHandle.getEdenMount().getInodeMap()->getInodeCounts();
+      auto inodeCountsBeforeGc = mount.getInodeMap()->getInodeCounts();
       auto totalNumberOfInodesBeforeGc = inodeCountsBeforeGc.fileCount +
           inodeCountsBeforeGc.treeCount +
           inodeCountsBeforeGc.unloadedInodeCount;
@@ -3431,22 +3760,92 @@ void EdenServer::garbageCollectAllMounts() {
         cutoff = std::chrono::system_clock::now() - cutoffConfig;
       }
     }
-    folly::via(
-        getServerState()->getThreadPool().get(),
-        [this, mountHandle, cutoff, pressureBasedGc]() mutable {
-          static auto context =
-              ObjectFetchContext::getNullContextWithCauseDetail(
-                  "EdenServer::garbageCollectAllMounts");
-          return garbageCollectWorkingCopy(
-                     mountHandle.getEdenMount(),
-                     mountHandle.getRootInode(),
-                     cutoff,
-                     context,
-                     pressureBasedGc)
-              .semi();
-        })
-        .ensure([mountHandle] {});
+
+    auto lease = mount.tryStartInodeGC();
+    if (!lease) {
+      XLOGF(
+          DBG6,
+          "Skipping GC for: {}, GC is already running or checkout holds its lease",
+          mount.getPath());
+      continue;
+    }
+    if (pressureBasedGc) {
+      lastPressureBasedGcTimes_[mount.getPath()] = steadyNow;
+    }
+
+    dueMounts.push_back(DueMountGC{mountHandle, cutoff, std::move(*lease)});
   }
+  if (dueMounts.empty()) {
+    return;
+  }
+
+  auto shutdownToken = gcCancelSource_.rlock()->getToken();
+  auto edenFsEventsLogger = serverState_->getEdenFsEventsLogger();
+  auto scanPins = pressureBasedGc && config->pressureBasedGcScanPins.getValue();
+  auto* threadPool = getServerState()->getThreadPool().get();
+  // Discover pinned directories once for all due mounts, then launch each
+  // mount's GC. Both the pin scan (a subprocess with a deadline) and the GC
+  // runs happen on the thread pool; only the scheduling decisions above run
+  // on the main EventBase.
+  folly::via(
+      threadPool,
+      [dueMounts = std::move(dueMounts),
+       pressureBasedGc,
+       scanPins,
+       shutdownToken = std::move(shutdownToken),
+       edenFsEventsLogger = std::move(edenFsEventsLogger),
+       threadPool]() mutable {
+        (void)scanPins; // consumed only on Linux
+#ifdef __linux__
+        std::optional<PinScanData> scan;
+        if (scanPins) {
+          bool anyFuseMount = false;
+          for (auto& dueMount : dueMounts) {
+            anyFuseMount = anyFuseMount ||
+                dueMount.mountHandle.getEdenMount().getFuseChannel() != nullptr;
+          }
+          if (anyFuseMount) {
+            scan = runPinnedInodeScan(shutdownToken);
+          }
+        }
+#endif
+        for (auto& dueMount : dueMounts) {
+          PinnedInodeSet pinnedInodes;
+#ifdef __linux__
+          if (pressureBasedGc &&
+              dueMount.mountHandle.getEdenMount().getFuseChannel() != nullptr) {
+            pinnedInodes = buildPinnedInodeSet(
+                dueMount.mountHandle.getEdenMount(),
+                scan ? &scan.value() : nullptr);
+          }
+#endif
+          folly::via(
+              threadPool,
+              [mountHandle = dueMount.mountHandle,
+               cutoff = dueMount.cutoff,
+               pressureBasedGc,
+               lease = std::move(dueMount.lease),
+               shutdownToken,
+               edenFsEventsLogger,
+               pinnedInodes = std::move(pinnedInodes)]() mutable {
+                static auto context =
+                    ObjectFetchContext::getNullContextWithCauseDetail(
+                        "EdenServer::garbageCollectAllMounts");
+                return garbageCollectInodesWithLease(
+                           mountHandle.getEdenMount(),
+                           mountHandle.getRootInode(),
+                           cutoff,
+                           context,
+                           pressureBasedGc,
+                           std::move(lease),
+                           std::move(shutdownToken),
+                           std::move(edenFsEventsLogger),
+                           std::move(pinnedInodes))
+                    .semi();
+              })
+              .ensure([mountHandle = dueMount.mountHandle] {});
+        }
+      });
 }
 
 bool EdenServer::stopAllGarbageCollections(
@@ -3464,12 +3863,12 @@ bool EdenServer::stopAllGarbageCollections(
   gcCancelSource_.wlock()->requestCancellation();
   XLOGF(DBG1, "Cancel request sent to all ongoing garbage collections");
 
-  bool isGCRunning = isWorkingCopyGCRunningForAnyMount();
+  bool isGCRunning = isInodeGCRunningForAnyMount();
   uint8_t currentAttempts = 0;
 
   while (isGCRunning && currentAttempts < maxRetries) {
     std::this_thread::sleep_for(retryInterval);
-    isGCRunning = isWorkingCopyGCRunningForAnyMount();
+    isGCRunning = isInodeGCRunningForAnyMount();
     currentAttempts++;
   }
 
@@ -3478,10 +3877,10 @@ bool EdenServer::stopAllGarbageCollections(
   return gcStopped;
 }
 
-bool EdenServer::isWorkingCopyGCRunningForAnyMount() const {
+bool EdenServer::isInodeGCRunningForAnyMount() const {
   auto mountPoints = getMountPoints();
   for (auto& mountHandle : mountPoints) {
-    if (mountHandle.getEdenMount().isWorkingCopyGCRunning()) {
+    if (mountHandle.getEdenMount().isInodeGCRunning()) {
       return true;
     }
   }

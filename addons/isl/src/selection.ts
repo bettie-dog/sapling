@@ -46,11 +46,6 @@ export const individualToggleKey: 'metaKey' | 'ctrlKey' = isMac ? 'metaKey' : 'c
  */
 export const selectedCommits = atom(new Set<Hash>());
 
-/**
- * Commit that is currently being actioned on (i.e., from the context menu).
- * This is a temporary visual state separate from selection.
- */
-export const actioningCommit = atom<Hash | null>(null);
 registerCleanup(
   selectedCommits,
   successionTracker.onSuccessions(successions => {
@@ -90,6 +85,12 @@ export const selectedCommitInfos = atom(get => {
     const info = dag.get(h);
     return info === undefined ? [] : [info];
   });
+});
+
+export const selectedCommitInfosInDagOrder = atom(get => {
+  const selected = get(selectedCommits);
+  const dag = get(dagWithPreviews);
+  return dag.getBatch(dag.sortAsc(dag.present(selected)));
 });
 
 /**

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/ExceptionWrapper.h>
+#include <folly/Expected.h>
 #include <folly/Function.h>
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
@@ -331,6 +332,15 @@ class SaplingBackingStore final
 
   ObjectId stripObjectId(const ObjectId& id) const override;
 
+  /**
+   * Get statistics about the hgcache (Sapling disk cache). The error side
+   * (a message) is distinct from a successful result reporting "no cache
+   * configured" (see HgCacheStats::cache_path_configured and the per-cache
+   * *_state fields) - callers must not conflate a genuine lookup failure
+   * with a cache that simply isn't configured.
+   */
+  folly::Expected<sapling::HgCacheStats, std::string> getCacheStats() const;
+
  private:
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
@@ -348,10 +358,7 @@ class SaplingBackingStore final
       sameRequestsDifferentFetchCause);
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
-      prefetchBlobsWithDuplicatesNoOptimizations);
-  FRIEND_TEST(
-      SaplingBackingStoreNoFaultInjectorTest,
-      prefetchBlobsWithDuplicatesWithOptimizations);
+      prefetchBlobsWithDuplicates);
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       prefetchBlobsWithDuplicatesResolvesAllCallbacks);
@@ -583,10 +590,6 @@ class SaplingBackingStore final
         std::move(slOid), context, sapling::FetchMode::RemoteOnly);
   }
 
-  folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
-
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -599,10 +602,6 @@ class SaplingBackingStore final
    * the blob aux data is present locally, as this function will always push
    * the request at the end of the queue.
    */
-  ImmediateFuture<GetBlobAuxResult> getBlobAuxDataEnqueue(
-      const SlOid& slOid,
-      const ObjectFetchContextPtr& context);
-
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxDataEnqueue(
       const SlOid& slOid,
       const ObjectFetchContextPtr& context);

@@ -11,7 +11,9 @@
 #include <folly/Range.h>
 #include <folly/SocketAddress.h>
 #include <sys/types.h>
+#include <chrono>
 #include <memory>
+#include <string>
 
 namespace folly {
 class EventBase;
@@ -33,8 +35,6 @@ struct NFSMountOptions {
   folly::SocketAddress mountdAddr;
   folly::SocketAddress nfsdAddr;
   bool readOnly = false;
-  // DEPRECATED: use readIOSize and writeIOSize instead
-  uint32_t iosize{};
   bool useReaddirplus = false;
   bool useSoftMount = false;
   uint32_t readIOSize{};
@@ -76,6 +76,53 @@ struct StopFileAccessMonitorResponse {
   std::string tmpOutputPath;
   std::string specifiedOutputPath;
   bool shouldUpload;
+};
+
+/*
+ * Environment variables that carry the restart budget across a relaunch.
+ *
+ * The privhelper sets them on the daemon it spawns, and that daemon reports
+ * them back to the next privhelper in EdenFsRestartArgs.
+ */
+inline constexpr folly::StringPiece kEdenFsRestartCountEnv{
+    "EDENFS_RESTART_COUNT"};
+inline constexpr folly::StringPiece kEdenFsFirstRestartAtEnv{
+    "EDENFS_FIRST_RESTART_AT"};
+
+/**
+ * Read one of the restart-budget environment variables above.
+ *
+ * Absent, empty or malformed all mean zero, which is the right answer for a
+ * daemon the user started.
+ */
+uint64_t readEdenFsRestartCounterEnv(folly::StringPiece name);
+
+/*
+ * Everything the privhelper needs in order to relaunch edenfs after a crash.
+ *
+ * The privhelper reads no configuration of its own: edenfs delivers the backoff
+ * policy here and the command to relaunch with in the sentinel below.
+ */
+struct EdenFsRestartArgs {
+  bool enabled = false;
+  // The daemon's restart sentinel. Its existence is the "still armed" flag:
+  // edenfs removes it when it shuts down on purpose. Its contents are the
+  // relaunch command, as {"argv": [...], "env": {...}, "nonce": N} JSON.
+  std::string sentinelPath;
+  // Identifies the generation that wrote the sentinel. The path is fixed per
+  // state dir, so without this a privhelper that outlives its daemon can read a
+  // sentinel a newer generation has since overwritten.
+  uint64_t sentinelNonce = 0;
+  // Restarts already performed within the current window. The privhelper exits
+  // after restarting, so the count travels to the new daemon through the
+  // environment and comes back here from the new daemon.
+  uint32_t restartCount = 0;
+  uint64_t firstRestartEpochSec = 0;
+  uint32_t maxRestarts = 0;
+  uint32_t windowSeconds = 0;
+
+  friend bool operator==(const EdenFsRestartArgs&, const EdenFsRestartArgs&) =
+      default;
 };
 
 struct NamespaceInfo {
@@ -251,6 +298,32 @@ class PrivHelper {
   virtual void setEdenFsEventsLogger(
       std::shared_ptr<EdenFsEventsLogger> /* logger */) {}
 
+  /**
+   * Give the privhelper what it needs to relaunch edenfs if this daemon dies
+   * without first calling notifyCleanShutdown().
+   *
+   * Default no-op so that FakePrivHelper and StubPrivHelper need no changes.
+   */
+  [[nodiscard]] virtual folly::Future<folly::Unit> setRestartArgs(
+      const EdenFsRestartArgs& args);
+
+  /**
+   * Tell the privhelper that this daemon is shutting down deliberately.
+   *
+   * One-way and best effort: there is no response, and a failure to deliver
+   * must not block shutdown. Default no-op so that FakePrivHelper and
+   * StubPrivHelper need no changes.
+   */
+  virtual void notifyCleanShutdown(folly::StringPiece reason) noexcept;
+
+  /**
+   * Override the threshold after which a pending privhelper request is
+   * reported as stalled. Test-only. Default no-op so that FakePrivHelper and
+   * StubPrivHelper need no changes.
+   */
+  virtual void setRequestStallThresholdForTest(
+      std::chrono::milliseconds /* threshold */) {}
+
   /*
    * Explicitly stop the privhelper process.
    *
@@ -271,7 +344,8 @@ class PrivHelper {
   virtual int stop() = 0;
 
   /**
-   * Returns the underlying file descriptor value.
+   * Returns the underlying file descriptor value, or -1 if the connection
+   * has been closed.
    * This is intended to be used to pass the privhelper_fd option down
    * to a child process and it must not to used for general reading/writing.
    */

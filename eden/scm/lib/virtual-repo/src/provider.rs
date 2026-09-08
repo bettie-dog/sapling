@@ -19,7 +19,7 @@ use minibytes::Bytes;
 use minibytes::Text;
 use tracing::debug;
 use tracing::trace;
-use twox_hash::Xxh3Hash64;
+use twox_hash::XxHash3_64;
 use types::Id20;
 use types::PathComponentBuf;
 use types::SerializationFormat;
@@ -216,19 +216,16 @@ impl VirtualRepoProvider {
     }
 }
 
-fn calculate_file_length(seed: u64, name_id: u64, blob_id: u64) -> u64 {
+pub(crate) fn calculate_file_length(seed: u64, name_id: u64, blob_id: u64) -> u64 {
     // Use xxhash to get a (roughly) uniform distribution.
     let x = {
-        let mut hash = Xxh3Hash64::default();
+        let mut hash = XxHash3_64::default();
         hash.write(&seed.to_le_bytes());
         hash.write(&name_id.to_le_bytes());
-        hash.write(&(blob_id >> 8).to_le_bytes());
+        hash.write(&blob_id.to_le_bytes());
         hash.finish()
     };
-    let len = generate_file_size(x);
-    // blob_id is meant to be the "generation number" of the file.
-    // But it can also be very large! So let's just truncate it.
-    len + ((blob_id & 0xff) << 5)
+    generate_file_size(x)
 }
 
 fn fold_u64_to_u16(x: u64) -> u16 {

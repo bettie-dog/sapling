@@ -13,7 +13,7 @@ doctest = false
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blobstore = { version = "0.1.0", path = "../../../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../bonsai_git_mapping" }
 bonsai_tag_mapping = { version = "0.1.0", path = "../../bonsai_tag_mapping" }
@@ -31,7 +31,7 @@ facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 filestore = { version = "0.1.0", path = "../../filestore" }
 fsnodes = { version = "0.1.0", path = "../../../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 manifest = { version = "0.1.0", path = "../../../manifest" }
@@ -48,7 +48,8 @@ restricted_paths = { version = "0.1.0", path = "../../restricted_paths" }
 scuba = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 skeleton_manifest = { version = "0.1.0", path = "../../../derived_data/skeleton_manifest" }
-thiserror = "2.0.19"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../../derived_data/unodes" }
 
