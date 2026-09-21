@@ -15,3 +15,6 @@ target/
 # Getdeps
 /eden/mononoke/tests/integration/getdeps_build.log
 /build/Testing/Temporary/LastTest.log
+
+# Claude Code local notes
+/.claude/local.md
