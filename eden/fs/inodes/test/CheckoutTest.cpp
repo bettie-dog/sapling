@@ -28,21 +28,27 @@
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/journal/Journal.h"
+#include "eden/fs/model/git/TopLevelIgnores.h"
+#ifdef _WIN32
 #include "eden/fs/prjfs/PrjfsChannel.h"
+#endif
 #include "eden/fs/service/PrettyPrinters.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
+#include "eden/fs/store/DiffContext.h"
 #include "eden/fs/store/IObjectStore.h"
+#include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/ScmStatusDiffCallback.h"
+#include "eden/fs/store/TreeCache.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/InodeUnloader.h"
 #include "eden/fs/testharness/TestChecks.h"
 #include "eden/fs/testharness/TestMount.h"
-#include "eden/fs/testharness/TestUtil.h"
 #include "eden/fs/utils/EdenError.h"
 
 using namespace facebook::eden;
@@ -407,6 +413,129 @@ void runRemoveFileTests(folly::StringPiece path, bool useCoroutines) {
     testRemoveFile(path, loadType, useCoroutines);
   }
 }
+
+// A file renamed within a directory keeps its object id. Checkout must not
+// dematerialize the directory to a tree that holds that object under the old
+// name: the directory would then claim to equal the tree, hiding the rename
+// from status and from later checkouts.
+TEST_P(CheckoutTest, renamedFileKeepsDirectoryMaterialized) {
+  FakeTreeBuilder builder1;
+  builder1.setFile("d/keep.txt", "k\n");
+  builder1.setFile("d/x.txt", "same\n");
+  TestMount testMount{builder1};
+  applyParam(testMount);
+
+  // Commit 2 changes the directory so checkout has to walk it.
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("d/keep.txt", "k2\n");
+  builder2.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit(RootId{"2"}, builder2)->setReady();
+
+  auto dir = testMount.getTreeInode("d");
+  dir->rename(
+         "x.txt"_pc,
+         dir,
+         "y.txt"_pc,
+         InvalidationRequired::No,
+         ObjectFetchContext::getNullContext())
+      .get();
+
+  auto executor = testMount.getServerExecutor().get();
+  auto checkoutResult = testMount.getEdenMount()
+                            ->checkout(
+                                testMount.getRootInode(),
+                                RootId{"2"},
+                                ObjectFetchContext::getNullContext(),
+                                __func__)
+                            .semi()
+                            .via(executor);
+  testMount.drainServerExecutor();
+  ASSERT_TRUE(checkoutResult.isReady());
+  EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
+
+  EXPECT_EQ("k2\n", testMount.readFile("d/keep.txt"));
+  EXPECT_TRUE(testMount.hasFileAt("d/y.txt"));
+  EXPECT_FALSE(testMount.hasFileAt("d/x.txt"));
+
+  ScmStatusDiffCallback callback;
+  DiffContext diffContext{
+      &callback,
+      folly::CancellationToken{},
+      ObjectFetchContext::getNullContext(),
+      /*listIgnored=*/false,
+      kPathMapDefaultCaseSensitive,
+      testMount.getEdenMount()->getObjectStore(),
+      std::make_unique<TopLevelIgnores>("", "")};
+  auto rootTree =
+      testMount.getEdenMount()
+          ->getObjectStore()
+          ->getRootTree(RootId{"2"}, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(executor);
+  testMount.drainServerExecutor();
+  std::vector<std::shared_ptr<const Tree>> trees{
+      std::move(rootTree).get().tree};
+  auto diffFuture = testMount.getRootInode()
+                        ->diff(
+                            &diffContext,
+                            RelativePathPiece{},
+                            std::move(trees),
+                            diffContext.getToplevelIgnore(),
+                            false)
+                        .semi()
+                        .via(executor);
+  testMount.drainServerExecutor();
+  std::move(diffFuture).get(0ms);
+  auto status = callback.extractStatus();
+
+  EXPECT_TRUE(dir->isMaterialized());
+  EXPECT_THAT(
+      *status.entries(),
+      UnorderedElementsAre(
+          std::make_pair("d/x.txt", ScmFileStatus::REMOVED),
+          std::make_pair("d/y.txt", ScmFileStatus::ADDED)));
+}
+
+#ifndef _WIN32
+// Removing an unloaded, unmaterialized file during checkout only erases the
+// parent's entry. The file's inode metadata record, created when the file
+// was last loaded, has to be freed too or it outlives the inode.
+TEST_P(CheckoutTest, removingUnloadedFileFreesInodeMetadata) {
+  FakeTreeBuilder builder1;
+  builder1.setFile("a.txt", "a\n");
+  builder1.setFile("keep.txt", "k\n");
+  TestMount testMount{builder1};
+  applyParam(testMount);
+
+  auto builder2 = builder1.clone();
+  builder2.removeFile("a.txt");
+  builder2.finalize(testMount.getBackingStore(), true);
+  testMount.getBackingStore()->putCommit(RootId{"2"}, builder2)->setReady();
+
+  // Loading the file creates its metadata record; unloading it afterwards
+  // keeps the record so a later load sees the same timestamps.
+  auto ino = testMount.getFileInode("a.txt")->getNodeId();
+  auto* metadata = testMount.getEdenMount()->getInodeMetadataTable();
+  ASSERT_TRUE(metadata->getOptional(ino).has_value());
+  testMount.getRootInode()->unloadChildrenNow();
+
+  auto executor = testMount.getServerExecutor().get();
+  auto checkoutResult = testMount.getEdenMount()
+                            ->checkout(
+                                testMount.getRootInode(),
+                                RootId{"2"},
+                                ObjectFetchContext::getNullContext(),
+                                __func__)
+                            .semi()
+                            .via(executor);
+  testMount.drainServerExecutor();
+  ASSERT_TRUE(checkoutResult.isReady());
+  EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
+  EXPECT_FALSE(testMount.hasFileAt("a.txt"));
+
+  EXPECT_FALSE(metadata->getOptional(ino).has_value());
+}
+#endif
 
 TEST_P(CheckoutTest, removeFile) {
   // Test with file names that will be at the beginning of the directory,
@@ -1789,6 +1918,9 @@ TEST_P(CheckoutTest, testSetPathObjectIdCheckoutSingleFile) {
   testMount.getBackingStore()->putBlob(ObjectId{"2"}, contents)->setReady();
 
   RelativePathPiece path{"dir/dir2/dir3/file.txt"};
+  auto gcLease = testMount.getEdenMount()->tryStartInodeGC();
+  ASSERT_TRUE(gcLease.has_value());
+  auto gcToken = gcLease->getCancellationToken();
 
   auto setPathObjectIdResultAndTimes =
       testMount.getEdenMount()
@@ -1803,6 +1935,9 @@ TEST_P(CheckoutTest, testSetPathObjectIdCheckoutSingleFile) {
 
   auto result = std::move(setPathObjectIdResultAndTimes).get();
   EXPECT_EQ(0, result.result.conflicts()->size());
+  EXPECT_TRUE(gcToken.isCancellationRequested());
+  gcLease.reset();
+  EXPECT_TRUE(testMount.getEdenMount()->tryStartInodeGC());
 
   // Confirm that the blob has been updated correctly.
   EXPECT_FILE_INODE(testMount.getFileInode(path), contents, 0644);
@@ -2101,6 +2236,10 @@ TEST_P(
 
   testMount.overwriteFile("d1/sub/one.txt", "new contents");
 
+  auto gcLease = testMount.getEdenMount()->tryStartInodeGC();
+  ASSERT_TRUE(gcLease.has_value());
+  auto gcToken = gcLease->getCancellationToken();
+
   auto executor = testMount.getServerExecutor().get();
   auto checkoutResult = testMount.getEdenMount()
                             ->checkout(
@@ -2115,6 +2254,9 @@ TEST_P(
   ASSERT_TRUE(checkoutResult.isReady());
   auto result = std::move(checkoutResult).get();
   ASSERT_EQ(1, result.conflicts.size());
+  EXPECT_FALSE(gcToken.isCancellationRequested());
+  gcLease.reset();
+  EXPECT_TRUE(testMount.getEdenMount()->tryStartInodeGC());
 
   {
     auto& conflict = result.conflicts[0];
@@ -2137,6 +2279,10 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
   auto commit2 = testMount.getBackingStore()->putCommit("2", builder2);
   commit2->setReady();
 
+  auto gcLease = testMount.getEdenMount()->tryStartInodeGC();
+  ASSERT_TRUE(gcLease.has_value());
+  auto gcToken = gcLease->getCancellationToken();
+
   // Block checkout so the checkout is "in progress"
   auto executor = testMount.getServerExecutor().get();
   auto checkout1 = testMount.getEdenMount()
@@ -2151,6 +2297,10 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
   ASSERT_TRUE(testMount.getServerState()->getFaultInjector().waitUntilBlocked(
       "checkout", 5s));
   EXPECT_FALSE(checkout1.isReady());
+  EXPECT_TRUE(gcToken.isCancellationRequested());
+  EXPECT_FALSE(testMount.getEdenMount()->tryStartInodeGC());
+  gcLease.reset();
+  EXPECT_FALSE(testMount.getEdenMount()->tryStartInodeGC());
 
   // Run another checkout and make sure it fails
   try {
@@ -2175,6 +2325,10 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
 
   EXPECT_NO_THROW(std::move(checkout1).getVia(executor));
 
+  auto gcAfterCheckout = testMount.getEdenMount()->tryStartInodeGC();
+  ASSERT_TRUE(gcAfterCheckout.has_value());
+  auto gcAfterCheckoutToken = gcAfterCheckout->getCancellationToken();
+
   // Try to checkout again just to make sure we don't block again.
   testMount.getServerState()->getFaultInjector().removeFault("checkout", ".*");
   auto checkout2 = testMount.getEdenMount()
@@ -2188,6 +2342,34 @@ TEST_P(CheckoutTest, checkoutFailsOnInProgressCheckout) {
                        .waitVia(executor);
   EXPECT_TRUE(checkout2.isReady());
   EXPECT_NO_THROW(std::move(checkout2).get());
+  EXPECT_TRUE(gcAfterCheckoutToken.isCancellationRequested());
+  EXPECT_FALSE(testMount.getEdenMount()->tryStartInodeGC());
+  gcAfterCheckout.reset();
+  EXPECT_TRUE(testMount.getEdenMount()->tryStartInodeGC());
+}
+
+TEST_P(CheckoutTest, overlappingCheckoutInhibitorsBlockInodeGC) {
+  FakeTreeBuilder builder;
+  TestMount testMount{builder};
+  applyParam(testMount);
+  auto mount = testMount.getEdenMount();
+
+  for (bool releaseFirstInhibitorFirst : {false, true}) {
+    std::optional<EdenMount::InodeGCLease> first{mount->stealInodeGCLease()};
+    std::optional<EdenMount::InodeGCLease> second{mount->stealInodeGCLease()};
+    EXPECT_FALSE(mount->tryStartInodeGC());
+
+    if (releaseFirstInhibitorFirst) {
+      first.reset();
+    } else {
+      second.reset();
+    }
+    EXPECT_FALSE(mount->tryStartInodeGC());
+
+    first.reset();
+    second.reset();
+    EXPECT_TRUE(mount->tryStartInodeGC());
+  }
 }
 
 TEST_P(
@@ -3160,6 +3342,74 @@ TEST_P(
   auto restrictedContents = restrictedTree->getContentsUnchecked().rlock();
   EXPECT_TRUE(restrictedContents->entries.empty());
 }
+
+#ifndef _WIN32
+TEST_P(
+    CheckoutTest,
+    forceCheckoutRemovesChildThatBecomesRestrictedAfterPlanning) {
+  auto currentBuilder = FakeTreeBuilder{};
+  currentBuilder.setFile("outer/child/file.txt", "base\n");
+  TestMount testMount{RootId{"current"}, currentBuilder};
+  applyParam(testMount);
+
+  auto backingStore = testMount.getBackingStore();
+  auto targetBuilder = currentBuilder.clone();
+  targetBuilder.setDirIsRestricted("outer");
+  targetBuilder.finalize(backingStore, true);
+  backingStore->putCommit(RootId{"target"}, targetBuilder)->setReady();
+
+  auto outerTreeId =
+      currentBuilder.getStoredTree("outer"_relpath)->get().getObjectId();
+  auto childTreeId =
+      currentBuilder.getStoredTree("outer/child"_relpath)->get().getObjectId();
+
+  // Persist a remembered child whose parent metadata remains stale-allowed.
+  auto child = testMount.getTreeInode("outer/child"_relpath);
+  ASSERT_FALSE(child->isRestricted());
+  auto childInodeNumber = child->getNodeId();
+  child->incFsRefcount();
+  child.reset();
+  testMount.remountGracefully();
+
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  SCOPE_EXIT {
+    inodeMap->decFsRefcount(childInodeNumber);
+  };
+  ASSERT_TRUE(inodeMap->isInodeRemembered(childInodeNumber));
+
+  auto outer = testMount.getTreeInode("outer"_relpath);
+  {
+    auto contents = outer->lockContentsRead();
+    const auto& entry = contents->entries.at("child"_pc);
+    ASSERT_EQ(nullptr, entry.getInode());
+    ASSERT_FALSE(entry.isRestricted());
+  }
+
+  testMount.getTreeCache()->clear();
+  backingStore->replaceTreeWithRestricted(outerTreeId)->setReady();
+  backingStore->replaceTreeWithRestricted(childTreeId)->setReady();
+
+  // FORCE drops the newly restricted old outer tree, then selects the stale
+  // child as local-only before its load discovers the restriction.
+  auto executor = testMount.getServerExecutor().get();
+  auto checkoutResult = testMount.getEdenMount()
+                            ->checkout(
+                                testMount.getRootInode(),
+                                RootId{"target"},
+                                ObjectFetchContext::getNullContext(),
+                                __func__,
+                                CheckoutMode::FORCE)
+                            .semi()
+                            .via(executor);
+  testMount.drainServerExecutor();
+  EXPECT_EQ(0, std::move(checkoutResult).get().conflicts.size());
+
+  EXPECT_TRUE(outer->isRestricted());
+  child = inodeMap->lookupTreeInode(childInodeNumber).get(1ms);
+  ASSERT_TRUE(child->getObjectId().has_value());
+  EXPECT_EQ(childTreeId, *child->getObjectId());
+}
+#endif
 
 TEST_P(CheckoutTest, checkoutToRestrictedTreeConflictsOnModifiedTrackedFile) {
   auto currentBuilder = FakeTreeBuilder{};

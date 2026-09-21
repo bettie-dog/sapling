@@ -21,7 +21,7 @@ sl_rust_library(
     },
     deps = [
         "fbsource//third-party/rust:hex",
-        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:sha2-010",
     ],
 )
 
@@ -33,6 +33,9 @@ sl_rust_binary(
             "name": "mkscratch",
         },
     },
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",

@@ -16,8 +16,8 @@ name = "edenapi_ext"
 anyhow = "1.0.104"
 blake2 = "0.10"
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-crossbeam = "0.8"
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+crossbeam = "0.8.5"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 itertools = "0.15.0"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-configmodel = { version = "0.1.0", path = "../../config/model" }
@@ -30,7 +30,7 @@ sapling-types = { version = "0.1.0", path = "../../types" }
 sapling-util = { version = "0.1.0", path = "../../util" }
 sapling-vfs = { version = "0.1.0", path = "../../vfs" }
 serde_cbor = "0.11.2"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

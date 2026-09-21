@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+mod batched;
 #[cfg(fbcode_build)]
 mod facebook;
 mod hybrid;
@@ -12,10 +13,12 @@ mod local;
 
 use std::collections::HashMap;
 
+pub use batched::BatchedPushrebaseClient;
 use bookmarks_movement::BookmarkKindRestrictions;
 use bookmarks_movement::BookmarkMovementError;
 use bookmarks_types::BookmarkKey;
 use bytes::Bytes;
+use context::CoreContext;
 #[cfg(fbcode_build)]
 pub use facebook::land_service::LandServicePushrebaseClient;
 #[cfg(fbcode_build)]
@@ -25,6 +28,7 @@ pub use hybrid::normal_pushrebase;
 pub use local::LocalPushrebaseClient;
 use mononoke_types::BonsaiChangeset;
 use pushrebase::PushrebaseOutcome;
+use repo_authorization::AuthorizationContext;
 
 #[async_trait::async_trait]
 /// This trait provides an abstraction for pushrebase, which can be used to allow
@@ -34,9 +38,11 @@ pub trait PushrebaseClient: Sync + Send {
     ///
     /// Per-request control over `pushrebase_enable_merge_resolution` is
     /// expressed via the `MERGE_RESOLUTION_OVERRIDE` pushvar; parsing
-    /// happens at the terminal `PushrebaseOntoBookmarkOp`.
+    /// happens at the terminal pushrebase implementation.
     async fn pushrebase(
         &self,
+        ctx: &CoreContext,
+        authz: &AuthorizationContext,
         bookmark: &BookmarkKey,
         changesets: &[BonsaiChangeset],
         pushvars: Option<&HashMap<String, Bytes>>,

@@ -20,7 +20,6 @@ https://mercurial-scm.org/wiki/RebaseExtension
 """
 
 import errno
-import os
 from collections.abc import MutableMapping, MutableSet
 
 import bindings
@@ -551,9 +550,16 @@ class rebaseruntime:
                 repo,
                 precheckrevs,
                 "rebase",
-                checkobsolete=False,
                 checkmerge=False,
             )
+            if self.collapsef and self.collapsemsg:
+                # Validate the collapse message before any commit is rewritten
+                # so a rejection cannot leave an interrupted rebase behind.
+                rewriteutil.precheckmessage(
+                    repo,
+                    [repo[rev] for rev in sorted(precheckrevs)],
+                    self.collapsemsg,
+                )
 
         # Keep track of the active bookmarks in order to reset them later
         self.activebookmark = self.activebookmark or repo._activebookmark
@@ -757,6 +763,7 @@ class rebaseruntime:
             destphase = max(ctx.phase(), phases.draft)
             overrides = {("phases", "new-commit"): destphase}
         with repo.ui.configoverride(overrides, "rebase"):
+            commitmsg = _adjustrebasecopymessage(repo, commitmsg, self.keepf, ctx)
             # # Replicates the empty check in ``repo.commit``.
             # if wctx.isempty() and not repo.ui.configbool("ui", "allowemptycommit"):
             #     return None
@@ -1051,50 +1058,125 @@ class rebaseruntime:
     def _prefetch(self):
         repo = self.repo
 
+        # Only remotefilelog repos fetch file content lazily; other formats already
+        # have every file locally.
+        if "remotefilelog" not in repo.requirements:
+            return
+
         # Collect list of relevant commits: source commits, their parents, and dest commits.
         source_nodes = bindings.dag.nameset(self.destmap.node2node.keys())
-        tofetch = bindings.dag.nameset(self.destmap.node2node.keys())
-        tofetch += repo.changelog.dag.parents(tofetch)
-        tofetch += self.destmap.node2node.values()
+        tofetch = (
+            source_nodes
+            + repo.changelog.dag.parents(source_nodes)
+            + bindings.dag.nameset(self.destmap.node2node.values())
+        )
 
         # Batch lazy DAG resolutions.
         repo.changelog.filternodes(tofetch)
 
-        # Batch fetch commit text (contains root tree node and file list).
-        repo.changelog.inner.getcommitrawtextlist(
-            tofetch,
-        )
+        # Batch fetch commit text (contains the root tree node and file list).
+        repo.changelog.inner.getcommitrawtextlist(tofetch)
 
         if hasattr(repo, "sparsematch"):
             matcher = repo.sparsematch()
         else:
             matcher = matchmod.always(repo.root, "")
 
-        # Collect directories touched by source commits, and prefetch those paths
-        # across source, parent, and destination root tree nodes.
-        all_files = set()
-        for n in source_nodes:
-            ctx = repo[n]
-            for fn in ctx.changeset().files or []:
-                if not matcher(fn):
-                    continue
-
-                # Hard code file name to "file". This keeps our file list small and still
-                # triggers all the same prefetching.
-                fn = os.path.dirname(fn)
-                all_files.add(f"{fn}/file" if fn else "file")
-
-        root_nodes = set()
-        for n in tofetch:
-            ctx = repo[n]
-            root_nodes.add(ctx.manifestnode())
-
-        # Prefetch all relevant trees across all commits. Note that this might overfetch
-        # since it doesn't track which files are relevant to which trees, but the
-        # assumption is it is still better than serial fetching later.
-        bindings.manifest.prefetch(
-            repo.manifestlog.datastore, list(root_nodes), paths=list(all_files)
+        manifest_pairs = self._mergeinputpairs(
+            self._sourcestacks(source_nodes), matcher
         )
+        if not manifest_pairs:
+            return
+
+        stats = bindings.filewalk.prefetchdiffs(
+            repo._rsrepo, manifest_pairs, matcher, self.ui._rcfg
+        )
+        perftrace.tracevalue("Prefetched merge inputs (local)", stats["local"])
+        perftrace.tracevalue("Prefetched merge inputs (remote)", stats["remote"])
+
+    def _sourcestacks(self, source_nodes):
+        """Group source commits by the root reached through first parents that
+        are themselves being rebased.
+
+        Replay puts every non-root commit on its rebased parent (see
+        `adjustdest`), so only a root's destination decides what its stack merges
+        against. Returns a list of (root context, stack contexts) pairs.
+        """
+        repo = self.repo
+        root_of = {}
+        stacks = {}
+        # dag.sort is topologically descending; reversed, parents come first.
+        for node in reversed(list(repo.changelog.dag.sort(source_nodes))):
+            ctx = repo[node]
+            root = root_of.get(ctx.p1().node(), node)
+            root_of[node] = root
+            stacks.setdefault(root, []).append(ctx)
+        return [(repo[root], contexts) for root, contexts in stacks.items()]
+
+    def _mergeinputpairs(self, stacks, matcher):
+        """Return (manifest, base manifest, matcher) triples whose modified entries
+        are the three-way merge inputs replay needs.
+
+        Each root's destination is compared with the root's parent over the paths
+        its stack changed. Only paths modified on both sides are merged during
+        replay; every other path takes one side's entry without reading content.
+        Paths added on both sides have no base, so the native merge hands them to
+        the on-disk fallback and nothing is prefetched for them either.
+        """
+        repo = self.repo
+        groups = []
+        diff_pairs = []
+        group_of_pair = {}
+        for root, stack_contexts in stacks:
+            candidate_files = {
+                path
+                for ctx in stack_contexts
+                for path in (ctx.files() or [])
+                if matcher(path)
+            }
+            if not candidate_files:
+                continue
+            candidate_matcher = scmutil.matchfiles(repo, candidate_files)
+            destination_manifest = repo[self.destmap.node2node[root.node()]].manifest()
+            ancestor_manifest = root.p1().manifest()
+            # The source pairs contribute no merge paths, but diffing them here
+            # prefetches the trees replay walks even when nothing needs merging.
+            diff_pairs.extend(
+                (ctx.manifest(), ctx.p1().manifest(), candidate_matcher)
+                for ctx in stack_contexts
+            )
+            group_of_pair[len(diff_pairs)] = len(groups)
+            diff_pairs.append(
+                (destination_manifest, ancestor_manifest, candidate_matcher)
+            )
+            groups.append((stack_contexts, destination_manifest, ancestor_manifest))
+        if not diff_pairs:
+            return []
+
+        merge_files = [set() for _ in groups]
+        for entry in bindings.manifest.diff_manifests(diff_pairs):
+            index, path, (destination_filenode, _), (ancestor_filenode, _) = entry
+            group = group_of_pair.get(index)
+            if group is not None and destination_filenode and ancestor_filenode:
+                merge_files[group].add(path)
+
+        # Merge commits are paired with p1 only, so paths only reachable through
+        # p2 are fetched lazily during replay.
+        manifest_pairs = []
+        for (stack_contexts, destination_manifest, ancestor_manifest), files in zip(
+            groups, merge_files
+        ):
+            if not files:
+                continue
+            merge_matcher = scmutil.matchfiles(repo, files)
+            manifest_pairs.extend(
+                (ctx.manifest(), ctx.p1().manifest(), merge_matcher)
+                for ctx in stack_contexts
+            )
+            manifest_pairs.append(
+                (destination_manifest, ancestor_manifest, merge_matcher)
+            )
+        return manifest_pairs
 
 
 def _simplemerge(ui, basectx, ctx, p1ctx, manifestbuilder):
@@ -1310,17 +1392,23 @@ def rebase(ui, repo, templ=None, **opts):
         or opts.get("quit")
     ):
         # 'hg rebase' w/o args should do nothing
-        if not opts.get("dest"):
+        dests = opts.get("dest")
+        if not dests:
             raise error.Abort("you must specify a destination (-d) for the rebase")
+
+        if not isinstance(dests, list):
+            dests = [dests]
+        for dest in dests:
+            bookmarks.checkagentpreferredtarget(repo, dest)
 
         # 'hg rebase' can fast-forward bookmark
         prev = repo["."]
+        dests = opts.get("dest")
 
         # Only fast-forward the bookmark if no source nodes were explicitly
         # specified.
         if not (opts.get("base") or opts.get("source") or opts.get("rev")):
-            dests = opts.get("dest")
-            if dests and len(dests) == 1 and dests[0] != prev:
+            if len(dests) == 1 and dests[0] != prev:
                 dest = scmutil.revsingle(repo, dests[0])
                 common = dest.ancestor(prev)
                 if prev == common and dest != prev:
@@ -1730,6 +1818,13 @@ def externalparent(repo, state, destancestors):
     )
 
 
+def _adjustrebasecopymessage(repo, message, keepf, source):
+    # Ordinary rebase rewrites its source; only --keep creates a second live copy.
+    if keepf:
+        return rewriteutil.copycommitmessage(repo, message, "rebase --keep", source)
+    return message
+
+
 def concludememorynode(
     repo,
     rev,
@@ -1776,6 +1871,7 @@ def concludememorynode(
         if date is None:
             date = ctx.date()
 
+        commitmsg = _adjustrebasecopymessage(repo, commitmsg, keepf, ctx)
         memctx = wctx.tomemctx(
             commitmsg,
             parents=(repo[p1], repo[p2]),
@@ -1786,7 +1882,6 @@ def concludememorynode(
             loginfo=loginfo,
             mutinfo=mutinfo,
         )
-
         commitres = repo.commitctx(memctx)
         wctx.clean()  # Might be reused
         return commitres
@@ -1832,6 +1927,7 @@ def concludenode(
         destphase = max(ctx.phase(), phases.draft)
         overrides = {("phases", "new-commit"): destphase}
         with repo.ui.configoverride(overrides, "rebase"):
+            commitmsg = _adjustrebasecopymessage(repo, commitmsg, keepf, ctx)
             # Commit might fail if unresolved files exist
             if date is None:
                 date = ctx.date()

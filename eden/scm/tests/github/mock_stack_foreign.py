@@ -14,10 +14,11 @@ from sapling.ext.github.mock_utils import (
 )
 
 # Mock for a no-op `sl pr submit` (github.pr-workflow=stack) where the stack
-# on GitHub contains a pull request (#99) that is not part of the local stack
-# (e.g. a collaborator linked it with `gh stack link`): submit must not
-# dissolve or otherwise modify the stack -- it only warns. The absence of
-# unstack/create expectations makes any modification attempt fail the test.
+# on GitHub has diverged (wrong order) AND contains a pull request (#99) that
+# is not part of the local stack (e.g. a collaborator linked it with
+# `gh stack link`): submit must not dissolve or otherwise modify the stack --
+# it only warns. The absence of unstack/create expectations makes any
+# modification attempt fail the test.
 
 
 def setup_mock_github_server(ui) -> MockGitHubServer:
@@ -36,7 +37,7 @@ def setup_mock_github_server(ui) -> MockGitHubServer:
         )
 
     github_server.expect_get_stack_request(42).and_respond(
-        [stack_json(44, [42, 43, 45, 99])]
+        [stack_json(44, [43, 42, 45, 99])]
     )
 
     return github_server

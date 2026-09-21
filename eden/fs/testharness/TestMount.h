@@ -11,6 +11,7 @@
 #include <folly/Range.h>
 #include <folly/executors/ManualExecutor.h>
 #include <sys/stat.h>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -84,11 +85,16 @@ class TestMount {
    * might fail with the ActivityBuffer enabled (i.e. InodePtr because inode
    * reference counts might be inaccurate if paths to store in the
    * ActivityBuffer are calculated concurrently), so we must turn it off then.
+   *
+   * configureEdenConfig is applied to the EdenConfig before ServerState and
+   * the mount's ObjectStore are constructed (and to replacement test configs),
+   * so construction-time config snapshots see its values.
    */
   TestMount(
       bool enableActivityBuffer = true,
       CaseSensitivity caseSensitivity = kPathMapDefaultCaseSensitive,
-      std::shared_ptr<ErrorLogger> errorLogger = nullptr);
+      std::shared_ptr<ErrorLogger> errorLogger = nullptr,
+      std::function<void(EdenConfig&)> configureEdenConfig = {});
 
   /**
    * Create a new TestMount
@@ -113,7 +119,8 @@ class TestMount {
       bool startReady = true,
       bool enableActivityBuffer = true,
       CaseSensitivity caseSensitivity = kPathMapDefaultCaseSensitive,
-      std::shared_ptr<ErrorLogger> errorLogger = nullptr);
+      std::shared_ptr<ErrorLogger> errorLogger = nullptr,
+      std::function<void(EdenConfig&)> configureEdenConfig = {});
   explicit TestMount(
       FakeTreeBuilder&& rootBuilder,
       bool enableActivityBuffer = true,
@@ -258,8 +265,14 @@ class TestMount {
    * this will prevent it from being destroyed.  This may result in an error
    * trying to create the new EdenMount if the old mount object still exists
    * and is still holding a lock on the overlay or other data structures.
+   *
+   * When simulateUncleanShutdown is true, the overlay's saved next inode
+   * number is deleted after the old mount is destroyed, so the new mount
+   * takes the same fsck recovery path as a mount whose daemon crashed. The
+   * Sqlite catalog used on Windows keeps no such file and reconciles the
+   * overlay with the disk on every start, so the option does nothing there.
    */
-  void remount();
+  void remount(bool simulateUncleanShutdown = false);
 
 #ifndef _WIN32
   /**
@@ -425,6 +438,7 @@ class TestMount {
   std::shared_ptr<TreeCache> treeCache_;
   std::shared_ptr<TestConfigSource> testConfigSource_;
   std::shared_ptr<EdenConfig> edenConfig_;
+  std::function<void(EdenConfig&)> configureEdenConfig_;
 
   /*
    * config_ is only set before edenMount_ has been initialized.
@@ -454,13 +468,9 @@ class TestMount {
 };
 inline void enableCoroutinesConfig(TestMount& mount) {
   mount.updateEdenConfig({
-      {"coroutines:enable-phase5", "true"},
-      {"coroutines:enable-phase4", "true"},
-      {"coroutines:enable-phase6", "true"},
       {"coroutines:enable-phase7", "true"},
       {"coroutines:enable-phase8", "true"},
       {"coroutines:enable-phase9", "true"},
-      {"coroutines:enable-phase11", "true"},
       {"coroutines:enable-phase10", "true"},
   });
 }

@@ -16,11 +16,13 @@ use std::sync::Arc;
 use blob::Blob;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use manifest::FileMetadata;
 use manifest::FileType;
 use manifest::FsNodeMetadata;
 use manifest::Manifest;
 use manifest_tree::TreeManifest;
 use pathmatcher::DynMatcher;
+use pathmatcher::IntersectMatcher;
 use slex::Items;
 use slex::Work;
 use slex::WorkOptions;
@@ -122,6 +124,20 @@ pub enum WalkInput {
         manifest: TreeManifest,
         base_manifest: TreeManifest,
     },
+    /// Walk files modified across several manifest pairs in one traversal.
+    ///
+    /// Additions and removals are skipped. Both file nodes are yielded for each modification.
+    ModifiedDiffPairs(Vec<ModifiedDiffPair>),
+}
+
+/// One manifest pair walked by [`WalkInput::ModifiedDiffPairs`].
+pub struct ModifiedDiffPair {
+    /// Target side of the diff.
+    pub manifest: TreeManifest,
+    /// Base side of the diff.
+    pub base_manifest: TreeManifest,
+    /// Only paths accepted by both this matcher and the walk matcher are visited.
+    pub matcher: DynMatcher,
 }
 
 /// Counts of file content fetches performed by a prefetch walk.
@@ -149,7 +165,34 @@ pub fn walk_and_fetch(
         work_options(options),
         file_nodes,
         WorkShape::batch(move |batch, scope| {
-            fetch_files(batch?, scope, &file_store, FetchContext::sapling_default())
+            fetch_batch(batch?, scope, &file_store, FetchContext::sapling_default())
+        }),
+    )
+}
+
+/// Fetch an explicit stream of file nodes in parallel.
+///
+/// This is useful when callers already know the file nodes and need one fetch pipeline spanning
+/// files from multiple manifests.
+pub fn fetch_file_nodes(
+    file_nodes: Items<(RepoPathBuf, FileMetadata), anyhow::Error>,
+    file_store: &Arc<dyn FileStore>,
+    fetch_context: FetchContext,
+    options: WalkOptions,
+) -> FileItems {
+    let options = options.normalized();
+    let file_store = file_store.clone();
+    let file_nodes = file_nodes.map_batch(|batch| {
+        Ok(batch?
+            .into_iter()
+            .map(|(path, metadata)| (path, FsNodeMetadata::File(metadata)))
+            .collect::<Vec<_>>())
+    });
+    Work::run(
+        work_options(options),
+        file_nodes,
+        WorkShape::batch(move |batch, scope| {
+            fetch_batch(batch?, scope, &file_store, fetch_context.clone())
         }),
     )
 }
@@ -194,7 +237,42 @@ fn manifest_items(input: WalkInput, matcher: DynMatcher) -> Items<FetchWork, any
             manifest,
             base_manifest,
         } => diff_manifest_items(manifest, base_manifest, matcher),
+        WalkInput::ModifiedDiffPairs(manifest_pairs) => {
+            modified_diff_manifest_pairs_items(manifest_pairs, matcher)
+        }
     }
+}
+
+fn modified_diff_manifest_pairs_items(
+    manifest_pairs: Vec<ModifiedDiffPair>,
+    matcher: DynMatcher,
+) -> Items<FetchWork, anyhow::Error> {
+    let pairs = manifest_pairs
+        .iter()
+        .map(|pair| {
+            let pair_matcher: DynMatcher = Arc::new(IntersectMatcher::new(vec![
+                matcher.clone(),
+                pair.matcher.clone(),
+            ]));
+            (&pair.manifest, &pair.base_manifest, pair_matcher)
+        })
+        .collect();
+
+    manifest_tree::diff_manifests(pairs).map_batch(|batch| {
+        Ok(batch?
+            .into_iter()
+            .flat_map(|(_pair, diff_entry)| {
+                let path = diff_entry.path;
+                match (diff_entry.diff_type.left(), diff_entry.diff_type.right()) {
+                    (Some(left), Some(right)) => [Some((path.clone(), left)), Some((path, right))],
+                    _ => [None, None],
+                }
+                .into_iter()
+                .flatten()
+            })
+            .map(|(path, metadata)| (path, FsNodeMetadata::File(metadata)))
+            .collect::<Vec<_>>())
+    })
 }
 
 fn diff_manifest_items(
@@ -218,7 +296,7 @@ fn diff_manifest_items(
     }
 }
 
-fn fetch_files(
+fn fetch_batch(
     work: Vec<FetchWork>,
     scope: &mut WorkScope<'_, FetchWork, FileResult, anyhow::Error>,
     file_store: &Arc<dyn FileStore>,
@@ -245,7 +323,15 @@ fn fetch_files(
             return Ok(());
         }
 
-        let batch = batch?;
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(err) => {
+                if !scope.send_error(err) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
 
         for (key, data) in batch {
             let file_type = file_info
@@ -320,6 +406,16 @@ impl FileStats {
 mod tests {
     use std::collections::BTreeMap;
 
+    use manifest_tree::testutil::TestStore;
+    use manifest_tree::testutil::make_tree_manifest;
+    use pathmatcher::AlwaysMatcher;
+    use pathmatcher::ExactMatcher;
+    use storemodel::InsertOpts;
+    use storemodel::KeyStore;
+    use types::testutil::hgid;
+    use types::testutil::repo_path;
+    use types::testutil::repo_path_buf;
+
     use super::*;
 
     #[test]
@@ -379,5 +475,178 @@ mod tests {
                 remote_files: 5,
             }
         );
+    }
+
+    /// Two manifest pairs: `first` and `second` are modified in their pairs, `added` and
+    /// `removed` are one-sided, and the second pair repeats the same `first` modification.
+    fn modified_diff_pairs_store() -> anyhow::Result<(
+        Arc<TestStore>,
+        Vec<(TreeManifest, TreeManifest)>,
+        BTreeMap<&'static str, Vec<Key>>,
+    )> {
+        let store = Arc::new(TestStore::new());
+        let first_id = hgid("11");
+        let first_base_id = hgid("22");
+        let second_id = hgid("33");
+        let second_base_id = hgid("44");
+        let added_id = hgid("55");
+        let removed_id = hgid("66");
+        for (path, id, data) in [
+            (repo_path("first"), first_id, b"first\n".as_slice()),
+            (
+                repo_path("first"),
+                first_base_id,
+                b"first base\n".as_slice(),
+            ),
+            (repo_path("second"), second_id, b"second\n".as_slice()),
+            (
+                repo_path("second"),
+                second_base_id,
+                b"second base\n".as_slice(),
+            ),
+            (repo_path("added"), added_id, b"added\n".as_slice()),
+            (repo_path("removed"), removed_id, b"removed\n".as_slice()),
+        ] {
+            store.insert_data(
+                InsertOpts {
+                    forced_id: Some(Box::new(id)),
+                    ..Default::default()
+                },
+                path,
+                Blob::from(data.to_vec()),
+            )?;
+        }
+
+        let first = make_tree_manifest(store.clone(), &[("first", "11"), ("added", "55")]);
+        let first_base = make_tree_manifest(store.clone(), &[("first", "22"), ("removed", "66")]);
+        let second = make_tree_manifest(store.clone(), &[("first", "11"), ("second", "33")]);
+        let second_base = make_tree_manifest(store.clone(), &[("first", "22"), ("second", "44")]);
+        let keys = BTreeMap::from([
+            (
+                "first",
+                vec![
+                    Key::new(repo_path_buf("first"), first_id),
+                    Key::new(repo_path_buf("first"), first_base_id),
+                ],
+            ),
+            (
+                "second",
+                vec![
+                    Key::new(repo_path_buf("second"), second_id),
+                    Key::new(repo_path_buf("second"), second_base_id),
+                ],
+            ),
+        ]);
+        Ok((
+            store,
+            vec![(first, first_base), (second, second_base)],
+            keys,
+        ))
+    }
+
+    /// Distinct keys handed to the store. The walk does not deduplicate keys repeated
+    /// across pairs; the store does that within a request.
+    fn distinct_fetches(store: &TestStore) -> Vec<Key> {
+        let mut fetched = store.fetches().into_iter().flatten().collect::<Vec<_>>();
+        fetched.sort();
+        fetched.dedup();
+        fetched
+    }
+
+    #[test]
+    fn test_prefetch_modified_diff_pairs() -> anyhow::Result<()> {
+        let (store, pairs, keys) = modified_diff_pairs_store()?;
+        let always: DynMatcher = Arc::new(AlwaysMatcher::new());
+        let pairs = pairs
+            .into_iter()
+            .map(|(manifest, base_manifest)| ModifiedDiffPair {
+                manifest,
+                base_manifest,
+                matcher: always.clone(),
+            })
+            .collect();
+
+        prefetch(
+            WalkInput::ModifiedDiffPairs(pairs),
+            always,
+            &(store.clone() as Arc<dyn FileStore>),
+            WalkOptions::default(),
+        )?;
+        let mut expected = keys.into_values().flatten().collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(distinct_fetches(&store), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prefetch_modified_diff_pairs_per_pair_matcher() -> anyhow::Result<()> {
+        let (store, mut pairs, keys) = modified_diff_pairs_store()?;
+        let (second, second_base) = pairs.pop().unwrap();
+        let (first, first_base) = pairs.pop().unwrap();
+        let second_only: DynMatcher =
+            Arc::new(ExactMatcher::new([repo_path("second")].iter(), true));
+        let nothing: DynMatcher = Arc::new(ExactMatcher::new(
+            std::iter::empty::<&types::RepoPath>(),
+            true,
+        ));
+
+        prefetch(
+            WalkInput::ModifiedDiffPairs(vec![
+                ModifiedDiffPair {
+                    manifest: first,
+                    base_manifest: first_base,
+                    matcher: nothing,
+                },
+                ModifiedDiffPair {
+                    manifest: second,
+                    base_manifest: second_base,
+                    matcher: second_only,
+                },
+            ]),
+            Arc::new(AlwaysMatcher::new()),
+            &(store.clone() as Arc<dyn FileStore>),
+            WalkOptions::default(),
+        )?;
+        let mut expected = keys["second"].clone();
+        expected.sort();
+        assert_eq!(distinct_fetches(&store), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fetch_file_nodes() -> anyhow::Result<()> {
+        let store = Arc::new(TestStore::new());
+        let id = hgid("11");
+        store.insert_data(
+            InsertOpts {
+                forced_id: Some(Box::new(id)),
+                ..Default::default()
+            },
+            repo_path("a.txt"),
+            Blob::from(b"a\n".to_vec()),
+        )?;
+        let files = Items::ready(vec![(
+            repo_path_buf("a.txt"),
+            FileMetadata {
+                hgid: id,
+                file_type: FileType::Regular,
+                ignore_unless_conflict: false,
+            },
+        )]);
+
+        let results = fetch_file_nodes(
+            files,
+            &(store.clone() as Arc<dyn FileStore>),
+            FetchContext::sapling_default(),
+            WalkOptions::default(),
+        )
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, repo_path_buf("a.txt"));
+        assert_eq!(results[0].data.to_bytes().as_ref(), b"a\n");
+        assert_eq!(store.key_fetch_count(), 1);
+        Ok(())
     }
 }

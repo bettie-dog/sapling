@@ -13,6 +13,7 @@ import concurrent.futures
 import enum
 import errno
 import inspect
+import io
 import json
 import os
 import platform
@@ -20,6 +21,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 import traceback
 import typing
 from dataclasses import dataclass
@@ -741,7 +743,9 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                 off_mount_repo_dir=instance.get_config_bool(
                     "clone.off-mount-repo-dir",
                     # Enable by default in tests.
-                    any(v in os.environ for v in ("INTEGRATION_TEST", "TESTTMP")),
+                    any(
+                        v in os.environ for v in ("EDENFS_INTEGRATION_TEST", "TESTTMP")
+                    ),
                 ),
             )
         except util.RepoError as ex:
@@ -948,6 +952,9 @@ class ReloadConfigCmd(Subcmd):
         raise NotImplementedError("Stub -- only implemented in Rust")
 
 
+CLAUDE_TIMEOUT_SECS = 120
+
+
 @subcmd("doctor", "Debug and fix issues with EdenFS")
 class DoctorCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -1000,6 +1007,144 @@ class DoctorCmd(Subcmd):
         if args.current_edenfs_only:
             doctor.run_system_wide_checks = False
         return doctor.cure_what_ails_you()
+
+
+@subcmd("doctor-ai", "Run eden doctor and, on failure, ask local AI for diagnosis")
+class DoctorAICmd(Subcmd):
+    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--claude-timeout-secs",
+            type=int,
+            default=CLAUDE_TIMEOUT_SECS,
+            help="Timeout for the local claude diagnosis subprocess.",
+        )
+
+    def run(self, args: argparse.Namespace) -> int:
+        instance = get_eden_instance(args)
+        # Not a `with` block: that would overwrite `duration` with the whole
+        # command's wall time, and the `claude` subprocess is the part worth
+        # timing when tuning --claude-timeout-secs.
+        sample = instance.get_telemetry_logger().new_sample("eden_doctor_ai")
+        # Seeded so an aborted run still emits a row with every field set:
+        # `finally` logs the sample even for KeyboardInterrupt, which `Exception`
+        # does not cover, and `exit_code` is unknown until doctor returns.
+        sample.add_string("reason", "unhandled_exception")
+        sample.add_int("exit_code", -1)
+        try:
+            return self._run(args, instance, sample)
+        except KeyboardInterrupt:
+            sample.add_string("reason", "interrupted")
+            sample.fail("interrupted")
+            raise
+        except BaseException as ex:
+            sample.fail(str(ex))
+            raise
+        finally:
+            sample.log()
+
+    def _run(
+        self,
+        args: argparse.Namespace,
+        instance: EdenInstance,
+        sample: TelemetrySample,
+    ) -> int:
+        doctor_output = io.StringIO()
+        doctor_returncode = doctor_mod.cure_what_ails_you(
+            instance,
+            dry_run=False,
+            debug=args.debug,
+            fast=False,
+            wait=False,
+            min_severity_to_report=ProblemSeverity.ALL,
+            out=ui.PlainOutput(doctor_output),
+        )
+
+        doctor_text = doctor_output.getvalue()
+        sample.add_int("exit_code", doctor_returncode)
+        if doctor_text:
+            sys.stdout.write(doctor_text)
+            if not doctor_text.endswith("\n"):
+                sys.stdout.write("\n")
+        if doctor_returncode == 0:
+            sample.add_string("reason", "doctor_ok")
+            return doctor_returncode
+
+        print("\nAI diagnosis follows.\n", file=sys.stderr)
+        prompt = f"""Use the local `diagnose-sapling` skill on this `eden doctor` output.
+
+{doctor_text.strip()}
+"""
+        claude_env = os.environ.copy()
+        claude_env.pop("CLAUDECODE", None)
+        claude_start = time.monotonic()
+        try:
+            claude_result = subprocess.run(
+                ["claude", "--print"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=args.claude_timeout_secs,
+                env=claude_env,
+                check=False,
+            )
+        except FileNotFoundError:
+            sample.add_string("reason", "claude_not_on_path")
+            sample.add_bool("success", False)
+            print(
+                "Local `claude` was not found on PATH; skipping AI diagnosis.",
+                file=sys.stderr,
+            )
+            return doctor_returncode
+        except OSError as ex:
+            # `claude` exists but could not be started, e.g. it is not
+            # executable. Must follow FileNotFoundError, which subclasses this.
+            sample.add_string("reason", "claude_failed")
+            sample.add_bool("success", False)
+            sample.add_double("duration", time.monotonic() - claude_start)
+            print(
+                f"Local `claude` could not be started: {ex}",
+                file=sys.stderr,
+            )
+            return doctor_returncode
+        except subprocess.TimeoutExpired as ex:
+            sample.add_string("reason", "claude_timed_out")
+            sample.add_bool("success", False)
+            sample.add_double("duration", time.monotonic() - claude_start)
+            stdout = (
+                ex.stdout.decode(errors="replace")
+                if isinstance(ex.stdout, bytes)
+                else (ex.stdout or "")
+            )
+            stderr = (
+                ex.stderr.decode(errors="replace")
+                if isinstance(ex.stderr, bytes)
+                else (ex.stderr or "")
+            )
+            print(
+                "Local `claude` timed out while generating the diagnosis.",
+                file=sys.stderr,
+            )
+            if stdout:
+                sys.stdout.write(stdout)
+            if stderr:
+                sys.stderr.write(stderr)
+            return doctor_returncode
+
+        sample.add_double("duration", time.monotonic() - claude_start)
+        sample.add_bool("success", claude_result.returncode == 0)
+        sample.add_string(
+            "reason", "claude_ok" if claude_result.returncode == 0 else "claude_failed"
+        )
+        if claude_result.returncode != 0:
+            print(
+                "Local `claude` failed while generating the diagnosis.",
+                file=sys.stderr,
+            )
+        if claude_result.stdout:
+            sys.stdout.write(claude_result.stdout)
+        if claude_result.stderr:
+            sys.stderr.write(claude_result.stderr)
+        return doctor_returncode
 
 
 @subcmd("health-report", "Notify critical eden issues")
@@ -2492,7 +2637,7 @@ class StartCmd(Subcmd):
                 cmd = ["strace", "-fttT", "-o", args.strace] + cmd
 
         # Wrap the command in sudo, if necessary
-        eden_env = daemon.get_edenfs_environment(args.preserved_vars)
+        eden_env = daemon.get_edenfs_environment(instance, args.preserved_vars)
         cmd, eden_env = daemon.prepare_edenfs_privileges(
             daemon_binary, cmd, eden_env, privhelper
         )
@@ -2568,10 +2713,10 @@ class SystemdStartCmd(Subcmd):
 def unmount_redirections_for_path(
     repo_path: str, complain_about_failing_to_unmount_redirs: bool
 ) -> None:
-    parser = create_parser()
-    args = parser.parse_args(["redirect", "unmount", "--mount", repo_path])
     try:
-        args.func(args)
+        args = create_parser().parse_args([])
+        instance, checkout, _rel_path = require_checkout(args, repo_path)
+        redirect_mod.unmount_redirections(instance, checkout)
     except Exception as exc:
         if complain_about_failing_to_unmount_redirs:
             print(
@@ -3053,10 +3198,20 @@ Any programs using files or directories inside the EdenFS mounts will need to
 re-open these files after EdenFS is restarted.
 """
         )
-        if not self.args.force_restart and sys.stdin.isatty():
+        # Only prompt when the user can actually see the prompt. If stdout is
+        # redirected (e.g. to a log file) the prompt is invisible and input()
+        # would block forever, so fall through to the same non-interactive
+        # behavior used for non-TTY stdin instead, with a notice so the skip
+        # is visible in the log or pipe output.
+        if not self.args.force_restart and sys.stdin.isatty() and sys.stdout.isatty():
             if prompt and not prompt_confirmation("Proceed?"):
                 print("Not confirmed.")
                 return 1
+        elif not self.args.force_restart and prompt and sys.stdin.isatty():
+            print(
+                "stdout is not a terminal; skipping confirmation and proceeding "
+                "with full restart"
+            )
 
         self._do_stop(instance, old_pid, timeout=DEFAULT_STOP_TIMEOUT)
         if migrate_to is not None:
@@ -3162,17 +3317,6 @@ class RageCmd(Subcmd):
         instance = get_eden_instance(args)
         instance.log_sample("eden_rage")
         rage_processor = rage_mod.get_rage_reporter(instance)
-
-        if not args.dry_run:
-            auth_problem = rage_mod.check_rage_reporter_auth(rage_processor)
-            if auth_problem is not None:
-                print_stderr(
-                    f"Error: cannot upload the rage report because {auth_problem}.\n"
-                    "Run `jf auth` to authenticate, then retry `eden rage`.\n"
-                    "To print the report locally without uploading it, "
-                    "run `eden rage --dry-run`."
-                )
-                return 1
 
         if args.report:
             rage_mod.report_edenfs_bug(instance, rage_processor)
@@ -3429,7 +3573,6 @@ def create_parser() -> argparse.ArgumentParser:
         subcmd_mod.HelpCmd,
         stats_mod.StatsCmd,
         trace_mod.TraceCmd,
-        redirect_mod.RedirectCmd,
         prefetch_mod.GlobCmd,
         prefetch_mod.PrefetchCmd,
     ]

@@ -9,7 +9,7 @@ license = "GPLv2+"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blobstore = { version = "0.1.0", path = "../../../blobstore" }
 bytes = { version = "1.12.1", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -21,15 +21,15 @@ context = { version = "0.1.0", path = "../../slapi/slapi_server/context" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 filestore = { version = "0.1.0", path = "../../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-futures-util = { version = "0.3.30", features = ["compat"] }
-gotham = "0.8"
-gotham_derive = "0.8"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+futures-util = { version = "0.3.34", features = ["compat"] }
+gotham = "0.8.1"
+gotham_derive = "0.8.1"
 gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-http = "1.4.2"
+http = "1.5.0"
 http-body = "1.1.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
@@ -40,7 +40,6 @@ metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
 metadata = { version = "0.1.0", path = "../../../common/metadata" }
 mime = "0.3.14"
 mononoke_app = { version = "0.1.0", path = "../../../cmdlib/mononoke_app" }
-mononoke_configs = { version = "0.1.0", path = "../../../common/mononoke_configs" }
 mononoke_macros = { version = "0.1.0", path = "../../../common/mononoke_macros" }
 mononoke_repos = { version = "0.1.0", path = "../../../common/mononoke_repos" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
@@ -63,10 +62,10 @@ secure_utils = { version = "0.1.0", git = "https://github.com/facebookexperiment
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 time_window_counter = { version = "0.1.0", path = "../../../common/time_window_counter" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

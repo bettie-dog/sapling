@@ -11,7 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::ensure;
 use byteorder::BigEndian;
@@ -176,12 +175,12 @@ impl Entry {
         let body = if let (true, Some(compressed)) = (should_compress, &self.compressed_content) {
             compressed.clone()
         } else {
-            let content = self.content.get().ok_or_else(|| anyhow!("No content"))?;
+            let content = self.calculate_content()?;
 
             if should_compress {
-                compress(content)?.into()
+                compress(&content)?.into()
             } else {
-                content.clone()
+                content
             }
         };
 
@@ -211,6 +210,7 @@ impl Entry {
 
         if let Some(content) = self.content.get() {
             self.compressed_content = Some(compress(content)?.into());
+            self.content.take();
         }
 
         Ok(())
@@ -348,6 +348,21 @@ impl IndexedLogHgIdDataStore {
 
     pub fn is_dirty(&self) -> bool {
         self.store.is_dirty()
+    }
+
+    /// Returns the bytes used on disk, flushing first so recently
+    /// written entries still sitting in the in-memory buffer (up to the
+    /// store's auto_sync_threshold, e.g. 50MiB for the default blob/tree
+    /// cache) are reflected. The byte limit is reported separately by
+    /// `max_bytes()`. Errors if the store could not be opened/flushed
+    /// or its on-disk usage could not be determined.
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.flush_log()?;
+        self.store.disk_usage()
+    }
+
+    pub fn max_bytes(&self) -> Result<u64> {
+        self.store.max_bytes()
     }
 
     /// Flush the underlying IndexedLog
@@ -495,6 +510,20 @@ mod tests {
     use crate::testutil::*;
 
     #[test]
+    fn test_serialize_uncompressed_after_precompression() -> Result<()> {
+        let content = Bytes::from(&[1, 2, 3, 4][..]);
+        let mut entry = Entry::new(key("a", "1").hgid, content.clone(), Metadata::default());
+        entry.compress_content()?;
+
+        let mut serialized = Vec::new();
+        entry.serialize(&mut serialized, false)?;
+        let decoded = Entry::from_bytes(Bytes::from(serialized))?;
+
+        assert_eq!(decoded.content()?, content);
+        Ok(())
+    }
+
+    #[test]
     fn test_empty() {
         let tempdir = TempDir::new().unwrap();
         let config = IndexedLogHgIdDataStoreConfig {
@@ -541,6 +570,36 @@ mod tests {
 
         log.add(&delta, &metadata).unwrap();
         log.flush().unwrap();
+    }
+
+    #[test]
+    fn test_disk_usage_errors_after_open_cache_loses_latest() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let config = IndexedLogHgIdDataStoreConfig {
+            max_log_count: None,
+            max_bytes_per_log: None,
+            max_bytes: None,
+            btrfs_compression: false,
+        };
+        let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
+            &tempdir,
+            &config,
+            StoreType::Rotated,
+            SerializationFormat::Hg,
+        )?;
+        let delta = Delta {
+            data: Bytes::from_static(b"data"),
+            base: None,
+            key: key("a", "1"),
+        };
+        log.add(&delta, &Metadata::default())?;
+        assert!(log.disk_usage()? > 0);
+
+        remove_file(tempdir.path().join("latest"))?;
+
+        assert!(log.disk_usage().is_err());
+        Ok(())
     }
 
     #[test]

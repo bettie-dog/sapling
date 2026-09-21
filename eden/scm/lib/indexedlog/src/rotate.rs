@@ -13,6 +13,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -25,6 +26,7 @@ use tracing::info;
 use tracing::trace;
 use try_once_lock::OnceLock;
 
+use crate::btrfs;
 use crate::change_detect::SharedChangeDetector;
 use crate::errors::IoResultExt;
 use crate::errors::ResultExt;
@@ -57,6 +59,9 @@ pub struct RotateLog {
     // Logical length of `logs`. It can be smaller than `logs.len()` if some Log
     // fails to load.
     logs_len: AtomicUsize,
+    // Set once a lazy log load fails (see `load_log`). Cleared only when
+    // `set_logs` replaces the complete log generation.
+    load_failed: AtomicBool,
     // Rotated logs we hold on to in "consistent read" mode to provide temporary read-after-write
     // consistency.
     pinned_logs: Vec<Log>,
@@ -272,6 +277,7 @@ impl OpenOptions {
                 open_options: self.clone(),
                 logs,
                 logs_len,
+                load_failed: AtomicBool::new(false),
                 pinned_logs: Vec::new(),
                 latest,
                 reader_lock: Some(reader_lock),
@@ -300,6 +306,7 @@ impl OpenOptions {
                 open_options: self.clone(),
                 logs,
                 logs_len,
+                load_failed: AtomicBool::new(false),
                 pinned_logs: Vec::new(),
                 latest: 0,
                 reader_lock: None,
@@ -703,9 +710,12 @@ impl RotateLog {
             if let Ok(entry) = entry {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(id) = name.parse::<u8>() {
-                        if (latest >= earliest && (id > latest || id < earliest))
-                            || (latest < earliest && (id > latest && id < earliest))
-                        {
+                        let is_active = if latest >= earliest {
+                            id >= earliest && id <= latest
+                        } else {
+                            id >= earliest || id <= latest
+                        };
+                        if !is_active {
                             return true;
                         }
                     }
@@ -807,6 +817,9 @@ impl RotateLog {
         }
 
         self.logs_len = AtomicUsize::new(logs.len());
+        // Fresh, not-yet-loaded log cells: any earlier load failure no
+        // longer applies to this generation of `logs`.
+        self.load_failed = AtomicBool::new(false);
         self.logs = logs;
         self.latest = latest;
     }
@@ -900,6 +913,17 @@ impl RotateLog {
                     match log {
                         Ok(log) => Ok(Some(log)),
                         Err(err) => {
+                            // Record the load failure *before* narrowing
+                            // `logs_len` below. `disk_usage()` checks
+                            // `load_failed` first, so a concurrent reader
+                            // must never be able to observe the narrowed
+                            // length without also seeing this flag - doing
+                            // it in the other order leaves a window where a
+                            // concurrent `disk_usage()` call sees the
+                            // already-narrowed `logs_len` but a still-false
+                            // `load_failed`, and silently returns the exact
+                            // partial sum this flag exists to prevent.
+                            self.load_failed.store(true, SeqCst);
                             // Logically truncate self.logs. This avoids loading broken Logs again.
                             self.logs_len.store(index, SeqCst);
                             Err(err)
@@ -959,6 +983,98 @@ impl RotateLog {
         if !self.is_consistent_reads() {
             self.pinned_logs.clear();
         }
+    }
+
+    /// Returns the current disk usage in bytes. Disk-backed logs are measured
+    /// from their on-disk metadata so a removed or truncated cache cannot be
+    /// reported from a stale in-memory snapshot.
+    ///
+    /// When `btrfs_compression` is configured, this reports the physical
+    /// (compressed) size of each log instead of the logical `primary_len`,
+    /// matching the unit `btrfs_needs_rotation` compares against
+    /// `max_bytes_per_log` - otherwise `disk_usage()`/`max_bytes()` would
+    /// mix compressed and uncompressed units and could report over 100%
+    /// used on a healthy, compressing filesystem.
+    ///
+    /// This is O(max_log_count). The non-Btrfs path reads one metadata file
+    /// and stats one primary file per log. With `btrfs_compression`, each log
+    /// additionally requires an `fsync` and a `BTRFS_IOC_TREE_SEARCH_V2`
+    /// extent scan (see `btrfs::physical_size`), so callers should not use it
+    /// in a hot path.
+    ///
+    /// The active generation and `load_failed` are checked before and after
+    /// summation so concurrent rotation or lazy-load failure cannot produce a
+    /// successful partial result.
+    pub fn disk_usage(&self) -> crate::Result<u64> {
+        fn load_failed_err() -> crate::Error {
+            crate::Error::programming(
+                "RotateLog::disk_usage: a log previously failed to load; usage is unavailable \
+                 until the logs are fully reloaded",
+            )
+        }
+
+        if self.load_failed.load(SeqCst) {
+            return Err(load_failed_err());
+        }
+
+        let logs_len = self.logs_len.load(SeqCst);
+        let use_btrfs_physical_size = self.open_options.log_open_options.btrfs_compression;
+        let mut total: u64 = 0;
+
+        if let Some(dir) = &self.dir {
+            let verify_latest = || -> crate::Result<()> {
+                let latest = read_latest(dir)?;
+                if latest != self.latest {
+                    return Err(crate::Error::path(
+                        dir,
+                        format!(
+                            "latest log changed while measuring disk usage: {} != {}",
+                            latest, self.latest
+                        ),
+                    ));
+                }
+                Ok(())
+            };
+
+            verify_latest()?;
+            for i in 0..logs_len {
+                let id = self.latest.wrapping_sub(i as u8);
+                let log_dir = dir.join(id.to_string());
+                total = total.saturating_add(measure_disk_log(&log_dir, use_btrfs_physical_size)?);
+            }
+            verify_latest()?;
+        } else {
+            for i in 0..logs_len {
+                let log = self
+                    .logs
+                    .get(i)
+                    .and_then(|cell| cell.get())
+                    .ok_or_else(|| {
+                        crate::Error::programming(
+                            "RotateLog::disk_usage: in-memory log was not loaded",
+                        )
+                    })?;
+                total = total.saturating_add(log.meta.disk_usage());
+            }
+        }
+
+        if self.load_failed.load(SeqCst) {
+            return Err(load_failed_err());
+        }
+
+        Ok(total)
+    }
+
+    /// Returns the configured maximum size in bytes (max_bytes_per_log * max_log_count).
+    pub fn max_bytes(&self) -> u64 {
+        self.open_options
+            .max_bytes_per_log
+            .saturating_mul(self.open_options.max_log_count as u64)
+    }
+
+    /// Returns the directory path, if this is an on-disk RotateLog.
+    pub fn path(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 }
 
@@ -1129,6 +1245,43 @@ fn create_empty_log(
 
 fn read_latest(dir: &Path) -> crate::Result<u8> {
     read_latest_raw(dir).context(dir, "cannot read latest")
+}
+
+/// Measure one on-disk log's disk usage for `RotateLog::disk_usage`, reading
+/// from on-disk state rather than any in-memory snapshot so a removed or
+/// truncated cache surfaces as an error instead of a stale byte count.
+///
+/// Errors if the log's metadata is unreadable (e.g. the cache directory was
+/// deleted) or its primary file is shorter than the metadata claims (i.e. it
+/// was truncated). With `use_btrfs_physical_size`, reports the physical
+/// (compressed) extent size; otherwise the logical `primary_len`.
+fn measure_disk_log(log_dir: &Path, use_btrfs_physical_size: bool) -> crate::Result<u64> {
+    let meta = log::LogMetadata::read_file(log_dir.join(log::META_FILE))?;
+    let log_path = log_dir.join(log::PRIMARY_FILE);
+    let log_file = fs::File::open(&log_path)
+        .context(&log_path, "opening primary log to measure disk usage")?;
+    let actual_len = log_file
+        .metadata()
+        .context(&log_path, "reading primary log length")?
+        .len();
+    if actual_len < meta.disk_usage() {
+        return Err(crate::Error::corruption(
+            &log_path,
+            format!(
+                "primary log is shorter than metadata: {} < {}",
+                actual_len,
+                meta.disk_usage()
+            ),
+        ));
+    }
+
+    if use_btrfs_physical_size {
+        let btrfs_metadata = btrfs::physical_size(&log_file, None)
+            .context(&log_path, "reading btrfs physical size")?;
+        Ok(btrfs_metadata.size())
+    } else {
+        Ok(meta.disk_usage())
+    }
 }
 
 // Unlike read_latest, this function returns io::Result.
@@ -1334,6 +1487,136 @@ mod tests {
         assert_eq!(lookup(&rotate, b"c").len(), 1);
         assert_eq!(lookup(&rotate, b"d").len(), 1);
         assert!(!dir.path().join("0").exists());
+    }
+
+    #[test]
+    fn test_disk_usage_includes_unloaded_logs() {
+        let dir = tempdir().unwrap();
+        let opts = || {
+            OpenOptions::new()
+                .create(true)
+                .max_bytes_per_log(100)
+                .max_log_count(4)
+        };
+        let mut rotate = opts().open(&dir).unwrap();
+
+        // Force rotations so multiple on-disk logs exist.
+        rotate.append(vec![b'a'; 120]).unwrap();
+        assert!(rotate.sync().unwrap() >= 1, "expected a rotation");
+        rotate.append(vec![b'b'; 120]).unwrap();
+        assert!(rotate.sync().unwrap() >= 1, "expected a rotation");
+        rotate.append(b"c").unwrap();
+        rotate.sync().unwrap();
+        let usage_all_loaded = rotate.disk_usage().unwrap();
+        assert!(
+            usage_all_loaded >= 240,
+            "all-loaded usage should cover both rotated logs, got {usage_all_loaded}"
+        );
+
+        // A freshly opened RotateLog eagerly loads only the active log; the
+        // rotated logs are lazy. disk_usage must still account for them by
+        // reading their on-disk meta.
+        let reopened = opts().open(&dir).unwrap();
+        assert_eq!(
+            reopened.disk_usage().unwrap(),
+            usage_all_loaded,
+            "disk_usage must not under-report lazily-unloaded logs"
+        );
+    }
+
+    #[test]
+    fn test_disk_usage_errors_once_a_log_fails_to_load() {
+        let dir = tempdir().unwrap();
+        let rotate = OpenOptions::new()
+            .create(true)
+            .max_bytes_per_log(100)
+            .max_log_count(4)
+            .open(&dir)
+            .unwrap();
+        assert!(rotate.disk_usage().is_ok());
+
+        rotate.load_failed.store(true, SeqCst);
+
+        assert!(
+            rotate.disk_usage().is_err(),
+            "disk_usage must error, not silently sum a narrowed range, once a log has failed to load"
+        );
+    }
+
+    #[test]
+    fn test_disk_usage_errors_when_loaded_cache_metadata_disappears() {
+        let dir = tempdir().unwrap();
+        let mut rotate = OpenOptions::new().create(true).open(&dir).unwrap();
+        rotate.append(b"data").unwrap();
+        rotate.sync().unwrap();
+        assert!(rotate.disk_usage().is_ok());
+
+        let meta_path = dir
+            .path()
+            .join(rotate.latest.to_string())
+            .join(log::META_FILE);
+        fs::remove_file(meta_path).unwrap();
+
+        assert!(rotate.disk_usage().is_err());
+    }
+
+    #[test]
+    fn test_disk_usage_errors_when_latest_disappears() {
+        let dir = tempdir().unwrap();
+        let rotate = OpenOptions::new().create(true).open(&dir).unwrap();
+        assert!(rotate.disk_usage().is_ok());
+
+        fs::remove_file(dir.path().join(LATEST_FILE)).unwrap();
+
+        assert!(rotate.disk_usage().is_err());
+    }
+
+    #[test]
+    fn test_disk_usage_errors_when_primary_is_shorter_than_metadata() {
+        let dir = tempdir().unwrap();
+        let mut rotate = OpenOptions::new().create(true).open(&dir).unwrap();
+        rotate.append(b"data").unwrap();
+        rotate.sync().unwrap();
+
+        let log_dir = dir.path().join(rotate.latest.to_string());
+        let primary_path = log_dir.join(log::PRIMARY_FILE);
+        let meta_path = log_dir.join(log::META_FILE);
+        let mut meta = log::LogMetadata::read_file(&meta_path).unwrap();
+        meta.primary_len = fs::metadata(primary_path).unwrap().len() + 1;
+        meta.write_file(meta_path, false).unwrap();
+
+        assert!(rotate.disk_usage().is_err());
+    }
+
+    #[test]
+    fn test_rotation_does_not_clear_load_failure() {
+        let dir = tempdir().unwrap();
+        let mut rotate = OpenOptions::new()
+            .create(true)
+            .max_bytes_per_log(1)
+            .max_log_count(4)
+            .open(&dir)
+            .unwrap();
+        rotate.load_failed.store(true, SeqCst);
+
+        rotate.append(b"data").unwrap();
+        assert!(rotate.sync().unwrap() > 0, "expected a rotation");
+
+        assert!(rotate.load_failed.load(SeqCst));
+        assert!(rotate.disk_usage().is_err());
+    }
+
+    #[test]
+    fn test_max_bytes() {
+        let dir = tempdir().unwrap();
+        let rotate = OpenOptions::new()
+            .create(true)
+            .max_bytes_per_log(100)
+            .max_log_count(4)
+            .open(&dir)
+            .unwrap();
+
+        assert_eq!(rotate.max_bytes(), 400);
     }
 
     #[test]
@@ -2162,6 +2445,10 @@ Reset latest to 2"#
         let dir = tempdir().unwrap();
 
         if fsinfo::fstype(dir.path()).unwrap() != fsinfo::FsType::BTRFS {
+            eprintln!(
+                "skipping test_btrfs_rotate: {:?} is not a btrfs filesystem",
+                dir.path()
+            );
             return;
         }
 
@@ -2201,6 +2488,46 @@ Reset latest to 2"#
             let rotated_btrfs_size = rotate.logs[1].get_mut().unwrap().btrfs_size().unwrap();
             assert!(rotated_btrfs_size >= 500);
         }
+    }
+
+    // see lib.rs - dummy_btrfs won't run this test
+    #[cfg(all(target_os = "linux", feature = "btrfs"))]
+    #[test]
+    fn test_disk_usage_reports_physical_size_on_btrfs() {
+        let dir = tempdir().unwrap();
+
+        if fsinfo::fstype(dir.path()).unwrap() != fsinfo::FsType::BTRFS {
+            eprintln!(
+                "skipping test_disk_usage_reports_physical_size_on_btrfs: {:?} is not a btrfs filesystem",
+                dir.path()
+            );
+            return;
+        }
+
+        // Highly compressible data: physical (compressed) size should end up
+        // far smaller than the logical byte count written.
+        let mut rotate = OpenOptions::new()
+            .create(true)
+            .max_bytes_per_log(1_000_000)
+            .max_log_count(2)
+            .btrfs_compression(true)
+            .open(&dir)
+            .unwrap();
+        let compressible = vec![b'a'; 500_000];
+        rotate.append(&compressible).unwrap();
+        rotate.sync().unwrap();
+
+        let logical_len = rotate.logs[0].get().unwrap().meta.disk_usage();
+        let reported = rotate.disk_usage().unwrap();
+
+        // disk_usage() must track the same (physical/compressed) unit that
+        // the rotation threshold compares against max_bytes_per_log, not the
+        // logical primary_len - otherwise used/max_bytes mixes units and can
+        // exceed 100% on a healthy, compressing filesystem.
+        assert!(
+            reported < logical_len,
+            "expected compressed disk_usage ({reported}) to be smaller than logical length ({logical_len})"
+        );
     }
 
     #[test]

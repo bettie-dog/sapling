@@ -12,7 +12,7 @@ path = "lib.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bytes = { version = "1.12.1", features = ["serde"] }
@@ -22,14 +22,14 @@ derived_data = { version = "0.1.0", path = ".." }
 derived_data_manager = { version = "0.1.0", path = "../manager" }
 derived_data_service_if = { version = "0.1.0", path = "../remote/if" }
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

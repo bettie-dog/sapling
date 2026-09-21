@@ -26,28 +26,15 @@ class GlobNode : public GlobNodeImpl {
   explicit GlobNode(
       bool includeDotfiles,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      uint32_t recursiveAsyncDepth = 3)
+      uint32_t recursiveAsyncDepth = 3,
+      GlobMatchOptions matchOptions = {})
       : GlobNodeImpl(
             includeDotfiles,
             caseSensitive,
-            prefetchOptimizations,
-            recursiveAsyncDepth) {}
+            recursiveAsyncDepth,
+            std::move(matchOptions)) {}
 
   using PrefetchList = folly::Synchronized<std::vector<ObjectId>>;
-
-  GlobNode(
-      folly::StringPiece pattern,
-      bool includeDotfiles,
-      bool hasSpecials,
-      CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false)
-      : GlobNodeImpl(
-            pattern,
-            includeDotfiles,
-            hasSpecials,
-            caseSensitive,
-            prefetchOptimizations) {}
 
   /**
    * Evaluate the compiled glob against the provided TreeInode and path.

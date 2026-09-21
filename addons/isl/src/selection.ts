@@ -26,11 +26,11 @@ import {BulkRebaseOperation} from './operations/BulkRebaseOperation';
 import {HideOperation} from './operations/HideOperation';
 import {RebaseOperation} from './operations/RebaseOperation';
 import {operationBeingPreviewed, useRunOperation} from './operationsState';
-import platform from './platform';
 import {dagWithPreviews} from './previews';
 import {latestDag} from './serverAPIState';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {exactRevset, type CommitInfo, type Hash} from './types';
+import {showConfirmation} from './useModal';
 import {registerCleanup} from './utils';
 
 /**
@@ -46,11 +46,6 @@ export const individualToggleKey: 'metaKey' | 'ctrlKey' = isMac ? 'metaKey' : 'c
  */
 export const selectedCommits = atom(new Set<Hash>());
 
-/**
- * Commit that is currently being actioned on (i.e., from the context menu).
- * This is a temporary visual state separate from selection.
- */
-export const actioningCommit = atom<Hash | null>(null);
 registerCleanup(
   selectedCommits,
   successionTracker.onSuccessions(successions => {
@@ -90,6 +85,12 @@ export const selectedCommitInfos = atom(get => {
     const info = dag.get(h);
     return info === undefined ? [] : [info];
   });
+});
+
+export const selectedCommitInfosInDagOrder = atom(get => {
+  const selected = get(selectedCommits);
+  const dag = get(dagWithPreviews);
+  return dag.getBatch(dag.sortAsc(dag.present(selected)));
 });
 
 /**
@@ -385,9 +386,13 @@ export function useShortcutToRebaseSelected(): void {
       );
     } else {
       if (
-        await platform.confirm(
-          t('Are you sure you want to rebase $count commits?', {count: selectedRevsets.length}),
-        )
+        await showConfirmation({
+          title: t('Rebase Commits?'),
+          message: t('Are you sure you want to rebase $count commits?', {
+            count: selectedRevsets.length,
+          }),
+          confirmLabel: t('Rebase'),
+        })
       ) {
         runOperation(new BulkRebaseOperation(selectedRevsets, baseCommitRevset));
       }

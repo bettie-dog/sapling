@@ -34,7 +34,10 @@ CheckoutContext::CheckoutContext(
       fetchContext_{makeRefPtr<StatsFetchContext>(
           clientPid,
           ObjectFetchContext::Cause::Thrift,
-          thriftMethodName,
+          // The caller may be backed by request or coroutine-local storage,
+          // while this context remains alive for the asynchronous checkout.
+          ObjectFetchContext::CauseDetail::fromOwnedString(
+              thriftMethodName.str()),
           requestInfo)},
       checkoutProgress_{std::move(checkoutProgress)} {
   if (mount_->getEdenConfig()->thriftCheckoutTimeTracing.getValue()) {
@@ -46,6 +49,11 @@ CheckoutContext::CheckoutContext(
 
 CheckoutContext::~CheckoutContext() {
   mount_->getOverlay()->exitCheckoutDeferral();
+}
+
+void CheckoutContext::inhibitInodeGC() {
+  XCHECK(!inodeGCLease_);
+  inodeGCLease_.emplace(mount_->stealInodeGCLease());
 }
 
 void CheckoutContext::start(

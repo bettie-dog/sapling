@@ -446,19 +446,21 @@ class EdenInstance(AbstractEdenInstance):
         return logger
 
     def _create_telemetry_logger(self) -> telemetry.TelemetryLogger:
-        if "INTEGRATION_TEST" in os.environ or "EDENFS_UNITTEST" in os.environ:
+        if telemetry.telemetry_disabled_by_env():
             return telemetry.NullTelemetryLogger()
 
-        if self.get_config_bool("telemetry.enable-xplatlogger-events", default=False):
-            try:
-                # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
-                from eden.fs.cli.facebook.xplat_logger import XplatLogger  # @manual
+        try:
+            # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
+            from eden.fs.cli.facebook.xplat_logger import get_xplat_logger  # @manual
 
-                return XplatLogger()
-            except ImportError:
-                pass
-            except Exception as ex:
-                log.warning(f"XplatLogger construction failed, falling back: {ex}")
+            # Python CLI telemetry continues to use edenfs_events. Other
+            # destinations request their own view from the same transport.
+            return get_xplat_logger()
+        except ImportError:
+            # OSS / non-internal builds do not ship XplatLogger; use the legacy loggers.
+            pass
+        except Exception as ex:
+            log.warning(f"XplatLogger construction failed, falling back: {ex}")
 
         try:
             # pyre-fixme [21]: Undefined import Could not find a module corresponding to import

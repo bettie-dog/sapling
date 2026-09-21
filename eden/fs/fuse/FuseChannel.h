@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <folly/CancellationToken.h>
 #include <folly/File.h>
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
@@ -15,7 +16,6 @@
 #include <folly/synchronization/CallOnce.h>
 #include <gtest/gtest_prod.h>
 #include <stdlib.h>
-#include <condition_variable>
 #include <iosfwd>
 #include <memory>
 #include <optional>
@@ -34,6 +34,7 @@
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/utils/FsChannelTypes.h"
+#include "eden/fs/utils/InvalidationQueue.h"
 #include "eden/fs/utils/ProcessAccessLog.h"
 
 #include <fmt/format.h>
@@ -299,6 +300,8 @@ class FuseChannel final : public FsChannel {
    * fuseMaxPages -
    *      The maximum number of pages per FUSE read request. Set to 0 to use
    *      the kernel default (32). Maximum 256 (1MB).
+   * handleKillPrivV2 -
+   *      Whether to negotiate FUSE_HANDLE_KILLPRIV_V2 during FUSE_INIT.
    * useIoUring -
    *      Whether to use io_uring for FUSE request/reply transport instead of
    *      traditional /dev/fuse read/write when the running kernel is known to
@@ -309,6 +312,10 @@ class FuseChannel final : public FsChannel {
    * ioUringQueueDepth -
    *      The io_uring queue depth to use when the io_uring transport is
    *      enabled.
+   * ioUringPreCreateQueues -
+   *      Whether to create every io_uring queue before replying to FUSE_INIT,
+   *      so that a mount can still fall back to /dev/fuse when the queues do
+   *      not all fit under RLIMIT_MEMLOCK.
    */
   FuseChannel(
       PrivHelper* privHelper,
@@ -333,10 +340,14 @@ class FuseChannel final : public FsChannel {
       size_t fuseTraceBusCapacity,
       std::optional<uint32_t> fuseBdiReadAheadKb = std::nullopt,
       uint32_t fuseMaxPages = 0,
+      bool handleKillPrivV2 = true,
       bool useIoUring = false,
       std::string ioUringKernelReleaseRegex = {},
       uint32_t ioUringQueueDepth = 8,
-      bool ioUringDisableIoWait = true);
+      bool ioUringDisableIoWait = true,
+      bool ioUringSkipSelfWakeup = true,
+      bool ioUringPreCreateQueues = false,
+      size_t numInvalidationThreads = 4);
 
   FuseChannel(const FuseChannel&) = delete;
   FuseChannel(FuseChannel&&) = delete;
@@ -389,7 +400,9 @@ class FuseChannel final : public FsChannel {
   bool isFuseDeviceValidForWrites() const {
     return isFuseDeviceValid(state_.rlock()->stopReason);
   }
+  // source must outlive all requests dispatched through it, including replies.
   void dispatchRequestFromTransport(
+      const FuseTransport& source,
       const fuse_in_header& header,
       folly::ByteRange arg,
       pid_t myPid);
@@ -491,6 +504,21 @@ class FuseChannel final : public FsChannel {
    */
   void invalidateEntry(InodeNumber parent, PathComponentPiece name);
 
+  /**
+   * Enqueue a directory entry invalidation, waiting when necessary to keep the
+   * queue below maxQueueSize. Returns false if cancellation or channel
+   * shutdown occurs before the invalidation is enqueued, or if maxQueueSize is
+   * zero (a zero-capacity queue can never accept an entry).
+   *
+   * The caller must not hold inode locks because this method may wait for
+   * invalidation workers to make room in the queue.
+   */
+  bool invalidateEntryWithQueueLimit(
+      InodeNumber parent,
+      PathComponentPiece name,
+      size_t maxQueueSize,
+      const folly::CancellationToken& cancellationToken);
+
   /*
    * Request that the kernel invalidate its cached data for the specified
    * inodes.
@@ -522,7 +550,10 @@ class FuseChannel final : public FsChannel {
    * throws system_error if the write fails.  Writes can fail if the
    * data we send to the kernel is invalid.
    */
-  void replyError(const fuse_in_header& request, int err);
+  void replyError(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      int err);
 
   /**
    * Sends a raw data packet to the kernel.
@@ -535,7 +566,10 @@ class FuseChannel final : public FsChannel {
    * throws system_error if the write fails.  Writes can fail if the
    * data we send to the kernel is invalid.
    */
-  void sendRawReply(const iovec iov[], size_t count) const;
+  void sendRawReply(
+      const FuseTransport& source,
+      const iovec iov[],
+      size_t count) const;
 
   /**
    * Sends a range of contiguous bytes as a reply to the kernel.
@@ -546,11 +580,16 @@ class FuseChannel final : public FsChannel {
    * throws system_error if the write fails.  Writes can fail if the
    * data we send to the kernel is invalid.
    */
-  void sendReply(const fuse_in_header& request, folly::ByteRange bytes) const;
+  void sendReply(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      folly::ByteRange bytes) const;
 
-  void sendReply(const fuse_in_header& request, folly::StringPiece bytes)
-      const {
-    sendReply(request, folly::ByteRange{bytes});
+  void sendReply(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      folly::StringPiece bytes) const {
+    sendReply(source, request, folly::ByteRange{bytes});
   }
 
   /**
@@ -562,8 +601,10 @@ class FuseChannel final : public FsChannel {
    * throws system_error if the write fails.  Writes can fail if the
    * data we send to the kernel is invalid.
    */
-  void sendReply(const fuse_in_header& request, folly::fbvector<iovec>&& vec)
-      const;
+  void sendReply(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      folly::fbvector<iovec>&& vec) const;
 
   /**
    * Sends a reply to a kernel request potentially consisting of multiple
@@ -572,7 +613,10 @@ class FuseChannel final : public FsChannel {
    * throws system_error if the write fails.  Writes can fail if the
    * data we send to the kernel is invalid.
    */
-  void sendReply(const fuse_in_header& request, const folly::IOBuf& buf) const;
+  void sendReply(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      const folly::IOBuf& buf) const;
 
   /**
    * Sends a reply to the kernel.
@@ -583,10 +627,14 @@ class FuseChannel final : public FsChannel {
    * data we send to the kernel is invalid.
    */
   template <typename T>
-  void sendReply(const fuse_in_header& request, const T& payload) const {
+  void sendReply(
+      const FuseTransport& source,
+      const fuse_in_header& request,
+      const T& payload) const {
     static_assert(std::is_standard_layout_v<T>);
     static_assert(std::is_trivial_v<T>);
     sendReply(
+        source,
         request,
         folly::ByteRange{
             reinterpret_cast<const uint8_t*>(&payload), sizeof(T)});
@@ -711,36 +759,35 @@ class FuseChannel final : public FsChannel {
   enum class InvalidationType : uint32_t {
     INODE,
     DIR_ENTRY,
-    FLUSH,
   };
   struct InvalidationEntry {
-    InvalidationEntry(InodeNumber inode, int64_t offset, int64_t length);
+    explicit InvalidationEntry(
+        InodeNumber inode,
+        int64_t offset = 0,
+        int64_t length = 0);
     InvalidationEntry(InodeNumber inode, PathComponentPiece name);
-    explicit InvalidationEntry(folly::Promise<folly::Unit> promise);
+    InvalidationEntry(const InvalidationEntry&) = delete;
+    InvalidationEntry& operator=(const InvalidationEntry&) = delete;
     InvalidationEntry(InvalidationEntry&& other) noexcept(
         std::is_nothrow_move_constructible_v<PathComponent> &&
-        std::is_nothrow_move_constructible_v<folly::Promise<folly::Unit>> &&
         std::is_nothrow_move_constructible_v<DataRange>);
+    InvalidationEntry& operator=(InvalidationEntry&&) = delete;
     ~InvalidationEntry();
 
     InvalidationType type;
     InodeNumber inode;
     union {
       PathComponent name;
-      DataRange range;
-      folly::Promise<folly::Unit> promise;
+      DataRange range{0, 0};
     };
-  };
-  struct InvalidationQueue {
-    std::vector<InvalidationEntry> queue;
-    bool stop{false};
   };
 
   friend struct fmt::formatter<facebook::eden::FuseChannel::InvalidationEntry>;
   FRIEND_TEST(FuseChannelTest, formatting_inode);
   FRIEND_TEST(FuseChannelTest, formatting_dir);
-  FRIEND_TEST(FuseChannelTest, formatting_flush);
   FRIEND_TEST(FuseChannelTest, formatting_unknown);
+  FRIEND_TEST(FuseChannelTest, zeroInvalidationThreadsUsesOneWorker);
+  FRIEND_TEST(FuseChannelTest, excessiveInvalidationThreadsAreCapped);
   /**
    * Private destructor.
    *
@@ -806,6 +853,12 @@ class FuseChannel final : public FsChannel {
       FuseRequestContext& request,
       const fuse_in_header& header,
       folly::ByteRange arg);
+#ifdef __linux__
+  ImmediateFuture<folly::Unit> fuseRename2(
+      FuseRequestContext& request,
+      const fuse_in_header& header,
+      folly::ByteRange arg);
+#endif
   ImmediateFuture<folly::Unit> fuseLink(
       FuseRequestContext& request,
       const fuse_in_header& header,
@@ -891,7 +944,6 @@ class FuseChannel final : public FsChannel {
   void setThreadSigmask();
   void initWorkerThread() noexcept;
   void fuseWorkerThread() noexcept;
-  void invalidationThread() noexcept;
   void stopInvalidationThread();
   void sendInvalidation(InvalidationEntry& entry);
   void sendInvalidateInode(InodeNumber ino, int64_t off, int64_t len);
@@ -932,9 +984,11 @@ class FuseChannel final : public FsChannel {
   void failTakeoverReadiness(folly::exception_wrapper&& ew);
 
   // Update the effective number of worker threads. For traditional dev/fuse, it
-  // is configured. For io_uring, it is the number of CPU cores.
+  // is configured. For io_uring, it is the number of CPU cores plus one
+  // /dev/fuse reader.
   void updateEffectiveWorkerThreadCount();
   void dispatchRequest(
+      const FuseTransport& source,
       const fuse_in_header& header,
       folly::ByteRange arg,
       pid_t myPid);
@@ -951,16 +1005,23 @@ class FuseChannel final : public FsChannel {
 
   PrivHelper* const privHelper_;
 
+  /**
+   * The size of the buffer a worker reads a request into. Sized from
+   * fuse:max-pages for a fresh mount, and from the negotiated max_write when
+   * taking over an established connection.
+   */
+  size_t bufferSize_{0};
+
   /*
    * Constant state that does not change for the lifetime of the FuseChannel
    */
-  const size_t bufferSize_{0};
   std::shared_ptr<folly::Executor> threadPool_;
   // The number of worker threads that are configured to be created.
   const size_t configuredWorkerThreadCount_;
   // The number of worker threads that are actually created. When using
   // io_uring, this is the number of CPU cores on the machine.
   size_t effectiveWorkerThreadCount_{0};
+  const size_t numInvalidationThreads_;
   std::unique_ptr<FuseDispatcher> dispatcher_;
   const folly::Logger* const straceLogger_;
   const std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
@@ -997,10 +1058,13 @@ class FuseChannel final : public FsChannel {
   bool useWriteBackCache_;
   std::optional<uint32_t> fuseBdiReadAheadKb_;
   uint32_t fuseMaxPages_{0};
+  bool handleKillPrivV2_{true};
   bool useIoUring_{false};
   std::string ioUringKernelReleaseRegex_;
   uint32_t ioUringQueueDepth_{8};
   bool ioUringDisableIoWait_{true};
+  bool ioUringSkipSelfWakeup_{true};
+  bool ioUringPreCreateQueues_{false};
 #if EDEN_HAVE_FUSE_IO_URING
   mutable folly::once_flag ioUringTransportAvailabilityInitFlag_;
   mutable bool ioUringTransportAvailable_{false};
@@ -1050,11 +1114,10 @@ class FuseChannel final : public FsChannel {
   // To prevent logging unsupported opcodes twice.
   folly::Synchronized<std::unordered_set<FuseOpcode>> unhandledOpcodes_;
 
-  // State for sending inode invalidation requests to the kernel
-  // These are processed in their own dedicated thread.
-  folly::Synchronized<InvalidationQueue, std::mutex> invalidationQueue_;
-  std::condition_variable invalidationCV_;
-  std::thread invalidationThread_;
+  // Inode invalidation requests to the kernel, sent from dedicated threads.
+  // Entries must be safe to complete out of dequeue order because the threads
+  // process them concurrently.
+  InvalidationQueue<InvalidationEntry> invalidationQueue_;
 
   ProcessAccessLog processAccessLog_;
 
@@ -1068,7 +1131,9 @@ class FuseChannel final : public FsChannel {
   folly::ThreadLocal<
       std::shared_ptr<RequestMetricsScope::LockedRequestWatchList>,
       ThreadLocalTag>
-      liveRequestWatches_;
+      liveRequestWatches_{[] {
+        return std::make_shared<RequestMetricsScope::LockedRequestWatchList>();
+      }};
 
   std::vector<TraceSubscriptionHandle<FuseTraceEvent>>
       traceSubscriptionHandles_;
@@ -1090,6 +1155,7 @@ class FuseChannel final : public FsChannel {
   std::shared_ptr<TraceBus<FuseTraceEvent>> traceBus_;
 };
 
+// Returns a view backed by the static FUSE handler table.
 folly::StringPiece fuseOpcodeName(uint32_t opcode);
 ProcessAccessLog::AccessType fuseOpcodeAccessType(uint32_t opcode);
 
@@ -1128,8 +1194,6 @@ struct formatter<facebook::eden::FuseChannel::InvalidationEntry>
       case facebook::eden::FuseChannel::InvalidationType::DIR_ENTRY:
         return fmt::format_to(
             out, "(inode {}, child \"{}\")", entry.inode, entry.name);
-      case facebook::eden::FuseChannel::InvalidationType::FLUSH:
-        return fmt::format_to(out, "(invalidation flush)");
       default:
         return fmt::format_to(
             out,

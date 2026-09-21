@@ -17,7 +17,7 @@ derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/rep
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
@@ -26,7 +26,7 @@ repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobsto
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
 sharding_ext = { version = "0.1.0", path = "../../cmdlib/sharding_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

@@ -27,8 +27,10 @@ class Notifier;
 class NfsDispatcher;
 class ProcessInfoCache;
 class PrivHelper;
+class ReloadableConfig;
 class Rpcbindd;
 class Nfsd3;
+class FaultInjector;
 
 class NfsServer {
  public:
@@ -92,9 +94,12 @@ class NfsServer {
       folly::Duration requestTimeout,
       std::shared_ptr<Notifier> notifier,
       CaseSensitivity caseSensitive,
-      uint32_t iosize,
+      uint32_t readIoSize,
+      uint32_t writeIoSize,
       size_t traceBusCapacity,
-      bool fastPathRPCs);
+      bool fastPathRPCs,
+      std::shared_ptr<ReloadableConfig> config,
+      FaultInjector& faultInjector);
 
   /**
    * Registers an RPC service running a certain protocol version on port.

@@ -64,6 +64,7 @@ cpp_library(
     ],
     deps = [
         "fbsource//third-party/fmt:fmt",
+        "//folly/container:f14_hash",
         "//folly/logging:logging",
     ],
     exported_deps = [
@@ -81,7 +82,6 @@ cpp_library(
         "//eden/common/utils:path",
         "//folly:range",
         "//folly/io:iobuf",
-        "//thrift/lib/cpp2/protocol/detail:protocol_methods",
     ],
 )
 
@@ -245,6 +245,22 @@ cpp_library(
         "//folly:expected",
         "//folly:portability",
         "//folly:range",
+    ],
+)
+
+cpp_library(
+    name = "invalidation_queue",
+    headers = ["InvalidationQueue.h"],
+    exported_deps = [
+        "//eden/common/utils:immediate_future",
+        "//folly:cancellation_token",
+        "//folly:function",
+        "//folly:scope_guard",
+        "//folly:synchronized",
+        "//folly/futures:core",
+        "//folly/logging:logging",
+        "//folly/synchronization:call_once",
+        "//folly/system:thread_name",
     ],
 )
 

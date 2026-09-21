@@ -3,10 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
 
-
-import sys
 import unittest
 
 from ..load import load_all_manifests, patch_loader
@@ -245,8 +242,3 @@ name = bar
         with self.assertRaisesRegex(Exception, "found duplicate manifest 'foo'"):
             # pyre-fixme[6]: For 1st argument expected `BuildOptions` but got `None`.
             load_all_manifests(None)
-
-    if sys.version_info < (3, 2):
-
-        def assertRaisesRegex(self, *args, **kwargs):
-            return self.assertRaisesRegex(*args, **kwargs)

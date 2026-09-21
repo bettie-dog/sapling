@@ -14,8 +14,8 @@ name = "workingcopy"
 
 [dependencies]
 anyhow = "1.0.104"
-bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
-crossbeam = "0.8"
+bitflags = { version = "2.13.2", features = ["serde", "std"], default-features = false }
+crossbeam = "0.8.5"
 fs-err = { version = "3.3.1", features = ["tokio"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 regex = "1.13.1"
@@ -49,14 +49,14 @@ sapling-vfs = { version = "0.1.0", path = "../vfs" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 slex = { version = "0.1.0", path = "../slex" }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 watchman_client = { version = "0.9.0", git = "https://github.com/facebook/watchman.git", branch = "main" }
-whoami = "1.5"
+whoami = "2.1.3"
 
 [dev-dependencies]
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blob = { version = "0.1.0", path = "../blob" }
 sapling-io = { version = "0.1.0", path = "../io" }
 tempfile = "3.27.0"

@@ -22,15 +22,15 @@ derived_data_type_if = { version = "0.1.0", path = "../../derived_data/if" }
 faster-hex = "0.6.1"
 fb303_core = { version = "0.0.0", git = "https://github.com/facebook/fb303.git", branch = "main" }
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hack = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 megarepo_configs = { version = "0.1.0", path = "../../megarepo_api/if/megarepo_configs" }
-ref-cast = "1.0.26"
+ref-cast = "1.0.27"
 rust = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_derive = "1.0.229"
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
-thiserror = "2.0.19"
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+thiserror = "2.0.20"
 thrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 
 [build-dependencies]

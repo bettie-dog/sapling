@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use anyhow::Error;
@@ -24,7 +23,6 @@ use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::Stream;
 use mononoke_macros::mononoke;
-use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::path::MPath;
 
@@ -34,8 +32,8 @@ use crate::PathOrPrefix;
 use crate::PathTree;
 use crate::StoreLoadable;
 use crate::TrieMapOps;
+use crate::comparison::diff_manifest_node;
 use crate::comparison::diff_manifest_node_by_listing;
-use crate::comparison::diff_manifests;
 use crate::select::select_path_tree;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,21 +394,52 @@ where
             None,
             None,
         ) {
-            diff_manifests(
-                ctx,
-                store,
-                self.clone(),
-                other_store,
-                other,
-                recurse_pruner,
-                manifest_replacements,
-            )
-            .filter_map(move |result| {
-                future::ready(match result {
-                    Ok(diff) => output_filter(diff).map(Ok),
-                    Err(err) => Some(Err(err)),
-                })
+            let PathTree {
+                value: replacement,
+                subentries: child_replacements,
+            } = PathTree::from_iter(
+                manifest_replacements
+                    .into_iter()
+                    .map(|(path, entry)| (path, Some(entry))),
+            );
+            let this = match replacement {
+                None => self.clone(),
+                Some(Entry::Tree(replacement)) => replacement,
+                Some(Entry::Leaf(_)) => {
+                    return stream::once(async move {
+                        Err(anyhow!(
+                            "Manifest replacement at root which resolves to a leaf"
+                        ))
+                    })
+                    .boxed();
+                }
+            };
+
+            if this == other {
+                return stream::empty().boxed();
+            }
+
+            let init = Some((Diff::Changed(MPath::ROOT, this, other), child_replacements));
+
+            bounded_traversal::bounded_traversal_stream(256, init, move |(work, replacements)| {
+                cloned!(ctx, output_filter, recurse_pruner, store, other_store);
+                async move {
+                    let (outs, recurse) = diff_manifest_node(
+                        &ctx,
+                        &store,
+                        &other_store,
+                        work,
+                        replacements,
+                        recurse_pruner,
+                    )
+                    .await?;
+                    let outs: Vec<Out> = outs.into_iter().filter_map(&output_filter).collect();
+                    anyhow::Ok((outs, recurse))
+                }
+                .boxed()
             })
+            .map_ok(|entries| stream::iter(entries.into_iter().map(Ok)))
+            .try_flatten()
             .boxed()
         } else {
             self.filtered_diff_slow(
@@ -453,8 +482,14 @@ where
         RecursePruner: Fn(&Diff<Self>) -> bool + Clone + Send + 'static,
         Out: Send + 'static,
     {
-        let (replacement, child_replacements) =
-            ReplacementsHolder::new(manifest_replacements).deconstruct();
+        let PathTree {
+            value: replacement,
+            subentries: child_replacements,
+        } = PathTree::from_iter(
+            manifest_replacements
+                .into_iter()
+                .map(|(path, entry)| (path, Some(entry))),
+        );
         let this = match replacement {
             None => self.clone(),
             Some(Entry::Tree(replacement)) => replacement,
@@ -498,54 +533,6 @@ where
         .map_ok(|entries| stream::iter(entries.into_iter().map(Ok)))
         .try_flatten()
         .boxed()
-    }
-}
-
-pub(crate) struct ReplacementsHolder<Entry> {
-    replacements: PathTree<Option<Entry>>,
-}
-
-impl<Entry> ReplacementsHolder<Entry> {
-    /// Create a new replacements holder for manifest entry replacements.  These entries will replace the entries at the given paths.
-    pub fn new(replacements: HashMap<MPath, Entry>) -> Self {
-        Self {
-            replacements: replacements
-                .into_iter()
-                .map(|(path, entry)| (path, Some(entry)))
-                .collect(),
-        }
-    }
-
-    /// Deconstruct one level of replacements, returning the replacement entry at the current level (if any), and a collection of child replacement holders.
-    pub fn deconstruct(self) -> (Option<Entry>, BTreeMap<MPathElement, Self>) {
-        let (replacement, child_replacements) = self.replacements.deconstruct();
-        let child_replacements: BTreeMap<_, _> = child_replacements
-            .into_iter()
-            .map(|(elem, replacements)| (elem, Self { replacements }))
-            .collect();
-        (replacement, child_replacements)
-    }
-
-    /// Complete processing of a collection of ReplacementsHolders, ensuring that all values have been consumed.
-    pub fn finalize(
-        path: &MPath,
-        mut replacements: BTreeMap<MPathElement, Self>,
-    ) -> Result<(), Error> {
-        if let Some((name, _replacement)) = replacements.pop_first() {
-            let path = path.join(&name);
-            return Err(anyhow!(
-                "Manifest replacement at {path} which doesn't exist in the comparison manifest"
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl<Entry> Default for ReplacementsHolder<Entry> {
-    fn default() -> Self {
-        Self {
-            replacements: PathTree::default(),
-        }
     }
 }
 

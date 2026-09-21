@@ -32,6 +32,18 @@ The list of all the EdenStats Counter/Duration are as follows:
      Number of conflicts avoided because a loaded inode already matched the
      checkout destination.
 
+- TreeInodeStats
+  1. `Counter readdirIndexHit{"inodes.readdir_index_hit"}` : Number of readdir
+     requests served from a directory's cached inode-ordered index.
+
+  2. `Counter readdirIndexCached{"inodes.readdir_index_cached"}` : Number of
+     times a listing that did not fit in one request cached its index for the
+     remaining requests.
+
+  3. `Counter readdirIndexDroppedByGc{"inodes.readdir_index_dropped_by_gc"}` :
+     Number of cached indexes freed by inode garbage collection, which is what
+     reclaims the index of a listing that stopped before its end.
+
 - JournalStats
   1. `Counter truncatedReads{"journal.truncated_reads"}` : Number of times a
      truncated read happens in Journal.
@@ -54,6 +66,15 @@ The list of all the EdenStats Counter/Duration are as follows:
      cache insertion skipped. This is updated when we skip inserting a new entry
      into the cache when the number of the entries from the calculated result is
      larger than the limit configured [here](https://fburl.com/code/flwry2g4).
+
+- GlobStats
+  1. `Counter memoizedFailureStateLimitExceeded{"glob_match.memoized_failure_state_limit_exceeded"}`
+     : Number of glob matches that stopped retaining new failed states after
+     reaching their configured memo limit.
+
+  2. `Counter backtrackingStepLimitExceeded{"glob_match.backtracking_step_limit_exceeded"}`
+     : Number of individual glob matches stopped and reported as non-matches
+     after reaching their configured backtracking step limit.
 
 - ThriftStats
   1. `Duration streamChangesSince{ "thrift.StreamingEdenService.streamChangesSince.streaming_time_us"}`
@@ -160,6 +181,7 @@ The list of all the EdenStats Counter/Duration are as follows:
   Duration rmdir{"fuse.rmdir_us"}
   Duration symlink{"fuse.symlink_us"}
   Duration rename{"fuse.rename_us"}
+  Duration rename2{"fuse.rename2_us"}
   Duration link{"fuse.link_us"}
   Duration open{"fuse.open_us"}
   Duration read{"fuse.read_us"}
@@ -232,6 +254,9 @@ The list of all the EdenStats Counter/Duration are as follows:
   Duration nfsFsinfo{"nfs.fsinfo_us"}
   Duration nfsPathconf{"nfs.pathconf_us"}
   Duration nfsCommit{"nfs.commit_us"}
+
+  Counter nfsRpcExtraConnection{"nfs.rpc.extra_connection"}
+  Counter nfsRpcExtraConnectionRefused{"nfs.rpc.extra_connection_refused"}
 
   Counter nfsInvalidationGcAttempt{"nfs.invalidation.gc.attempt"}
   Counter nfsInvalidationGcSuccess{"nfs.invalidation.gc.success"}

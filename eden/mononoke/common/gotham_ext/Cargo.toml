@@ -10,33 +10,32 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 artillery_http_ext = { version = "0.1.0", path = "../rust/artillery_http_ext" }
-async-compression = { version = "0.4.42", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
-async-trait = "0.1.91"
-base64 = { version = "0.22.1", features = ["alloc"] }
+async-compression = { version = "0.4.47", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
+async-trait = "0.1.92"
+base64 = { version = "0.23.1", features = ["alloc"] }
 bytes = { version = "1.12.1", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cats = { version = "0.1.0", path = "../cats" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 connection_security_checker = { version = "0.1.0", path = "../connection_security_checker" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-either = "1.16.0"
+either = "1.18.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-gotham = "0.8"
-gotham_derive = "0.8"
+gotham = "0.8.1"
+gotham_derive = "0.8.1"
 hex = { version = "0.4.3", features = ["alloc"] }
-hickory-resolver = { version = "0.26.1", features = ["system-config", "tokio"] }
-http = "1.4.2"
+hickory-resolver = { version = "0.26.3", features = ["system-config", "tokio"] }
+http = "1.5.0"
 http-body = "1.1.0"
-http-body-util = "0.1.4"
-hyper = { version = "1.10.1", features = ["client", "http1", "http2"] }
+http-body-util = "0.1.5"
+hyper = { version = "=1.11.0", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 justknobs_ext = { version = "0.1.0", path = "../rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 metadata = { version = "0.1.0", path = "../metadata" }
 mime = "0.3.14"
-mononoke_configs = { version = "0.1.0", path = "../mononoke_configs" }
 mononoke_macros = { version = "0.1.0", path = "../mononoke_macros" }
 openssl = "0.10.80"
 percent-encoding = "2.1"
@@ -51,7 +50,7 @@ scopeguard = "1.2.0"
 scuba_ext = { version = "0.1.0", path = "../scuba_ext" }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tokio-openssl = "0.6.5"
 tokio-util = { version = "0.7.19", features = ["full"] }
 tower-service = "0.3.3"

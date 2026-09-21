@@ -11,9 +11,12 @@
 #include <folly/FileUtil.h>
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
+#include <folly/portability/Fcntl.h>
 #include <folly/portability/Unistd.h>
 #include <gflags/gflags.h>
 #include <sys/types.h>
+#include <algorithm>
+#include <cstdlib>
 
 #include "eden/common/os/ProcessId.h"
 #include "eden/common/telemetry/SessionId.h"
@@ -24,6 +27,7 @@
 #include "eden/fs/service/StartupStatusSubscriber.h"
 
 #ifndef _WIN32
+#include <poll.h>
 #include <sys/wait.h>
 #include <sysexits.h>
 #endif
@@ -64,7 +68,8 @@ std::shared_ptr<StartupLogger> daemonizeIfRequested(
     folly::StringPiece logPath,
     PrivHelper* privHelper,
     const std::vector<std::string>& argv,
-    std::shared_ptr<StartupStatusChannel> startupStatusChannel) {
+    std::shared_ptr<StartupStatusChannel> startupStatusChannel,
+    bool disclaimTccResponsibility) {
   if (!FLAGS_foreground && FLAGS_startupLoggerFd == -1) {
     auto startupLogger =
         std::make_shared<DaemonStartupLogger>(std::move(startupStatusChannel));
@@ -72,7 +77,7 @@ std::shared_ptr<StartupLogger> daemonizeIfRequested(
       startupLogger->warn(
           "Ignoring --startupLogPath because --foreground was not specified");
     }
-    startupLogger->spawn(logPath, privHelper, argv);
+    startupLogger->spawn(logPath, privHelper, argv, disclaimTccResponsibility);
     /* NOTREACHED */
   }
   if (FLAGS_startupLoggerFd != -1) {
@@ -173,8 +178,9 @@ void DaemonStartupLogger::sendResult(ResultType result) {
 void DaemonStartupLogger::spawn(
     StringPiece logPath,
     PrivHelper* privHelper,
-    const std::vector<std::string>& argv) {
-  auto child = spawnImpl(logPath, privHelper, argv);
+    const std::vector<std::string>& argv,
+    bool disclaimTccResponsibility) {
+  auto child = spawnImpl(logPath, privHelper, argv, disclaimTccResponsibility);
   runParentProcess(std::move(child), logPath);
 }
 
@@ -214,7 +220,8 @@ DaemonStartupLogger::ChildHandler::~ChildHandler() {
 DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
     StringPiece logPath,
     [[maybe_unused]] PrivHelper* privHelper,
-    const std::vector<std::string>& argv) {
+    const std::vector<std::string>& argv,
+    [[maybe_unused]] bool disclaimTccResponsibility) {
   XDCHECK(!logPath.empty());
 
   auto exePath = executablePath();
@@ -232,6 +239,14 @@ DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
   SpawnedProcess::Options opts;
   opts.executablePath(exePath);
   opts.nullStdin();
+
+#ifdef __APPLE__
+  if (disclaimTccResponsibility) {
+    // Make the daemon its own TCC responsible process so that TCC grants
+    // keyed to edenfs's code signature apply regardless of what launched us.
+    opts.disclaimTccResponsibility();
+  }
+#endif
 
 #ifdef _WIN32
   // Redirect to a pipe. See `StartupLogger::ChildHandler` for detail.
@@ -264,10 +279,18 @@ DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
   args.push_back(logPath.str());
 
 #ifndef _WIN32
-  // If we started a privhelper, pass its control descriptor to the child
-  if (privHelper && privHelper->getRawClientFd() != -1) {
-    auto fd = opts.inheritDescriptor(FileDescriptor(
-        ::dup(privHelper->getRawClientFd()), FileDescriptor::FDType::Socket));
+  // If we started a privhelper, pass its control descriptor to the child.
+  // Read the fd once: it can become -1 if the connection is lost.
+  const int privHelperFd = privHelper ? privHelper->getRawClientFd() : -1;
+  if (privHelperFd != -1) {
+    // The copy must be close-on-exec, or it survives the exec below at its own
+    // number and leaks the privhelper socket. inheritDescriptor()'s dup2()
+    // clears the flag on the target the child is meant to use.
+    const int duped = fcntl(privHelperFd, F_DUPFD_CLOEXEC, 0);
+    folly::checkUnixError(
+        duped, "failed to duplicate the privhelper client descriptor");
+    auto fd = opts.inheritDescriptor(
+        FileDescriptor(duped, FileDescriptor::FDType::Socket));
     // Note: we can't use `--privhelper_fd=123` here because
     // startOrConnectToPrivHelper has an intentionally anemic argv parser.
     // It requires that the flag and the value be in separate
@@ -395,8 +418,8 @@ void DaemonStartupLogger::runParentProcess(
   // Wait for the child to finish initializing itself and then exit
   // without ever returning to the caller.
   try {
-    auto result =
-        waitForChildStatus(child.exitStatusPipe, child.process, logPath);
+    auto result = waitForChildStatus(
+        child.exitStatusPipe, child.process, logPath, startupTimeout());
     if (!result.errorMessage.empty()) {
       fprintf(stderr, "%s\n", result.errorMessage.c_str());
       fflush(stderr);
@@ -439,13 +462,69 @@ void DaemonStartupLogger::redirectOutput(StringPiece logPath) {
   }
 }
 
+std::optional<std::chrono::milliseconds> DaemonStartupLogger::startupTimeout() {
+  // The privhelper sets this on every daemon it relaunches, and nothing else
+  // does, so its presence is what distinguishes a supervised startup from one
+  // the user began.
+  if (std::getenv(kEdenFsRestartCountEnv.str().c_str()) == nullptr) {
+    return std::nullopt;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      kRelaunchStartupTimeout);
+}
+
 DaemonStartupLogger::ParentResult DaemonStartupLogger::waitForChildStatus(
     FileDescriptor& pipe,
     SpawnedProcess& proc,
-    StringPiece logPath) {
+    StringPiece logPath,
+    std::optional<std::chrono::milliseconds> timeout) {
+  // Only a caller that set a deadline gets a daemon terminated on its behalf.
+  const bool enforceDeadline = timeout.has_value();
+
+#ifndef _WIN32
+  if (enforceDeadline) {
+    const auto deadline = std::chrono::steady_clock::now() + *timeout;
+    while (true) {
+      const auto remaining = std::max(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now()),
+          0ms);
+      struct pollfd pfd{pipe.fd(), POLLIN, 0};
+      const auto pollResult =
+          ::poll(&pfd, 1, static_cast<int>(remaining.count()));
+      if (pollResult > 0) {
+        break;
+      }
+      if (pollResult < 0 && errno == EINTR) {
+        continue;
+      }
+      if (pollResult < 0) {
+        const auto error = folly::errnoStr(errno);
+        proc.terminateOrKill(kRestartTerminationTimeout);
+        return ParentResult(
+            EX_SOFTWARE,
+            "error waiting for EdenFS initialization status: ",
+            error);
+      }
+
+      proc.terminateOrKill(kRestartTerminationTimeout);
+      return ParentResult(
+          EX_SOFTWARE,
+          "error: EdenFS did not finish initializing within ",
+          std::chrono::duration_cast<std::chrono::seconds>(*timeout).count(),
+          " seconds\nCheck the EdenFS log file at ",
+          logPath,
+          " for more details");
+    }
+  }
+#endif
+
   ResultType status;
   auto readResult = pipe.readFull(&status, sizeof(status));
   if (readResult.hasException()) {
+    if (enforceDeadline) {
+      proc.terminateOrKill(kRestartTerminationTimeout);
+    }
     return ParentResult(
         EX_SOFTWARE,
         "error reading status of EdenFS initialization: ",
@@ -457,10 +536,18 @@ DaemonStartupLogger::ParentResult DaemonStartupLogger::waitForChildStatus(
   if (static_cast<size_t>(bytesRead) < sizeof(status)) {
     // This should only happen if edenfs crashed before writing its status.
     // Check to see if the child process has died.
-    auto result = handleChildCrash(proc);
+    auto result = handleChildCrash(proc, enforceDeadline);
     result.errorMessage += fmt::format(
         "\nCheck the EdenFS log file at {} for more details", logPath);
     return result;
+  }
+
+  if (enforceDeadline && status != 0) {
+    // A reported failure is not an exit yet, and returning before the child is
+    // gone would leave it running once the privhelper starts unmounting. The
+    // budget is halved so both phases fit the one PrivHelper.h accounts for.
+    proc.waitOrTerminateOrKill(
+        kRestartTerminationTimeout / 2, kRestartTerminationTimeout / 2);
   }
 
   // Return the status code.
@@ -469,7 +556,8 @@ DaemonStartupLogger::ParentResult DaemonStartupLogger::waitForChildStatus(
 }
 
 DaemonStartupLogger::ParentResult DaemonStartupLogger::handleChildCrash(
-    SpawnedProcess& proc) {
+    SpawnedProcess& proc,
+    bool terminateIfStillRunning) {
   constexpr size_t kMaxRetries = 5;
   constexpr auto kRetrySleep = 100ms;
 
@@ -510,6 +598,9 @@ DaemonStartupLogger::ParentResult DaemonStartupLogger::handleChildCrash(
 
     // The child still wasn't waitable after waiting for a while.
     // This should only happen if there is a bug somehow.
+    if (terminateIfStillRunning) {
+      proc.terminateOrKill(kRestartTerminationTimeout);
+    }
     return ParentResult(
         EX_SOFTWARE,
         "error: EdenFS is still running but did not report "

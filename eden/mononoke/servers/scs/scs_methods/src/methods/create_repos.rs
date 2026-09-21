@@ -24,12 +24,20 @@ use configo_thrift_srclients::ConfigoServiceClient;
 use configo_thrift_srclients::make_ConfigoService_srclient;
 use configo_thrift_srclients::thrift::MutationState;
 use context::CoreContext;
+use fbinit::FacebookInit;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use futures::future::try_join_all;
+use futures::stream;
 use futures_retry::retry;
 use git_source_of_truth::GitSourceOfTruth;
 use git_source_of_truth::GitSourceOfTruthConfig;
 use git_source_of_truth::RepositoryName;
 use git_source_of_truth::Staleness;
+use git_source_of_truth::flip_landed_mutation_to_mononoke;
+use git_symbolic_refs::GitSymbolicRefs;
+use git_symbolic_refs::GitSymbolicRefsEntry;
+use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
 use infrasec_authorization::ACL;
 use infrasec_authorization::Identity;
 use infrasec_authorization::consts as auth_consts;
@@ -52,6 +60,7 @@ use oncall::OncallClient;
 use permission_checker::AclProvider;
 use repo_authorization::AuthorizationContext;
 use repo_spec_writer::RepoIndexEntry;
+use repo_spec_writer::RepoSpecDir;
 use repo_spec_writer::append_to_repo_index;
 use repo_spec_writer::make_repo_spec_config_path;
 use repo_spec_writer::make_repo_spec_file_path;
@@ -62,7 +71,10 @@ use repos::RepoSpec;
 use repos::ShardingRegions;
 use repos::TShirtSize;
 use source_control as thrift;
+use sql_construct::SqlConstructFromMetadataDatabaseConfig;
+use sql_ext::facebook::MysqlOptions;
 use thrift::RepoSizeBucket;
+use tokio::sync::OnceCell;
 use tracing::info;
 use tracing::warn;
 
@@ -75,6 +87,366 @@ const REPO_SPEC_THRIFT_PATH: &str = "source/scm/mononoke/repos/repos.thrift";
 /// `reserve_repos_ids`. Shared by the production call site and the tests so
 /// the two can never drift.
 const ATTACH_JK: &str = "scm/mononoke:create_repos_attach_to_inflight_mutation";
+/// Whether an out-of-bounds batch is rejected or merely logged. Turning this
+/// off is the kill switch; the caps themselves are not runtime-tunable.
+/// Switchval'd on the tier name, so enforcement can be turned on one tier at a
+/// time.
+const ENFORCE_BATCH_SIZE_JK: &str = "scm/mononoke:create_repos_enforce_max_batch_size";
+const WRITE_DEFAULT_BRANCH_SYMREF_JK: &str =
+    "scm/mononoke:create_repos_write_default_branch_symref";
+const DEFAULT_GIT_REPO_CONFIG_PATH: &str = "scm/mononoke/repos/common/default_git_repo_config";
+
+/// Group granting the elevated batch tier, one step below Source Control's own.
+/// Membership is the whole mechanism:
+/// callers are added and removed there rather than here, so widening or
+/// narrowing who may create repos in bulk does not need a diff. Expected
+/// members are the automated bundle-import pipeline
+/// (`SANDCASTLE_TAG:git_repo_importer`, the tag its Skycastle workflow declares
+/// in `required_tag_identities`) and whoever is currently doing bulk onboarding
+/// by hand.
+const BULK_REPO_CREATORS_GROUP: &str = "bulk_repo_creators";
+
+/// Which batch-size cap applies to a caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchSizeTier {
+    SourceControl,
+    /// Members of the bulk-repo-creators group.
+    Elevated,
+    Default,
+}
+
+impl BatchSizeTier {
+    /// Enforcement switchval, and the tier as it appears in the advisory log.
+    fn name(self) -> &'static str {
+        match self {
+            Self::SourceControl => "source_control",
+            Self::Elevated => "elevated",
+            Self::Default => "default",
+        }
+    }
+
+    /// Only Source Control's tier covers the largest batches on record. A
+    /// delegated grant is deliberately smaller than what the team that hands it
+    /// out can do itself -- see the tests, which pin every rejection.
+    fn max_batch_size(self) -> usize {
+        match self {
+            Self::SourceControl => 1000,
+            Self::Elevated => 500,
+            Self::Default => 50,
+        }
+    }
+}
+
+/// Resolve the caller's batch-size tier.
+///
+/// A property of the caller, not of the request: the same identity gets the
+/// same cap whatever it is creating.
+///
+/// Elevated is group membership rather than anything hardcoded here, so the
+/// set of bulk creators can change without a code change.
+///
+/// Keyed on the mTLS identity set, deliberately **not** on the `client_id`
+/// header: that header is client-supplied and never verified against the
+/// identities (`source_control_impl.rs` sets it on the untrusted-proxy branch
+/// too), so it cannot carry an authorization decision. It is not keyed on an
+/// ACL action either -- a Hipster action expresses a permission, and no ACL
+/// carries one for a quota; the closest in-tree precedent for a per-caller
+/// limit is a rate-limit target on an identity set
+/// (`rate_limiting/src/config.rs`).
+///
+/// Fails *down*, never up -- a group lookup error yields the lower tier.
+async fn batch_size_tier_for_caller(
+    ctx: &CoreContext,
+    acl_provider: &dyn AclProvider,
+) -> BatchSizeTier {
+    let identities = ctx.metadata().identities();
+
+    // Checked before the group so that a Source Control member who is also in
+    // it gets the higher of the two caps rather than whichever was looked up
+    // first. It also means an edit that empties or breaks the group cannot
+    // leave the oncall holding an unrecognised caller's cap while they fix it.
+    if let Ok(admins) = acl_provider.admin_group().await {
+        if admins.is_member(identities).await {
+            return BatchSizeTier::SourceControl;
+        }
+    }
+
+    if let Ok(bulk_creators) = acl_provider.group(BULK_REPO_CREATORS_GROUP).await {
+        if bulk_creators.is_member(identities).await {
+            return BatchSizeTier::Elevated;
+        }
+    }
+
+    BatchSizeTier::Default
+}
+
+/// Classify a batch against a cap, without deciding whether to act on it.
+///
+/// The error must be a `Request` error: `create_repos_in_mononoke` retries
+/// everything that is not `ServiceError::Request`, so an internal error here
+/// would be silently retried instead of reported to the caller.
+fn check_batch_size(count: usize, max_batch_size: usize) -> Result<(), scs_errors::ServiceError> {
+    if count == 0 {
+        return Err(scs_errors::invalid_request(
+            "create_repos was called with an empty batch, which creates nothing but still costs a \
+             configerator mutation. Omit the call instead."
+                .to_string(),
+        )
+        .into());
+    }
+
+    if count <= max_batch_size {
+        return Ok(());
+    }
+
+    Err(scs_errors::invalid_request(format!(
+        "create_repos was asked to create {count} repos, which exceeds the maximum batch size of \
+         {max_batch_size} for this caller. Split the request into smaller batches, or ask Source \
+         Control for membership of the '{BULK_REPO_CREATORS_GROUP}' group."
+    ))
+    .into())
+}
+
+const HEAD_SYMREF: &str = "HEAD";
+
+fn validate_default_branch(branch: &str) -> Result<&str, scs_errors::ServiceError> {
+    if branch.is_empty() {
+        return Err(scs_errors::invalid_request(
+            "default_branch must not be empty; omit the field to create a repo without a HEAD \
+             symref"
+                .to_string(),
+        )
+        .into());
+    }
+    if branch.eq_ignore_ascii_case(HEAD_SYMREF) {
+        return Err(scs_errors::invalid_request(
+            "default_branch must not be 'HEAD' (in any casing): HEAD is the symref that points \
+             at the default branch, not a branch itself"
+                .to_string(),
+        )
+        .into());
+    }
+    if branch.starts_with("refs/") {
+        return Err(scs_errors::invalid_request(format!(
+            "default_branch must be a short branch name (e.g. 'main'), not a full ref: '{branch}'"
+        ))
+        .into());
+    }
+    Ok(branch)
+}
+
+/// Gate for the `default_branch` feature, evaluated once per batch: returns
+/// whether symref writes are enabled, validating every set `default_branch`
+/// when they are. The JK is never evaluated when no request sets the field,
+/// and with it off the field is fully inert (no validation, no writes).
+fn validate_default_branches(
+    repos: &[thrift::RepoCreationRequest],
+) -> Result<bool, scs_errors::ServiceError> {
+    if !repos.iter().any(|request| request.default_branch.is_some()) {
+        return Ok(false);
+    }
+    if !justknobs::eval(WRITE_DEFAULT_BRANCH_SYMREF_JK, None, None) {
+        return Ok(false);
+    }
+    for request in repos {
+        if let Some(branch) = &request.default_branch {
+            validate_default_branch(branch)?;
+        }
+    }
+    Ok(true)
+}
+
+async fn write_default_branch_symref(
+    ctx: &CoreContext,
+    store: &dyn GitSymbolicRefs,
+    branch: &str,
+) -> Result<(), scs_errors::ServiceError> {
+    let entry = GitSymbolicRefsEntry::new(
+        HEAD_SYMREF.to_string(),
+        branch.to_string(),
+        "branch".to_string(),
+    )
+    .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
+    store
+        .add_or_update_entries(ctx, vec![entry])
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+trait SymrefStoreProvider: Send + Sync {
+    async fn repo_store(
+        &self,
+        repo_id: RepositoryId,
+    ) -> Result<Arc<dyn GitSymbolicRefs>, scs_errors::ServiceError>;
+}
+
+#[derive(Clone)]
+struct SymrefStoreFactory {
+    fb: FacebookInit,
+    configs: Arc<MononokeConfigs>,
+    mysql_options: MysqlOptions,
+    /// Storage-name/config resolution and SQL connection setup happen once
+    /// per factory (one factory per request); per-repo stores share the
+    /// connections.
+    builder: Arc<OnceCell<SqlGitSymbolicRefsBuilder>>,
+}
+
+impl SymrefStoreFactory {
+    fn default_git_storage_name(&self) -> Result<String, scs_errors::ServiceError> {
+        let config_store = self.configs.config_store().ok_or_else(|| {
+            scs_errors::internal_error(
+                "No config store available for resolving the default git repo storage",
+            )
+        })?;
+        let template = configerator_repo_config_handle(DEFAULT_GIT_REPO_CONFIG_PATH, config_store)
+            .map_err(|e| {
+                scs_errors::internal_error(format!("Failed to load default git repo config: {e:#}"))
+            })?
+            .get();
+        template.storage_config.clone().ok_or_else(|| {
+            scs_errors::internal_error(format!(
+                "{DEFAULT_GIT_REPO_CONFIG_PATH} does not name a storage config"
+            ))
+            .into()
+        })
+    }
+
+    async fn shared_builder(&self) -> Result<&SqlGitSymbolicRefsBuilder, scs_errors::ServiceError> {
+        self.builder
+            .get_or_try_init(|| async {
+                let storage_name = self.default_git_storage_name()?;
+                let storage_configs = self.configs.storage_configs();
+                let storage_config =
+                    storage_configs.storage.get(&storage_name).ok_or_else(|| {
+                        scs_errors::ServiceError::from(scs_errors::internal_error(format!(
+                            "Storage config '{storage_name}' not found while building the symref \
+                             store"
+                        )))
+                    })?;
+                SqlGitSymbolicRefsBuilder::with_metadata_database_config(
+                    self.fb,
+                    &storage_config.metadata,
+                    &self.mysql_options,
+                    false,
+                )
+                .await
+                .map_err(|e| {
+                    scs_errors::ServiceError::from(scs_errors::internal_error(format!(
+                        "Failed to open the symref store: {e:#}"
+                    )))
+                })
+            })
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl SymrefStoreProvider for SymrefStoreFactory {
+    async fn repo_store(
+        &self,
+        repo_id: RepositoryId,
+    ) -> Result<Arc<dyn GitSymbolicRefs>, scs_errors::ServiceError> {
+        let builder = self.shared_builder().await?;
+        Ok(Arc::new(builder.clone().build(repo_id)))
+    }
+}
+
+/// `enabled` is the batch-wide decision from `validate_default_branches`;
+/// the JK must not be re-evaluated here.
+async fn write_default_branch_symrefs(
+    ctx: &CoreContext,
+    symref_store_provider: &dyn SymrefStoreProvider,
+    repo_ids_and_requests: &[(RepositoryId, thrift::RepoCreationRequest)],
+    enabled: bool,
+) -> Result<Vec<RepositoryId>, scs_errors::ServiceError> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let targets = repo_ids_and_requests
+        .iter()
+        .filter_map(|(repo_id, request)| {
+            request
+                .default_branch
+                .clone()
+                .map(|branch| (*repo_id, branch))
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let repo_ids = targets
+        .iter()
+        .map(|(repo_id, _branch)| *repo_id)
+        .collect::<Vec<_>>();
+    stream::iter(targets)
+        .map(|(repo_id, branch)| async move {
+            let store = symref_store_provider.repo_store(repo_id).await?;
+            write_default_branch_symref(ctx, store.as_ref(), &branch).await
+        })
+        .buffer_unordered(10)
+        .try_collect::<Vec<()>>()
+        .await?;
+
+    Ok(repo_ids)
+}
+
+async fn delete_head_symrefs(
+    ctx: &CoreContext,
+    symref_store_provider: &dyn SymrefStoreProvider,
+    repo_ids: &[RepositoryId],
+) -> Result<(), scs_errors::ServiceError> {
+    stream::iter(repo_ids.iter().copied())
+        .map(|repo_id| async move {
+            let store = symref_store_provider.repo_store(repo_id).await?;
+            store
+                .delete_symrefs(ctx, vec![HEAD_SYMREF.to_string()])
+                .await
+                .map_err(|e| {
+                    scs_errors::ServiceError::from(scs_errors::internal_error(format!(
+                        "Failed to delete the HEAD symref for repo {repo_id}: {e:#}"
+                    )))
+                })
+        })
+        .buffer_unordered(10)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+async fn cleanup_reserved_repos_after_failure(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
+    symref_repo_ids: &[RepositoryId],
+    params: &thrift::CreateReposParams,
+) -> Result<(), scs_errors::ServiceError> {
+    // Symref deletes go before the SoT deletes so a failure leaves the rows
+    // Reserved and retryable; same retry shape as the poll-path cleanup.
+    retry(
+        |_| delete_head_symrefs(ctx, symref_store_provider, symref_repo_ids),
+        Duration::from_millis(1_000),
+    )
+    .binary_exponential_backoff()
+    .max_attempts(5)
+    .await?;
+    retry(
+        |_| {
+            delete_source_of_truth_for_reserved_repos(
+                ctx.clone(),
+                git_source_of_truth_config,
+                params,
+            )
+        },
+        Duration::from_millis(1_000),
+    )
+    .binary_exponential_backoff()
+    .max_attempts(5)
+    .await?;
+    Ok(())
+}
 
 async fn ensure_acls_allow_repo_creation(
     ctx: CoreContext,
@@ -751,7 +1123,7 @@ fn make_repo_spec(
             make_top_level_acl_name_from_repo_name(&request.repo_name)
         },
         enabled: true,
-        readonly: false,
+        readonly: request.readonly.unwrap_or(false),
         default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
         enable_git_bundle_uri: None,
         tiers: tier_list_for_repo(&request.repo_name),
@@ -779,14 +1151,12 @@ async fn prepare_repo_configs_mutation_nowait(
     let config_store = configs.config_store().ok_or_else(|| {
         scs_errors::internal_error("No config store available for loading default repo config")
     })?;
-    let default_repo_config = configerator_repo_config_handle(
-        "scm/mononoke/repos/common/default_git_repo_config",
-        config_store,
-    )
-    .map_err(|e| {
-        scs_errors::internal_error(format!("Failed to load default git repo config: {e:#}"))
-    })?
-    .get();
+    let default_repo_config =
+        configerator_repo_config_handle(DEFAULT_GIT_REPO_CONFIG_PATH, config_store)
+            .map_err(|e| {
+                scs_errors::internal_error(format!("Failed to load default git repo config: {e:#}"))
+            })?
+            .get();
 
     // Create individual repo config files
     for (repo_id, request) in &repos_ids_and_requests {
@@ -794,7 +1164,8 @@ async fn prepare_repo_configs_mutation_nowait(
             &(*repo_id, request.clone()),
             Some((*default_repo_config).clone()),
         )?;
-        let file_path = make_repo_spec_file_path(&request.repo_name);
+        // create_repos only ever creates git repos (see RepoSpecDir docs).
+        let file_path = make_repo_spec_file_path(&request.repo_name, RepoSpecDir::Git);
         txn.set_thrift_object(
             repo_spec,
             file_path,
@@ -821,7 +1192,7 @@ async fn prepare_repo_configs_mutation_nowait(
     let new_entries: Vec<_> = repos_ids_and_requests
         .iter()
         .map(|(repo_id, request)| {
-            let config_path = make_repo_spec_config_path(&request.repo_name);
+            let config_path = make_repo_spec_config_path(&request.repo_name, RepoSpecDir::Git);
             let t_shirt_size = to_repo_spec_tshirt_size(request.size_bucket)?;
             Ok((
                 request.repo_name.clone(),
@@ -836,6 +1207,7 @@ async fn prepare_repo_configs_mutation_nowait(
                     } else {
                         make_top_level_acl_name_from_repo_name(&request.repo_name)
                     },
+                    readonly: request.readonly.unwrap_or(false),
                     enable_git_bundle_uri: None,
                 },
             ))
@@ -868,25 +1240,14 @@ async fn prepare_repo_configs_mutation_nowait(
     Ok(mutation.id)
 }
 
-async fn update_source_of_truth_to_mononoke_for_mutation_id(
-    ctx: CoreContext,
-    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
-    mutation_id: i64,
-) -> Result<(), scs_errors::ServiceError> {
-    git_source_of_truth_config
-        .update_source_of_truth_by_mutation_id(&ctx, GitSourceOfTruth::Mononoke, mutation_id)
-        .await
-        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
-    Ok(())
-}
-
 async fn update_mutation_id_by_repo_names_for_reserved_repos(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     params: &thrift::CreateReposParams,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
-    git_source_of_truth_config
+    let expected = params.repos.len() as u64;
+    let stamped = git_source_of_truth_config
         .update_mutation_id_by_repo_names_for_reserved_repos(
             &ctx,
             &params
@@ -898,7 +1259,52 @@ async fn update_mutation_id_by_repo_names_for_reserved_repos(
         )
         .await
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
+    // Every reserved row must still exist when it is stamped. A shortfall
+    // means rows were lost (e.g. deleted out-of-band) after reservation:
+    // fail the creation loudly before it proceeds toward landing, instead
+    // of landing repos with no source-of-truth row.
+    // MySQL affected_rows counts CHANGED rows; the confirm-read distinguishes a lost-ack re-stamp from genuine row loss.
+    if stamped != expected
+        && !all_requested_repos_stamped(&ctx, git_source_of_truth_config, params, mutation_id)
+            .await?
+    {
+        return Err(scs_errors::internal_error(format!(
+            "stamping mutation_id {mutation_id} updated {stamped} reserved row(s) but {expected} \
+             were reserved; refusing to proceed, reconcile the source-of-truth table"
+        ))
+        .into());
+    }
     Ok(())
+}
+
+async fn all_requested_repos_stamped(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    params: &thrift::CreateReposParams,
+    mutation_id: i64,
+) -> Result<bool, scs_errors::ServiceError> {
+    // A row can flip Reserved -> Mononoke while the stamp is still retrying:
+    // once the stamp has committed (even with its ack lost), a concurrent
+    // duplicate request can attach to this mutation_id, and its client's poll
+    // can land the mutation and flip the rows before the retry loop is done.
+    // A flip proves the stamp committed, so rows in either state count.
+    let stamped_names: HashSet<String> = git_source_of_truth_config
+        .get_reserved_by_mutation_id(ctx, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?
+        .into_iter()
+        .chain(
+            git_source_of_truth_config
+                .get_redirected_to_mononoke_by_mutation_id(ctx, mutation_id)
+                .await
+                .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?,
+        )
+        .map(|entry| entry.repo_name.0)
+        .collect();
+    Ok(params
+        .repos
+        .iter()
+        .all(|request| stamped_names.contains(&request.repo_name)))
 }
 
 async fn delete_source_of_truth_for_reserved_repos(
@@ -936,8 +1342,10 @@ async fn delete_source_of_truth_for_mutation_id(
 async fn create_repos_in_mononoke(
     ctx: CoreContext,
     git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
+    symref_store_factory: SymrefStoreFactory,
     params: &thrift::CreateReposParams,
     configs: &MononokeConfigs,
+    write_default_branch_symrefs_enabled: bool,
 ) -> Result<Option<i64>, scs_errors::ServiceError> {
     // ## What:
     // Create these repositories in Mononoke.
@@ -978,6 +1386,41 @@ async fn create_repos_in_mononoke(
         ReserveOutcome::AttachedToInflight { mutation_id } => return Ok(Some(mutation_id)),
     };
 
+    // Written at reservation time: the poll may run on another host that only has the mutation_id.
+    let written_symref_repo_ids = match write_default_branch_symrefs(
+        &ctx,
+        &symref_store_factory,
+        &repo_ids_and_requests,
+        write_default_branch_symrefs_enabled,
+    )
+    .await
+    {
+        Ok(written) => written,
+        Err(write_err) => {
+            let attempted = repo_ids_and_requests
+                .iter()
+                .filter(|(_repo_id, request)| request.default_branch.is_some())
+                .map(|(repo_id, _request)| *repo_id)
+                .collect::<Vec<_>>();
+            if let Err(cleanup_err) = cleanup_reserved_repos_after_failure(
+                &ctx,
+                git_source_of_truth_config.as_ref(),
+                &symref_store_factory,
+                &attempted,
+                params,
+            )
+            .await
+            {
+                warn!(
+                    "cleanup after create_repos symref write failure also failed; original error: {:?}",
+                    write_err
+                );
+                return Err(cleanup_err);
+            }
+            return Err(write_err);
+        }
+    };
+
     // We have reserved the repo ids. Now it's time to actually create the repos, safe in the
     // knowledge that no-one will compete with us
     match prepare_repo_configs_mutation_nowait(ctx.clone(), repo_ids_and_requests, configs).await {
@@ -1000,6 +1443,7 @@ async fn create_repos_in_mononoke(
             // Clone necessary data for the spawned task
             let poll_ctx = ctx.clone();
             let git_sot_config = git_source_of_truth_config.clone();
+            let poll_symref_store_factory = symref_store_factory.clone();
 
             mononoke::spawn_task({
                 async move {
@@ -1010,6 +1454,7 @@ async fn create_repos_in_mononoke(
                         match poll_mutation_id(
                             poll_ctx.clone(),
                             git_sot_config.as_ref(),
+                            &poll_symref_store_factory,
                             mutation_id,
                         )
                         .await
@@ -1042,19 +1487,21 @@ async fn create_repos_in_mononoke(
         Err(e) => {
             // We failed to land the mutation, so it is safe to "release the lock" on these repo
             // ids and names, which will allow a future attempt to succeed.
-            retry(
-                |_| {
-                    delete_source_of_truth_for_reserved_repos(
-                        ctx.clone(),
-                        git_source_of_truth_config.as_ref(),
-                        params,
-                    )
-                },
-                Duration::from_millis(1_000),
+            if let Err(cleanup_err) = cleanup_reserved_repos_after_failure(
+                &ctx,
+                git_source_of_truth_config.as_ref(),
+                &symref_store_factory,
+                &written_symref_repo_ids,
+                params,
             )
-            .binary_exponential_backoff()
-            .max_attempts(5)
-            .await?;
+            .await
+            {
+                warn!(
+                    "cleanup after create_repos mutation prepare failure also failed; original error: {:?}",
+                    e
+                );
+                return Err(cleanup_err);
+            }
             Err(e)
         }
     }
@@ -1064,27 +1511,66 @@ async fn create_repos_in_mononoke(
 async fn create_repos_in_mononoke(
     _ctx: CoreContext,
     _git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
+    _symref_store_factory: SymrefStoreFactory,
     _params: &thrift::CreateReposParams,
     _configs: &MononokeConfigs,
+    _write_default_branch_symrefs_enabled: bool,
 ) -> Result<Option<i64>, scs_errors::ServiceError> {
     println!("No access to configo in oss build");
     Ok(None)
 }
 
 impl SourceControlServiceImpl {
+    fn symref_store_factory(&self) -> SymrefStoreFactory {
+        SymrefStoreFactory {
+            fb: self.fb,
+            configs: self.configs.clone(),
+            mysql_options: self.mysql_options.clone(),
+            builder: Arc::new(OnceCell::new()),
+        }
+    }
+
     pub(crate) async fn create_repos(
         &self,
         ctx: CoreContext,
         params: thrift::CreateReposParams,
     ) -> Result<thrift::CreateReposToken, scs_errors::ServiceError> {
+        // Must precede `ensure_acls_allow_repo_creation`, which fans out one
+        // Hipster/Oncall RPC per requested repo with an unbounded `try_join_all`:
+        // a cap applied afterwards would already have paid the cost it bounds.
+        //
+        // Advisory unless the enforce knob is on. `create_repos` has always
+        // accepted any batch, including empty ones, and both the bulk-import
+        // pipeline and `scmadmin repo tasks` are unattended, so a rejection
+        // that arrives without a measured log-only phase fails a partner run on
+        // a number we guessed (`config_rollout_safety.md`, S578742).
+        let count = params.repos.len();
+        let tier = batch_size_tier_for_caller(&ctx, self.acl_provider.as_ref()).await;
+        if let Err(error) = check_batch_size(count, tier.max_batch_size()) {
+            if justknobs::eval(ENFORCE_BATCH_SIZE_JK, None, Some(tier.name())) {
+                return Err(error);
+            }
+            warn!(
+                count,
+                max_batch_size = tier.max_batch_size(),
+                tier = tier.name(),
+                "create_repos batch is outside the cap for this tier; admitting it because \
+                 enforcement is off"
+            );
+        }
+
+        let write_default_branch_symrefs_enabled = validate_default_branches(&params.repos)?;
+
         ensure_acls_allow_repo_creation(ctx.clone(), &params.repos, self.acl_provider.as_ref())
             .await?;
         update_repos_acls(ctx.clone(), &params).await?;
         let mutation_id = create_repos_in_mononoke(
             ctx,
             self.git_source_of_truth_config.clone(),
+            self.symref_store_factory(),
             &params,
             &self.configs,
+            write_default_branch_symrefs_enabled,
         )
         .await?;
 
@@ -1105,10 +1591,12 @@ impl SourceControlServiceImpl {
         }
 
         let mutation_id = token.mutation_id.unwrap();
+        let symref_store_factory = self.symref_store_factory();
         let mutation_state;
         let status = match poll_mutation_id(
             ctx,
             self.git_source_of_truth_config.as_ref(),
+            &symref_store_factory,
             mutation_id,
         )
         .await
@@ -1152,13 +1640,29 @@ impl SourceControlServiceImpl {
 async fn poll_mutation_id(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
     mutation_id: i64,
 ) -> Result<MutationState, scs_errors::ServiceError> {
-    match poll_mutation_id_impl(ctx.clone(), git_source_of_truth_config, mutation_id, 0).await {
+    match poll_mutation_id_impl(
+        ctx.clone(),
+        git_source_of_truth_config,
+        symref_store_provider,
+        mutation_id,
+        0,
+    )
+    .await
+    {
         Ok(state) => Ok(state),
         Err(e) => match e {
             scs_errors::ServiceError::Poll(_) => {
-                poll_mutation_id_impl(ctx.clone(), git_source_of_truth_config, mutation_id, 1).await
+                poll_mutation_id_impl(
+                    ctx.clone(),
+                    git_source_of_truth_config,
+                    symref_store_provider,
+                    mutation_id,
+                    1,
+                )
+                .await
             }
             _ => Err(e),
         },
@@ -1170,19 +1674,9 @@ async fn handle_landed_state(
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
-    retry(
-        |_| {
-            update_source_of_truth_to_mononoke_for_mutation_id(
-                ctx.clone(),
-                git_source_of_truth_config,
-                mutation_id,
-            )
-        },
-        Duration::from_millis(1_000),
-    )
-    .binary_exponential_backoff()
-    .max_attempts(5)
-    .await?;
+    flip_landed_mutation_to_mononoke(&ctx, git_source_of_truth_config, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     Ok(())
 }
 
@@ -1212,6 +1706,7 @@ async fn handle_prepared_state(
 async fn handle_mutation_state(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
     configo_client: ConfigoServiceClient,
     state: MutationState,
     mutation_id: i64,
@@ -1224,7 +1719,13 @@ async fn handle_mutation_state(
             handle_landed_state(ctx, git_source_of_truth_config, mutation_id).await?;
         }
         MutationState::FAILED | MutationState::ABORTED => {
-            cleanup_repos(ctx, git_source_of_truth_config, mutation_id).await?;
+            cleanup_repos(
+                ctx,
+                git_source_of_truth_config,
+                symref_store_provider,
+                mutation_id,
+            )
+            .await?;
         }
         MutationState::PREPARED => {
             handle_prepared_state(
@@ -1245,6 +1746,7 @@ async fn handle_mutation_state(
 async fn poll_mutation_id_impl(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
     mutation_id: i64,
     retry_count: i64,
 ) -> std::result::Result<MutationState, scs_errors::ServiceError> {
@@ -1257,7 +1759,13 @@ async fn poll_mutation_id_impl(
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
 
     if resp.error {
-        cleanup_repos(ctx.clone(), git_source_of_truth_config, mutation_id).await?;
+        cleanup_repos(
+            ctx.clone(),
+            git_source_of_truth_config,
+            symref_store_provider,
+            mutation_id,
+        )
+        .await?;
         return Err(scs_errors::internal_error(format!(
             "Configo mutation error: {}",
             resp.errorMessage
@@ -1272,7 +1780,13 @@ async fn poll_mutation_id_impl(
 
     if mutation.stateInfo.isError {
         info!("cleaning up, mutation state info has error {}", mutation_id);
-        cleanup_repos(ctx.clone(), git_source_of_truth_config, mutation_id).await?;
+        cleanup_repos(
+            ctx.clone(),
+            git_source_of_truth_config,
+            symref_store_provider,
+            mutation_id,
+        )
+        .await?;
         return Err(scs_errors::internal_error(format!(
             "Configo mutation error: {}",
             mutation.stateInfo.errorMessage
@@ -1284,6 +1798,7 @@ async fn poll_mutation_id_impl(
     handle_mutation_state(
         ctx,
         git_source_of_truth_config,
+        symref_store_provider,
         configo_client,
         state,
         mutation_id,
@@ -1296,11 +1811,45 @@ async fn poll_mutation_id_impl(
     Ok(state)
 }
 
+async fn delete_head_symrefs_for_mutation_id(
+    ctx: CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
+    mutation_id: i64,
+) -> Result<(), scs_errors::ServiceError> {
+    let reserved_repo_ids = git_source_of_truth_config
+        .get_reserved_by_mutation_id(&ctx, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?
+        .into_iter()
+        .map(|entry| entry.repo_id)
+        .collect::<Vec<_>>();
+    delete_head_symrefs(&ctx, symref_store_provider, &reserved_repo_ids).await
+}
+
+/// Two concurrent pollers can both run this; a stalled one could delete a fresh HEAD row
+/// after id reuse plus re-reserve+rewrite. Not atomically fixable across the two DBs; accepted.
 async fn cleanup_repos(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    symref_store_provider: &dyn SymrefStoreProvider,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
+    // Symref deletes go before the SoT deletes so a failure leaves the rows Reserved and retryable.
+    let (_result, _attempts) = retry(
+        |_| {
+            delete_head_symrefs_for_mutation_id(
+                ctx.clone(),
+                git_source_of_truth_config,
+                symref_store_provider,
+                mutation_id,
+            )
+        },
+        Duration::from_millis(1_000),
+    )
+    .binary_exponential_backoff()
+    .max_attempts(5)
+    .await?;
     let (_result, _attempts) = retry(
         |_| {
             delete_source_of_truth_for_mutation_id(
@@ -1336,7 +1885,10 @@ async fn initiate_land_for_mutation(
 
 #[cfg(test)]
 mod tests {
+    use fbinit::FacebookInit;
+    use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
     use mononoke_macros::mononoke;
+    use sql_construct::SqlConstruct;
 
     use super::*;
 
@@ -1344,7 +1896,7 @@ mod tests {
     fn test_make_repo_spec_file_path_simple_name() {
         // Test asserts the git-only path. When adding HG support to create_repos, add a
         // parallel test for repos/hg/ paths.
-        let path = make_repo_spec_file_path("my-repo");
+        let path = make_repo_spec_file_path("my-repo", RepoSpecDir::Git);
         assert!(
             path.starts_with("source/scm/mononoke/repos/git/"),
             "Path should start with RepoSpec base path: {path}"
@@ -1357,7 +1909,7 @@ mod tests {
 
     #[mononoke::test]
     fn test_make_repo_spec_file_path_slash_in_name() {
-        let path = make_repo_spec_file_path("org/project/repo");
+        let path = make_repo_spec_file_path("org/project/repo", RepoSpecDir::Git);
         assert!(
             path.ends_with("/org_project_repo.cconf"),
             "Slashes should be replaced with underscores: {path}"
@@ -1366,8 +1918,8 @@ mod tests {
 
     #[mononoke::test]
     fn test_make_repo_spec_file_path_no_collision_slash_vs_underscore() {
-        let path1 = make_repo_spec_file_path("org/repo");
-        let path2 = make_repo_spec_file_path("org_repo");
+        let path1 = make_repo_spec_file_path("org/repo", RepoSpecDir::Git);
+        let path2 = make_repo_spec_file_path("org_repo", RepoSpecDir::Git);
         assert_ne!(
             path1, path2,
             "Repos differing only in '/' vs '_' must produce different paths"
@@ -1376,15 +1928,15 @@ mod tests {
 
     #[mononoke::test]
     fn test_make_repo_spec_file_path_deterministic() {
-        let path1 = make_repo_spec_file_path("test/repo");
-        let path2 = make_repo_spec_file_path("test/repo");
+        let path1 = make_repo_spec_file_path("test/repo", RepoSpecDir::Git);
+        let path2 = make_repo_spec_file_path("test/repo", RepoSpecDir::Git);
         assert_eq!(path1, path2, "Hash-based path should be deterministic");
     }
 
     #[mononoke::test]
     fn test_make_repo_spec_file_path_different_repos_may_differ() {
-        let path1 = make_repo_spec_file_path("repo-alpha");
-        let path2 = make_repo_spec_file_path("repo-beta");
+        let path1 = make_repo_spec_file_path("repo-alpha", RepoSpecDir::Git);
+        let path2 = make_repo_spec_file_path("repo-beta", RepoSpecDir::Git);
         assert_ne!(
             path1, path2,
             "Different repos should produce different paths"
@@ -1530,6 +2082,25 @@ mod tests {
     }
 
     #[mononoke::test]
+    fn test_make_repo_spec_honours_readonly_request() {
+        let repo_id = RepositoryId::new(12346);
+        let request = thrift::RepoCreationRequest {
+            repo_name: "org/mirror-repo".to_string(),
+            size_bucket: RepoSizeBucket::SMALL,
+            readonly: Some(true),
+            ..Default::default()
+        };
+
+        let spec =
+            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
+
+        assert!(
+            spec.readonly,
+            "a request with readonly=true must produce a read-only RepoSpec"
+        );
+    }
+
+    #[mononoke::test]
     fn test_make_repo_spec_uses_top_level_acl_for_aosp_repo() {
         let repo_id = RepositoryId::new(18279);
         let request = thrift::RepoCreationRequest {
@@ -1667,6 +2238,51 @@ mod tests {
     }
 
     #[mononoke::test]
+    fn test_default_branch_validation() {
+        for invalid in [
+            "",
+            "HEAD",
+            "head",
+            "Head",
+            "hEaD",
+            "refs/heads/main",
+            "refs/tags/v1.0",
+        ] {
+            let err = validate_default_branch(invalid)
+                .expect_err(&format!("'{invalid}' must be rejected as a default_branch"));
+            assert!(
+                matches!(err, scs_errors::ServiceError::Request(_)),
+                "'{invalid}' must be rejected as an invalid request, got: {err:?}"
+            );
+        }
+        for valid in ["main", "release/1.0"] {
+            assert_eq!(
+                validate_default_branch(valid)
+                    .unwrap_or_else(|err| panic!("'{valid}' must be accepted, got: {err:?}")),
+                valid,
+            );
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_write_default_branch_symref_writes_head_row(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let store = SqlGitSymbolicRefsBuilder::with_sqlite_in_memory()?.build(RepositoryId::new(1));
+
+        write_default_branch_symref(&ctx, &store, "main")
+            .await
+            .expect("writing the HEAD symref should succeed");
+
+        let entry = store
+            .get_ref_by_symref(&ctx, "HEAD".to_string())
+            .await?
+            .expect("a HEAD symref row should exist after the write");
+        assert_eq!(entry.ref_name, "main");
+        assert_eq!(entry.ref_name_with_type(), "refs/heads/main");
+        Ok(())
+    }
+
+    #[mononoke::test]
     fn test_make_repo_spec_uses_full_acl_when_custom_acl_set() {
         let repo_id = RepositoryId::new(55555);
         let request = thrift::RepoCreationRequest {
@@ -1719,6 +2335,136 @@ mod attach_tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn stamp_count_mismatch_fails_creation(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        config
+            .insert_repos(
+                &ctx,
+                &[(
+                    RepositoryId::new(1),
+                    RepositoryName("repo/a".to_string()),
+                    GitSourceOfTruth::Reserved,
+                )],
+            )
+            .await?;
+
+        // Only one of the two expected reserved rows exists: the stamp must
+        // fail the creation rather than proceed with a lost row.
+        let params = params_for(&["repo/a", "repo/b"]);
+        let result = update_mutation_id_by_repo_names_for_reserved_repos(
+            ctx.clone(),
+            &config,
+            &params,
+            4242,
+        )
+        .await;
+        assert!(result.is_err(), "missing reserved row must fail the stamp");
+
+        // With every expected row reserved, the stamp succeeds.
+        config
+            .insert_repos(
+                &ctx,
+                &[(
+                    RepositoryId::new(2),
+                    RepositoryName("repo/b".to_string()),
+                    GitSourceOfTruth::Reserved,
+                )],
+            )
+            .await?;
+        update_mutation_id_by_repo_names_for_reserved_repos(ctx.clone(), &config, &params, 4243)
+            .await
+            .map_err(|e| anyhow::anyhow!("stamp should succeed: {e:?}"))?;
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn lost_ack_restamp_confirm_read(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        config
+            .insert_repos(
+                &ctx,
+                &[
+                    (
+                        RepositoryId::new(1),
+                        RepositoryName("repo/a".to_string()),
+                        GitSourceOfTruth::Reserved,
+                    ),
+                    (
+                        RepositoryId::new(2),
+                        RepositoryName("repo/b".to_string()),
+                        GitSourceOfTruth::Reserved,
+                    ),
+                ],
+            )
+            .await?;
+        // Attempt 1 committed the stamp but its ack was lost; the retry's
+        // UPDATE reports 0 changed rows on MySQL. Sqlite counts matched rows,
+        // so exercise the confirm-read directly against the stamped state.
+        config
+            .update_mutation_id_by_repo_names_for_reserved_repos(
+                &ctx,
+                &[
+                    RepositoryName("repo/a".to_string()),
+                    RepositoryName("repo/b".to_string()),
+                ],
+                4242,
+            )
+            .await?;
+
+        let params = params_for(&["repo/a", "repo/b"]);
+        assert!(
+            all_requested_repos_stamped(&ctx, &config, &params, 4242)
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm-read should succeed: {e:?}"))?,
+            "every requested repo carries the stamp: the re-stamp must be accepted",
+        );
+
+        // Genuine loss: a requested repo with no stamped row must still fail.
+        let params_missing = params_for(&["repo/a", "repo/b", "repo/c"]);
+        assert!(
+            !all_requested_repos_stamped(&ctx, &config, &params_missing, 4242)
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm-read should succeed: {e:?}"))?,
+            "a repo missing from the stamped set must not be accepted",
+        );
+
+        // Rows stamped under a different mutation are not ours.
+        assert!(
+            !all_requested_repos_stamped(&ctx, &config, &params, 9999)
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm-read should succeed: {e:?}"))?,
+            "rows stamped with another mutation_id must not be accepted",
+        );
+
+        // A stamped row that a concurrent attacher's poll already flipped to
+        // Mononoke still proves the stamp committed: the re-stamp must be
+        // accepted, not reported as row loss.
+        config
+            .update_source_of_truth_by_repo_names(
+                &ctx,
+                GitSourceOfTruth::Mononoke,
+                &[RepositoryName("repo/b".to_string())],
+            )
+            .await?;
+        assert!(
+            all_requested_repos_stamped(&ctx, &config, &params, 4242)
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm-read should succeed: {e:?}"))?,
+            "a row flipped to Mononoke under our mutation_id still counts as stamped",
+        );
+        assert!(
+            !all_requested_repos_stamped(&ctx, &config, &params, 9999)
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm-read should succeed: {e:?}"))?,
+            "flipped rows under another mutation_id must not be accepted",
+        );
+        Ok(())
     }
 
     #[mononoke::fbinit_test]
@@ -2078,6 +2824,675 @@ mod attach_tests {
             .boxed(),
         )
         .await?;
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn batch_at_cap_is_allowed() {
+        check_batch_size(2, 2).expect("a batch exactly at the cap must be allowed");
+    }
+
+    #[mononoke::test]
+    fn batch_over_cap_is_rejected() {
+        let err = check_batch_size(3, 2).expect_err("a batch over the cap must be rejected");
+        // An Internal error would be retried by `create_repos_in_mononoke`
+        // rather than reported to the caller.
+        let scs_errors::ServiceError::Request(request_error) = &err else {
+            panic!("expected Request error, got: {err:?}");
+        };
+        let message = format!("{request_error:?}");
+        assert!(
+            message.contains('3'),
+            "message should state the requested count, got: {message}"
+        );
+        assert!(
+            message.contains('2'),
+            "message should state the cap, got: {message}"
+        );
+    }
+
+    #[mononoke::test]
+    fn empty_batch_is_rejected() {
+        let err = check_batch_size(0, BatchSizeTier::Default.max_batch_size())
+            .expect_err("an empty batch must be rejected");
+        let scs_errors::ServiceError::Request(request_error) = &err else {
+            panic!("expected Request error, got: {err:?}");
+        };
+        let message = format!("{request_error:?}");
+        assert!(
+            message.contains("empty"),
+            "message should say the batch was empty, got: {message}"
+        );
+    }
+
+    #[mononoke::test]
+    fn tiers_admit_the_batches_they_are_sized_for() {
+        let elevated = BatchSizeTier::Elevated.max_batch_size();
+        let default = BatchSizeTier::Default.max_batch_size();
+
+        // Real runs through the bulk-import pipeline: ~40, 95, 134.
+        for count in [40, 95, 134] {
+            check_batch_size(count, elevated).unwrap_or_else(|err| {
+                panic!("a pipeline batch of {count} must be allowed, got: {err:?}")
+            });
+        }
+        // p50 of all observed traffic is 1: the common case is one repo.
+        check_batch_size(1, default).expect("a single-repo batch must always be allowed");
+    }
+
+    #[mononoke::test]
+    fn only_source_control_admits_the_largest_batches_on_record() {
+        // 588 (par-msl, the all-time high) and the 700+ MTK Wearables say they
+        // expect. Source Control has issued batches this size and can still do
+        // so; a delegated grant deliberately cannot, so a group member has to
+        // split, ask for the cap to be raised, or hand the batch back to Source
+        // Control. Sizing the delegated tier around its two largest outliers
+        // would leave it bounding nothing. Encoded so the decision is
+        // discoverable rather than a surprise at the flip.
+        let source_control = BatchSizeTier::SourceControl.max_batch_size();
+        let elevated = BatchSizeTier::Elevated.max_batch_size();
+        for count in [588, 700] {
+            check_batch_size(count, source_control).unwrap_or_else(|err| {
+                panic!("Source Control must still be able to issue {count}, got: {err:?}")
+            });
+            check_batch_size(count, elevated)
+                .expect_err(&format!("{count} is expected to exceed the elevated tier"));
+        }
+    }
+
+    #[mononoke::test]
+    fn the_default_tier_does_not_admit_the_observed_p95() {
+        // Also deliberate, and the sharper edge of the two. Observed over 32
+        // days: p95 66, max 139 -- both from ad-hoc Thrift Fiddle onboarding
+        // runs. Under a default of 50 those callers must split their batches,
+        // join the group, or be recognised as Source Control, which the
+        // identity check should already do for a human on the team. Anyone else
+        // doing bulk creation from an unrecognised identity is exactly what the
+        // cap is for, so this is the intended bite rather than collateral.
+        let default = BatchSizeTier::Default.max_batch_size();
+        check_batch_size(66, default).expect_err("the observed p95 is expected to exceed default");
+        check_batch_size(139, default).expect_err("the observed max is expected to exceed default");
+    }
+}
+
+#[cfg(all(fbcode_build, test))]
+mod symref_tests {
+    use std::collections::HashMap;
+
+    use fbinit::FacebookInit;
+    use futures::FutureExt;
+    use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
+    use git_symbolic_refs::RefType;
+    use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs_async;
+    use mononoke_macros::mononoke;
+    use sql_construct::SqlConstruct;
+
+    use super::*;
+
+    struct TestSymrefStoreProvider {
+        stores: HashMap<RepositoryId, Arc<dyn GitSymbolicRefs>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SymrefStoreProvider for TestSymrefStoreProvider {
+        async fn repo_store(
+            &self,
+            repo_id: RepositoryId,
+        ) -> Result<Arc<dyn GitSymbolicRefs>, scs_errors::ServiceError> {
+            self.stores.get(&repo_id).cloned().ok_or_else(|| {
+                scs_errors::internal_error(format!("no test symref store for repo {repo_id}"))
+                    .into()
+            })
+        }
+    }
+
+    struct FailingSymrefStore {
+        repo_id: RepositoryId,
+    }
+
+    #[async_trait::async_trait]
+    impl GitSymbolicRefs for FailingSymrefStore {
+        fn repo_id(&self) -> RepositoryId {
+            self.repo_id
+        }
+
+        async fn get_ref_by_symref(
+            &self,
+            _ctx: &CoreContext,
+            _symref: String,
+        ) -> Result<Option<GitSymbolicRefsEntry>> {
+            anyhow::bail!("FailingSymrefStore always fails")
+        }
+
+        async fn get_symrefs_by_ref(
+            &self,
+            _ctx: &CoreContext,
+            _ref_name: String,
+            _ref_type: RefType,
+        ) -> Result<Option<Vec<String>>> {
+            anyhow::bail!("FailingSymrefStore always fails")
+        }
+
+        async fn add_or_update_entries(
+            &self,
+            _ctx: &CoreContext,
+            _entries: Vec<GitSymbolicRefsEntry>,
+        ) -> Result<()> {
+            anyhow::bail!("FailingSymrefStore always fails")
+        }
+
+        async fn delete_symrefs(&self, _ctx: &CoreContext, _symrefs: Vec<String>) -> Result<()> {
+            anyhow::bail!("FailingSymrefStore always fails")
+        }
+
+        async fn list_all_symrefs(&self, _ctx: &CoreContext) -> Result<Vec<GitSymbolicRefsEntry>> {
+            anyhow::bail!("FailingSymrefStore always fails")
+        }
+    }
+
+    fn sqlite_store(repo_id: RepositoryId) -> Result<Arc<dyn GitSymbolicRefs>> {
+        Ok(Arc::new(
+            SqlGitSymbolicRefsBuilder::with_sqlite_in_memory()?.build(repo_id),
+        ))
+    }
+
+    fn request_with_branch(name: &str, branch: Option<&str>) -> thrift::RepoCreationRequest {
+        thrift::RepoCreationRequest {
+            repo_name: name.to_string(),
+            scm_type: thrift::RepoScmType::GIT,
+            size_bucket: thrift::RepoSizeBucket::SMALL,
+            default_branch: branch.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn requests_of(
+        repo_ids_and_requests: &[(RepositoryId, thrift::RepoCreationRequest)],
+    ) -> Vec<thrift::RepoCreationRequest> {
+        repo_ids_and_requests
+            .iter()
+            .map(|(_id, request)| request.clone())
+            .collect()
+    }
+
+    async fn head_branch(
+        ctx: &CoreContext,
+        store: &Arc<dyn GitSymbolicRefs>,
+    ) -> Result<Option<String>> {
+        Ok(store
+            .get_ref_by_symref(ctx, HEAD_SYMREF.to_string())
+            .await?
+            .map(|entry| entry.ref_name))
+    }
+
+    fn symref_jk(enabled: bool) -> JustKnobsInMemory {
+        JustKnobsInMemory::new(HashMap::from([(
+            WRITE_DEFAULT_BRANCH_SYMREF_JK.to_string(),
+            KnobVal::Bool(enabled),
+        )]))
+    }
+
+    #[mononoke::fbinit_test]
+    async fn writes_head_only_for_requests_with_default_branch(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let store_with = sqlite_store(RepositoryId::new(1))?;
+        let store_without = sqlite_store(RepositoryId::new(2))?;
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([
+                (RepositoryId::new(1), store_with.clone()),
+                (RepositoryId::new(2), store_without.clone()),
+            ]),
+        };
+        let repo_ids_and_requests = vec![
+            (
+                RepositoryId::new(1),
+                request_with_branch("repo/with", Some("main")),
+            ),
+            (
+                RepositoryId::new(2),
+                request_with_branch("repo/without", None),
+            ),
+        ];
+
+        with_just_knobs_async(
+            symref_jk(true),
+            async {
+                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
+                    .expect("valid default branches must pass validation");
+                assert!(
+                    enabled,
+                    "JK on + a set default_branch must enable symref writes",
+                );
+                let written =
+                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
+                        .await
+                        .expect("writing symrefs for a mixed batch should succeed");
+                assert_eq!(
+                    written,
+                    vec![RepositoryId::new(1)],
+                    "only the repo with default_branch should be reported as written",
+                );
+                anyhow::Ok(())
+            }
+            .boxed(),
+        )
+        .await?;
+
+        assert_eq!(
+            head_branch(&ctx, &store_with).await?,
+            Some("main".to_string()),
+            "the repo with default_branch must get a HEAD row",
+        );
+        assert_eq!(
+            head_branch(&ctx, &store_without).await?,
+            None,
+            "the repo without default_branch must NOT get a HEAD row",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn jk_off_writes_nothing(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let store = sqlite_store(RepositoryId::new(1))?;
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
+        };
+        let repo_ids_and_requests = vec![(
+            RepositoryId::new(1),
+            request_with_branch("repo/with", Some("main")),
+        )];
+
+        with_just_knobs_async(
+            symref_jk(false),
+            async {
+                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
+                    .expect("the gated-off path must not reject the request");
+                assert!(!enabled, "writes must be disabled with the kill switch off");
+                let written =
+                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
+                        .await
+                        .expect("the gated-off path should succeed as a no-op");
+                assert!(
+                    written.is_empty(),
+                    "nothing should be reported as written with the kill switch off",
+                );
+                anyhow::Ok(())
+            }
+            .boxed(),
+        )
+        .await?;
+
+        assert_eq!(
+            head_branch(&ctx, &store).await?,
+            None,
+            "no HEAD row should be written with the kill switch off",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn jk_off_invalid_branch_is_fully_inert(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let store = sqlite_store(RepositoryId::new(1))?;
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
+        };
+        let repo_ids_and_requests = vec![(
+            RepositoryId::new(1),
+            request_with_branch("repo/with", Some("refs/heads/x")),
+        )];
+
+        with_just_knobs_async(
+            symref_jk(false),
+            async {
+                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
+                    .expect(
+                        "an invalid default_branch must NOT be rejected with the kill switch off",
+                    );
+                assert!(!enabled, "writes must be disabled with the kill switch off");
+                let written =
+                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
+                        .await
+                        .expect("the gated-off path should succeed as a no-op");
+                assert!(
+                    written.is_empty(),
+                    "nothing should be reported as written with the kill switch off",
+                );
+                anyhow::Ok(())
+            }
+            .boxed(),
+        )
+        .await?;
+
+        assert_eq!(
+            head_branch(&ctx, &store).await?,
+            None,
+            "no HEAD row should be written with the kill switch off",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn jk_on_invalid_branch_is_rejected(_fb: FacebookInit) -> Result<()> {
+        with_just_knobs_async(
+            symref_jk(true),
+            async {
+                let err = validate_default_branches(&[request_with_branch(
+                    "repo/with",
+                    Some("refs/heads/x"),
+                )])
+                .expect_err("an invalid default_branch must be rejected with the kill switch on");
+                assert!(
+                    matches!(err, scs_errors::ServiceError::Request(_)),
+                    "expected Request error, got: {err:?}"
+                );
+                anyhow::Ok(())
+            }
+            .boxed(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn no_default_branch_targets_short_circuit_before_jk(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let store = sqlite_store(RepositoryId::new(1))?;
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
+        };
+        let repo_ids_and_requests = vec![(
+            RepositoryId::new(1),
+            request_with_branch("repo/without", None),
+        )];
+
+        // Deliberately no `with_just_knobs_async`: a JK eval against the unset test store panics.
+        let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
+            .expect("a batch with no default_branch must succeed without a JK eval");
+        assert!(!enabled, "a batch with no default_branch enables nothing");
+        let written = write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
+            .await
+            .expect("a batch with no default_branch must succeed without a JK eval");
+        assert!(
+            written.is_empty(),
+            "nothing should be reported as written for a batch with no default_branch",
+        );
+        assert_eq!(
+            head_branch(&ctx, &store).await?,
+            None,
+            "no HEAD row should be written for a batch with no default_branch",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn poll_cleanup_deletes_symrefs_and_sot_rows(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        sot.insert_repos(
+            &ctx,
+            &[
+                (
+                    RepositoryId::new(1),
+                    RepositoryName("repo/a".to_string()),
+                    GitSourceOfTruth::Reserved,
+                ),
+                (
+                    RepositoryId::new(2),
+                    RepositoryName("repo/b".to_string()),
+                    GitSourceOfTruth::Reserved,
+                ),
+            ],
+        )
+        .await?;
+        sot.update_mutation_id_by_repo_names_for_reserved_repos(
+            &ctx,
+            &[
+                RepositoryName("repo/a".to_string()),
+                RepositoryName("repo/b".to_string()),
+            ],
+            4242,
+        )
+        .await?;
+
+        let store_a = sqlite_store(RepositoryId::new(1))?;
+        let store_b = sqlite_store(RepositoryId::new(2))?;
+        write_default_branch_symref(&ctx, store_a.as_ref(), "main")
+            .await
+            .expect("seeding repo/a's HEAD row should succeed");
+        write_default_branch_symref(&ctx, store_b.as_ref(), "main")
+            .await
+            .expect("seeding repo/b's HEAD row should succeed");
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([
+                (RepositoryId::new(1), store_a.clone()),
+                (RepositoryId::new(2), store_b.clone()),
+            ]),
+        };
+
+        cleanup_repos(ctx.clone(), &sot, &stores, 4242)
+            .await
+            .expect("poll-path cleanup should succeed");
+
+        assert_eq!(
+            head_branch(&ctx, &store_a).await?,
+            None,
+            "cleanup must delete repo/a's HEAD row",
+        );
+        assert_eq!(
+            head_branch(&ctx, &store_b).await?,
+            None,
+            "cleanup must delete repo/b's HEAD row",
+        );
+        for name in ["repo/a", "repo/b"] {
+            assert!(
+                sot.get_by_repo_name(
+                    &ctx,
+                    &RepositoryName(name.to_string()),
+                    Staleness::MostRecent,
+                )
+                .await?
+                .is_none(),
+                "cleanup must delete the reserved SoT row for {name}",
+            );
+        }
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn poll_cleanup_with_unseeded_symref_store_succeeds(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        sot.insert_repos(
+            &ctx,
+            &[(
+                RepositoryId::new(1),
+                RepositoryName("repo/a".to_string()),
+                GitSourceOfTruth::Reserved,
+            )],
+        )
+        .await?;
+        sot.update_mutation_id_by_repo_names_for_reserved_repos(
+            &ctx,
+            &[RepositoryName("repo/a".to_string())],
+            4242,
+        )
+        .await?;
+
+        let store = sqlite_store(RepositoryId::new(1))?;
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
+        };
+
+        cleanup_repos(ctx.clone(), &sot, &stores, 4242)
+            .await
+            .expect("cleanup against a store with no HEAD row must succeed");
+
+        assert_eq!(
+            head_branch(&ctx, &store).await?,
+            None,
+            "there is still no HEAD row after cleanup",
+        );
+        assert!(
+            sot.get_by_repo_name(
+                &ctx,
+                &RepositoryName("repo/a".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?
+            .is_none(),
+            "cleanup must still delete the reserved SoT row",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn prepare_failure_cleanup_deletes_symrefs_and_sot_rows(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        sot.insert_repos(
+            &ctx,
+            &[(
+                RepositoryId::new(1),
+                RepositoryName("repo/a".to_string()),
+                GitSourceOfTruth::Reserved,
+            )],
+        )
+        .await?;
+
+        let store = sqlite_store(RepositoryId::new(1))?;
+        write_default_branch_symref(&ctx, store.as_ref(), "main")
+            .await
+            .expect("seeding the HEAD row should succeed");
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
+        };
+        let params = thrift::CreateReposParams {
+            repos: vec![request_with_branch("repo/a", Some("main"))],
+            ..Default::default()
+        };
+
+        cleanup_reserved_repos_after_failure(&ctx, &sot, &stores, &[RepositoryId::new(1)], &params)
+            .await
+            .expect("prepare-failure cleanup should succeed");
+
+        assert_eq!(
+            head_branch(&ctx, &store).await?,
+            None,
+            "prepare-failure cleanup must delete the HEAD row",
+        );
+        assert!(
+            sot.get_by_repo_name(
+                &ctx,
+                &RepositoryName("repo/a".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?
+            .is_none(),
+            "prepare-failure cleanup must delete the reserved SoT row",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn poll_cleanup_failed_symref_delete_keeps_sot_rows(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        sot.insert_repos(
+            &ctx,
+            &[(
+                RepositoryId::new(1),
+                RepositoryName("repo/a".to_string()),
+                GitSourceOfTruth::Reserved,
+            )],
+        )
+        .await?;
+        sot.update_mutation_id_by_repo_names_for_reserved_repos(
+            &ctx,
+            &[RepositoryName("repo/a".to_string())],
+            7,
+        )
+        .await?;
+
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(
+                RepositoryId::new(1),
+                Arc::new(FailingSymrefStore {
+                    repo_id: RepositoryId::new(1),
+                }) as Arc<dyn GitSymbolicRefs>,
+            )]),
+        };
+
+        cleanup_repos(ctx.clone(), &sot, &stores, 7)
+            .await
+            .expect_err("cleanup must fail when the symref delete fails");
+
+        let entry = sot
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("repo/a".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?
+            .expect("the SoT row must survive a failed symref delete");
+        assert_eq!(
+            entry.source_of_truth,
+            GitSourceOfTruth::Reserved,
+            "the surviving row must still be Reserved (retryable)",
+        );
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn prepare_failure_cleanup_failed_symref_delete_keeps_sot_rows(
+        fb: FacebookInit,
+    ) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
+        sot.insert_repos(
+            &ctx,
+            &[(
+                RepositoryId::new(1),
+                RepositoryName("repo/a".to_string()),
+                GitSourceOfTruth::Reserved,
+            )],
+        )
+        .await?;
+
+        let stores = TestSymrefStoreProvider {
+            stores: HashMap::from([(
+                RepositoryId::new(1),
+                Arc::new(FailingSymrefStore {
+                    repo_id: RepositoryId::new(1),
+                }) as Arc<dyn GitSymbolicRefs>,
+            )]),
+        };
+        let params = thrift::CreateReposParams {
+            repos: vec![request_with_branch("repo/a", Some("main"))],
+            ..Default::default()
+        };
+
+        cleanup_reserved_repos_after_failure(&ctx, &sot, &stores, &[RepositoryId::new(1)], &params)
+            .await
+            .expect_err("prepare-failure cleanup must fail when the symref delete fails");
+
+        let entry = sot
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("repo/a".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?
+            .expect("the SoT row must survive a failed symref delete");
+        assert_eq!(
+            entry.source_of_truth,
+            GitSourceOfTruth::Reserved,
+            "the surviving row must still be Reserved (retryable)",
+        );
         Ok(())
     }
 }

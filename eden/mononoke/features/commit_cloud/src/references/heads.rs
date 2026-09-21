@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use commit_cloud_types::WorkspaceHead;
@@ -26,6 +27,7 @@ pub fn heads_from_list(s: &Vec<String>) -> anyhow::Result<Vec<WorkspaceHead>> {
         .map(|s| {
             Sha1::from_str(s).map(|commit_id| WorkspaceHead {
                 commit: CloudChangesetId(commit_id),
+                author_date: None,
             })
         })
         .collect()
@@ -43,6 +45,7 @@ pub async fn update_heads(
     cc_ctx: &CommitCloudContext,
     removed_heads: Vec<CloudChangesetId>,
     new_heads: Vec<CloudChangesetId>,
+    head_author_dates: &HashMap<CloudChangesetId, i64>,
 ) -> anyhow::Result<Transaction> {
     if !removed_heads.is_empty() {
         let delete_args = DeleteArgs {
@@ -62,7 +65,10 @@ pub async fn update_heads(
         if justknobs::eval("scm/mononoke:commitcloud_bulk_inserts", None, None) {
             let heads: Vec<WorkspaceHead> = new_heads
                 .into_iter()
-                .map(|commit| WorkspaceHead { commit })
+                .map(|commit| WorkspaceHead {
+                    commit,
+                    author_date: head_author_dates.get(&commit).copied(),
+                })
                 .collect();
             txn = InsertMany::<WorkspaceHead>::insert_many(
                 sql_commit_cloud,
@@ -79,7 +85,10 @@ pub async fn update_heads(
                     txn,
                     cc_ctx.reponame.clone(),
                     cc_ctx.workspace.clone(),
-                    WorkspaceHead { commit: head },
+                    WorkspaceHead {
+                        commit: head,
+                        author_date: head_author_dates.get(&head).copied(),
+                    },
                 )
                 .await?;
             }

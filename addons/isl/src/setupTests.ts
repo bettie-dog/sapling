@@ -10,6 +10,10 @@
 // expect(element).toHaveTextContent(/react/i)
 // learn more: https://github.com/testing-library/jest-dom
 import '@testing-library/jest-dom';
+import {TextDecoder, TextEncoder} from 'node:util';
+
+// jsdom omits the browser encoding APIs used by bounded evidence handoffs.
+Object.assign(globalThis, {TextDecoder, TextEncoder});
 
 // Use __mocks__/logger so calls to logger don't output to console, but
 // console.log still works for debugging tests.
@@ -42,6 +46,21 @@ configure({
 });
 
 global.ResizeObserver = require('resize-observer-polyfill');
+
+// jsdom does not implement scrollIntoView; stub it so components that call it
+// (e.g. auto-scroll-to-"You are here") don't throw during tests.
+window.HTMLElement.prototype.scrollIntoView = jest.fn();
+
+// jsdom does not implement IntersectionObserver; stub it so components that observe
+// (e.g. the "You are here" viewport tracking) don't throw during tests.
+global.IntersectionObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+  takeRecords() {
+    return [];
+  }
+} as unknown as typeof IntersectionObserver;
 
 global.fetch = jest.fn().mockImplementation(() => Promise.resolve());
 

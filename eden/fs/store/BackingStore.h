@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/Range.h>
+#include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
@@ -272,7 +273,17 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    */
   virtual folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
       const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
+      const ObjectFetchContextPtr& context) {
+    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+    return folly::coro::co_invoke(
+               [this](ObjectId ownedId, ObjectFetchContextPtr ownedContext)
+                   -> folly::coro::Task<GetTreeAuxResult> {
+                 co_return co_await co_getTreeAuxData(ownedId, ownedContext);
+               },
+               ObjectId{id},
+               context.copy())
+        .semi();
+  }
 
   virtual folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
@@ -296,10 +307,6 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    *
    * Return the blob aux data and where it was found.
    */
-  virtual folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
-
   virtual folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;

@@ -32,6 +32,7 @@
 namespace facebook::eden {
 
 class EdenMount;
+class InodeMap;
 class ObjectFetchContext;
 class ObjectStore;
 class ParentInodeInfo;
@@ -67,6 +68,14 @@ class InodeBase {
 
   dtype_t getType() const {
     return mode_to_dtype(initialMode_);
+  }
+
+  /**
+   * Have the destructor remove this inode's overlay data. Only for InodeMap,
+   * when unloading an unlinked inode that nothing references any more.
+   */
+  void removeOverlayDataOnDestruction() {
+    removeOverlayDataOnDestruction_ = true;
   }
 
   mode_t getInitialMode() const {
@@ -132,8 +141,8 @@ class InodeBase {
    * where the kernel does not tell us when an inode has been dereferenced.
    * (NFS and Windows).
    */
-  void clearFsRefcount() {
-    numFsReferences_.store(0u, std::memory_order_release);
+  bool clearFsRefcount() {
+    return numFsReferences_.exchange(0u, std::memory_order_acq_rel) != 0;
   }
 
   /**
@@ -536,7 +545,12 @@ class InodeBase {
 
   template <typename InodeType>
   friend class InodePtrImpl;
+  friend class InodeMap;
   friend class InodePtrTestHelper;
+
+  void restoreLastFsRequestTime(EdenTimestamp timestamp) {
+    lastFsRequestTime_.store(timestamp, std::memory_order_relaxed);
+  }
 
   // Forbid copies and moves (we cannot be moved since we contain mutexes)
   InodeBase(InodeBase const&) = delete;
@@ -634,7 +648,17 @@ class InodeBase {
    * writing metadata into this inode's metadata storage.  The type
    * bits can never change - they can be accessed via getType().
    */
+  void removeOverlayData() noexcept;
+
   mode_t const initialMode_;
+
+  /**
+   * Set by InodeMap when this inode is unloaded while unlinked and no longer
+   * referenced by the filesystem: its overlay data is removed by the
+   * destructor, which every unload path runs after releasing the InodeMap and
+   * parent contents locks, rather than while holding them.
+   */
+  bool removeOverlayDataOnDestruction_{false};
 
   /**
    * A reference count tracking the outstanding lookups that the kernel's FUSE

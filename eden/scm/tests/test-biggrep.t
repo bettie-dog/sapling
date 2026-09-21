@@ -1,15 +1,6 @@
-#require python3 xargs
+#require python3
 
-#testcases rust python
-
-Test that biggrep integration works correctly and that Python and Rust
-implementations pass the same arguments and produce the same output.
-
-#if python
-  $ setconfig grep.use-rust=false
-#else
-  $ setconfig grep.use-rust=true
-#endif
+Test that biggrep integration works correctly.
 
 Set up the repository with files that match fake-biggrep-client.py:
   $ newclientrepo
@@ -42,6 +33,24 @@ Helper to capture biggrep args:
   >   BIGGREP_ARGS_FILE="$TESTTMP/bg_args" sl grep --color=off "$@" >/dev/null 2>&1 || true
   >   cat "$TESTTMP/bg_args"
   > }
+
+Test options that biggrep cannot implement:
+  $ sl grep --max-count 1 foobar
+  abort: --max-count is incompatible with biggrep; use --no-external to disable biggrep
+  [255]
+  $ sl grep --replace replacement foobar
+  abort: --replace is incompatible with biggrep; use --no-external to disable biggrep
+  [255]
+  $ sl grep --null foobar
+  abort: --null is incompatible with biggrep; use --no-external to disable biggrep
+  [255]
+  $ sl grep --invert-match foobar
+  abort: --invert-match is incompatible with biggrep; use --no-external to disable biggrep
+  [255]
+
+The incompatible options remain available when external search is disabled:
+  $ sl grep --no-external --max-count 1 foobar grepdir/grepfile1
+  grepdir/grepfile1:foobarbaz
 
 Test basic argument passing:
   $ capture_args -n foobar
@@ -187,8 +196,7 @@ Clean up uncommitted changes:
   $ sl revert --all -q
   $ rm grepdir/uncommitted_file
 
-#if rust
-Test manifest diff with --rev to search an older revision (Rust only):
+Test manifest diff with --rev to search an older revision:
 When searching an older rev, the diff is between corpus and that rev.
 
 Search the first commit when corpus points to current commit:
@@ -203,4 +211,3 @@ The output should include:
 - grepfile2: grepped locally (exists in target but not corpus) - no _bg suffix
 - newfile: excluded (doesn't exist in target rev)
 - subdir1/subfile1 and subdir2/subfile2: from biggrep (unchanged) - has _bg suffix
-#endif

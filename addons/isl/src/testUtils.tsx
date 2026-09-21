@@ -16,10 +16,11 @@ import type {
   SmartlogCommits,
   UncommittedChanges,
   ValidatedRepoInfo,
+  WorktreeEntry,
 } from './types';
 
 import {act, screen, waitFor, within} from '@testing-library/react';
-import {nextTick} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import platform from './platform';
 import {deserializeFromString, serializeToString} from './serialize';
 import {mostRecentSubscriptionIds} from './serverAPIState';
@@ -65,6 +66,25 @@ export function getLastMessagesSentToServer(num: number): Array<string> {
 
 export function simulateServerDisconnected(): void {
   testMessageBus.simulateServerStatusChange({type: 'error', error: 'server disconnected'});
+}
+
+export function simulateWorktreeInfo(
+  sharedRoot: string,
+  worktrees: ReadonlyArray<{
+    path: string;
+    role: 'main' | 'linked';
+    label?: string;
+    node?: string;
+  }>,
+) {
+  act(() => {
+    simulateMessageFromServer({
+      type: 'subscriptionResult',
+      kind: 'worktreeInfo',
+      subscriptionID: mostRecentSubscriptionIds.worktreeInfo,
+      data: {sharedRoot, worktrees: worktrees as WorktreeEntry[]},
+    });
+  });
 }
 
 export function simulateCommits(commits: Result<SmartlogCommits>) {
@@ -345,6 +365,13 @@ export function expectYouAreHerePointAt(hash: string) {
   const row = screen.getByTestId(`dag-row-group-${hash}`);
   const previousRow = row.previousElementSibling;
   expect(previousRow).toHaveTextContent('You are here');
+}
+
+/** Check that a "checked out elsewhere" badge row points to the given commit. */
+export function expectCheckedOutElsewherePointAt(hash: string, worktreeName: string) {
+  const row = screen.getByTestId(`dag-row-group-${hash}`);
+  const previousRow = row.previousElementSibling;
+  expect(previousRow).toHaveTextContent(worktreeName);
 }
 
 /**

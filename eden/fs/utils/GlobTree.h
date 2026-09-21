@@ -21,26 +21,13 @@ class GlobTree : public GlobNodeImpl {
   explicit GlobTree(
       bool includeDotfiles,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      uint32_t recursiveAsyncDepth = 3)
+      uint32_t recursiveAsyncDepth = 3,
+      GlobMatchOptions matchOptions = {})
       : GlobNodeImpl(
             includeDotfiles,
             caseSensitive,
-            prefetchOptimizations,
-            recursiveAsyncDepth) {}
-
-  GlobTree(
-      folly::StringPiece pattern,
-      bool includeDotfiles,
-      bool hasSpecials,
-      CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false)
-      : GlobNodeImpl(
-            pattern,
-            includeDotfiles,
-            hasSpecials,
-            caseSensitive,
-            prefetchOptimizations) {}
+            recursiveAsyncDepth,
+            std::move(matchOptions)) {}
 
   /**
    * Evaluate the compiled glob against the provided Tree.

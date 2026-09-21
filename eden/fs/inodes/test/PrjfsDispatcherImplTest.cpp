@@ -9,21 +9,106 @@
 
 #include <gtest/gtest.h>
 
+#include <process.h>
+
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <variant>
+
+#include <folly/executors/InlineExecutor.h>
+#include <folly/portability/Windows.h>
 
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/PrjfsDispatcherImpl.h"
+#include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
 
 namespace facebook::eden {
 
+namespace {
+
+// Stack reservation for the constrained-stack helper below. Following
+// a/b/c/d/e/f/g/loop -> loop exhausts kMaxSymlinkChainDepth (40) symlink
+// follows, and the recursive resolver nests one continuation per path
+// component per follow: 40 * 8 = 320 levels. Each level costs roughly 2 KiB
+// of native stack when continuations complete inline (measured on Linux x64
+// opt), so the recursive implementation needs ~660 KiB and overflows this
+// reservation with STATUS_STACK_OVERFLOW. An iterative resolver keeps its
+// state in a heap-allocated coroutine frame and stays around 1 KiB.
+constexpr unsigned int kConstrainedStackSize = 256 * 1024;
+
+class CountingFetchContext final : public ObjectFetchContext {
+ public:
+  void didFetch(ObjectType type, const ObjectId&, Origin, uint64_t = 0)
+      override {
+    if (type == ObjectType::Blob) {
+      blobFetchCount_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  Cause getCause() const override {
+    return Cause::Unknown;
+  }
+
+  const std::unordered_map<std::string, std::string>* getRequestInfo()
+      const override {
+    return nullptr;
+  }
+
+  size_t getBlobFetchCount() const {
+    return blobFetchCount_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<size_t> blobFetchCount_{0};
+};
+
+struct ConstrainedStackTask {
+  std::function<bool()> fn;
+  bool result = false;
+};
+
+unsigned __stdcall runConstrainedStackTask(void* arg) {
+  auto* task = static_cast<ConstrainedStackTask*>(arg);
+  task->result = task->fn();
+  return 0;
+}
+
+// Runs `fn` to completion on a thread whose stack is reserved at
+// kConstrainedStackSize, joins it, and returns the result.
+bool runOnConstrainedStackThread(std::function<bool()> fn) {
+  ConstrainedStackTask task{std::move(fn)};
+  auto handle = reinterpret_cast<HANDLE>(_beginthreadex(
+      /*security=*/nullptr,
+      kConstrainedStackSize,
+      &runConstrainedStackTask,
+      &task,
+      STACK_SIZE_PARAM_IS_A_RESERVATION,
+      /*thrdaddr=*/nullptr));
+  if (handle == nullptr) {
+    throw std::runtime_error("failed to create constrained-stack thread");
+  }
+  WaitForSingleObject(handle, INFINITE);
+  CloseHandle(handle);
+  return task.result;
+}
+
+} // namespace
+
 class PrjfsDispatcherImplTest : public ::testing::Test {
  protected:
   void SetUp() override {
     builder_.setFile("adir/file.txt", "contents");
+    // Mirrors the production shape from S697276: a deep multi-component path
+    // whose last component is a self-referential symlink.
+    builder_.setSymlink("a/b/c/d/e/f/g/loop", "loop");
+    builder_.setSymlink("again", ".");
+    builder_.setSymlink("shallow", "adir");
     mount_.initialize(builder_);
     dispatcher_ =
         std::make_unique<PrjfsDispatcherImpl>(mount_.getEdenMount().get());
@@ -82,6 +167,82 @@ TEST_F(PrjfsDispatcherImplTest, relativeTargetJoinsSymlinkDirectory) {
 
   ASSERT_TRUE(std::holds_alternative<RelativePath>(result));
   EXPECT_EQ(RelativePath{"adir/file.txt"}, std::get<RelativePath>(result));
+}
+
+// The recursive implementation crashed with STATUS_STACK_OVERFLOW under this
+// same constrained stack and inline-executor drive (see the parent commit);
+// the iterative resolver keeps its state in a heap-allocated coroutine frame
+// and completes within the reservation.
+TEST_F(
+    PrjfsDispatcherImplTest,
+    selfReferentialSymlinkFailsWithinConstrainedStack) {
+  auto result = runOnConstrainedStackThread([&] {
+    return dispatcher_
+        ->isFinalSymlinkPathDirectory(
+            RelativePath{"a/b/c/d/e/f/g/loop"},
+            "loop",
+            ObjectFetchContext::getNullContext())
+        .semi()
+        .via(&folly::InlineExecutor::instance())
+        .get();
+  });
+
+  EXPECT_FALSE(result);
+}
+
+TEST_F(PrjfsDispatcherImplTest, shallowSymlinkStillResolves) {
+  auto future = dispatcher_->isFinalSymlinkPathDirectory(
+      RelativePath{"shallow"}, "adir", ObjectFetchContext::getNullContext());
+
+  EXPECT_TRUE(std::move(future).get());
+}
+
+// A self-referential symlink reproduces the same resolution state after one
+// follow, so cycle detection gives up right there: one blob fetch instead of
+// exhausting the kMaxSymlinkChainDepth (40) follow budget, with the same
+// give-up value (the original path) that depth exhaustion produces.
+TEST_F(PrjfsDispatcherImplTest, selfReferentialSymlinkDetectedAfterOneFollow) {
+  auto context = makeRefPtr<CountingFetchContext>();
+
+  auto result = dispatcher_
+                    ->resolveSymlinkPath(
+                        RelativePath{"a/b/c/d/e/f/g/loop"},
+                        context.as<ObjectFetchContext>())
+                    .get();
+
+  ASSERT_TRUE(std::holds_alternative<RelativePath>(result));
+  EXPECT_EQ(RelativePath{"a/b/c/d/e/f/g/loop"}, std::get<RelativePath>(result));
+  EXPECT_EQ(1u, context->getBlobFetchCount());
+}
+
+// The "again" symlink is legitimately followed twice while resolving
+// again/again/adir: the same symlink is hit in two different resolution
+// states (again/again/adir, then again/adir). Pinning the exact follow count
+// rules out any cycle detection that naively bails on "already followed this
+// symlink".
+TEST_F(PrjfsDispatcherImplTest, repeatedSymlinkFollowsCountedExactly) {
+  auto context = makeRefPtr<CountingFetchContext>();
+
+  auto result = dispatcher_
+                    ->resolveSymlinkPath(
+                        RelativePath{"again/again/adir"},
+                        context.as<ObjectFetchContext>())
+                    .get();
+
+  ASSERT_TRUE(std::holds_alternative<RelativePath>(result));
+  EXPECT_EQ(RelativePath{"adir"}, std::get<RelativePath>(result));
+  EXPECT_EQ(2u, context->getBlobFetchCount());
+}
+
+TEST_F(PrjfsDispatcherImplTest, repeatedSymlinkWithShrinkingSuffixResolves) {
+  auto result = dispatcher_
+                    ->resolveSymlinkPath(
+                        RelativePath{"again/again/adir"},
+                        ObjectFetchContext::getNullContext())
+                    .get();
+
+  ASSERT_TRUE(std::holds_alternative<RelativePath>(result));
+  EXPECT_EQ(RelativePath{"adir"}, std::get<RelativePath>(result));
 }
 
 } // namespace facebook::eden

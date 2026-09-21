@@ -9,20 +9,21 @@ import type {JSX, ReactNode} from 'react';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
 import type {DagCommitInfo} from './dag/dag';
-import type {CommitInfo, SuccessorInfo} from './types';
+import type {CommitInfo, SuccessorInfo, WorktreeEntry} from './types';
 import {succeedableRevset, WarningCheckResult} from './types';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
+import {Tag} from 'isl-components/Tag';
 import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue, useSetAtom} from 'jotai';
-import React, {memo, useEffect} from 'react';
+import React, {memo, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {contextMenuState, useContextMenu} from 'shared/ContextMenu';
+import {useContextMenu} from 'shared/ContextMenu';
 import {MS_PER_DAY} from 'shared/constants';
 import {useAutofocusRef} from 'shared/hooks';
-import {notEmpty, nullthrows} from 'shared/utils';
+import {basename, guessPathSep, notEmpty, nullthrows} from 'shared/utils';
 import {AllBookmarksTruncated, Bookmark, Bookmarks, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
 import css from './Commit.module.css';
@@ -39,6 +40,7 @@ import {SubmitSingleCommitButton} from './SubmitSingleCommitButton';
 import {getSuggestedRebaseOperation, suggestedRebaseDestinations} from './SuggestedRebase';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
+import {changeCwd, openWorktreeInWindow, RenameWorktreeModal} from './WorktreeSection';
 import {tracker} from './analytics';
 import {clipboardLinkHtml} from './clipboard';
 import {
@@ -70,6 +72,8 @@ import {CommitCloudMoveCommitsOperation} from './operations/CommitCloudMoveCommi
 import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
 import {RebaseOperation} from './operations/RebaseOperation';
+import {RemoveWorktreeOperation} from './operations/RemoveWorktreeOperation';
+import {RenameWorktreeOperation} from './operations/RenameWorktreeOperation';
 import {
   inlineProgressByHash,
   operationBeingPreviewed,
@@ -81,15 +85,15 @@ import platform from './platform';
 import {CommitPreview, dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
 import {RelativeDate, relativeDate} from './relativeDate';
 import {repoRelativeCwd, useIsIrrelevantToCwd} from './repositoryData';
-import {isNarrowCommitTree} from './responsive';
+import {commitTreeWidth} from './responsive';
 import {
-  actioningCommit,
   selectedCommitInfos,
+  selectedCommitInfosInDagOrder,
   selectedCommits,
   selectedCommitsRangeComparison,
   useCommitCallbacks,
 } from './selection';
-import {inMergeConflicts, mergeConflicts} from './serverAPIState';
+import {applicationinfo, inMergeConflicts, mergeConflicts} from './serverAPIState';
 import {SmartActionsDropdown} from './smartActions/SmartActionsDropdown';
 import {SmartActionsMenu} from './smartActions/SmartActionsMenu';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
@@ -97,7 +101,7 @@ import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {copyAndShowToast} from './toast';
-import {showModal} from './useModal';
+import {showConfirmation, showModal} from './useModal';
 import {short} from './utils';
 
 export const rebaseOffWarmWarningEnabled = localStorageBackedAtom<boolean>(
@@ -181,18 +185,11 @@ export const Commit = memo(
     const {isSelected, onDoubleClickToShowDrawer} = useCommitCallbacks(commit);
     const actionsPrevented = previewPreventsActions(previewType);
 
-    const isActioning = useAtomValue(actioningCommit) === commit.hash;
-    const isContextMenuOpen = useAtomValue(contextMenuState) != null;
-
-    useEffect(() => {
-      if (!isContextMenuOpen && isActioning) {
-        writeAtom(actioningCommit, null);
-      }
-    }, [isContextMenuOpen, isActioning]);
+    const [isActioning, setIsActioning] = useState(false);
 
     const inConflicts = useAtomValue(inMergeConflicts);
 
-    const isNarrow = useAtomValue(isNarrowCommitTree);
+    const treeWidth = useAtomValue(commitTreeWidth);
 
     const title = useAtomValue(latestCommitMessageTitle(commit.hash));
 
@@ -285,6 +282,29 @@ export const Commit = memo(
           loggingLabel: 'Copy Diff Number',
         });
       }
+      const multiDiffProvider = readAtom(codeReviewProvider);
+      if (multiDiffProvider?.getMultiDiffUrl != null) {
+        const selectedDiffIDsInDagOrder = readAtom(selectedCommitInfosInDagOrder)
+          .map(selected => selected.diffId)
+          .filter(notEmpty);
+        if (selectedDiffIDsInDagOrder.length > 1) {
+          const multiDiffUrl = multiDiffProvider.getMultiDiffUrl(selectedDiffIDsInDagOrder);
+          items.push({
+            label: <T>Copy Multi-Diff URL</T>,
+            onClick: () => {
+              clipboardCopy(multiDiffUrl);
+            },
+            loggingLabel: 'Copy Multi-Diff URL',
+          });
+          items.push({
+            label: <T>Open Multi-Diff in Phabricator</T>,
+            onClick: () => {
+              platform.openExternalLink(multiDiffUrl);
+            },
+            loggingLabel: 'Open Multi-Diff in Phabricator',
+          });
+        }
+      }
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
@@ -306,13 +326,10 @@ export const Commit = memo(
         if (provider != null) {
           const selectedInfos = readAtom(selectedCommitInfos);
           const diffSummaries = readAtom(allDiffSummaries);
-          const dag = readAtom(dagWithPreviews);
 
           const isMultiSelect =
             selectedInfos.length > 1 && selectedInfos.some(c => c.hash === commit.hash);
-          const commits = isMultiSelect
-            ? dag.getBatch(dag.sortAsc(dag.present(new Set(selectedInfos.map(c => c.hash)))))
-            : [commit];
+          const commits = isMultiSelect ? readAtom(selectedCommitInfosInDagOrder) : [commit];
           const submittable =
             (diffSummaries?.value != null
               ? provider.getSubmittableDiffs(commits, diffSummaries.value)
@@ -572,22 +589,25 @@ export const Commit = memo(
       return items;
     };
 
-    const contextMenu = useContextMenu((): Array<ContextMenuItem> => {
-      return makeContextMenuOptions().map((item: ContextMenuItem & {loggingLabel?: string}) => {
-        if (item.type == null && notEmpty(item.loggingLabel)) {
-          return {
-            ...item,
-            onClick: () => {
-              tracker.track('CommitContextMenuItemClick', {
-                extras: {choice: item.loggingLabel},
-              });
-              item.onClick?.();
-            },
-          };
-        }
-        return item;
-      });
-    });
+    const contextMenu = useContextMenu(
+      (): Array<ContextMenuItem> => {
+        return makeContextMenuOptions().map((item: ContextMenuItem & {loggingLabel?: string}) => {
+          if (item.type == null && notEmpty(item.loggingLabel)) {
+            return {
+              ...item,
+              onClick: () => {
+                tracker.track('CommitContextMenuItemClick', {
+                  extras: {choice: item.loggingLabel},
+                });
+                item.onClick?.();
+              },
+            };
+          }
+          return item;
+        });
+      },
+      {onOpen: () => setIsActioning(true), onDismiss: () => setIsActioning(false)},
+    );
 
     const inlineCommitActions = [];
     const floatingCommitActions = [];
@@ -636,6 +656,7 @@ export const Commit = memo(
             )}
             delayMs={250}>
             <Button
+              icon
               aria-label={t('Go to commit "$title"', {replace: {$title: commit.title}})}
               className={css.gotoButton}
               onClick={async event => {
@@ -692,6 +713,10 @@ export const Commit = memo(
       );
     }
 
+    if ((commit as DagCommitInfo).isCheckedOutElsewhere) {
+      return null;
+    }
+
     return (
       <div
         className={
@@ -700,10 +725,7 @@ export const Commit = memo(
           (commit.successorInfo != null ? ' obsolete' : '') +
           (isIrrelevantToCwd ? ' irrelevant' : '')
         }
-        onContextMenu={e => {
-          writeAtom(actioningCommit, commit.hash);
-          contextMenu(e);
-        }}
+        onContextMenu={contextMenu}
         data-testid={`commit-${commit.hash}`}>
         <div
           className={'commit-rows' + (isActioning ? ' commit-row-actioning' : '')}
@@ -749,10 +771,14 @@ export const Commit = memo(
               fullRepoBranch={commit.fullRepoBranch}
             />
             {isPublic ? <CommitDate date={commit.date} /> : null}
-            {isNarrow ? (
+            {treeWidth !== 'wide' ? (
               <>
                 {inlineCommitActions}
-                <div className="commit-narrow-right-actions">{floatingCommitActions}</div>
+                {treeWidth === 'very-narrow' ? (
+                  <div className="commit-narrow-right-actions">{floatingCommitActions}</div>
+                ) : (
+                  floatingCommitActions
+                )}
               </>
             ) : null}
           </DragToRebase>
@@ -766,7 +792,7 @@ export const Commit = memo(
             {inlineProgress && <InlineProgressSpan message={inlineProgress} />}
             {commit.isFollower ? <DiffFollower commit={commit} /> : null}
           </DivIfChildren>
-          {!isNarrow ? commitActions : null}
+          {treeWidth === 'wide' ? commitActions : null}
         </div>
       </div>
     );
@@ -810,6 +836,158 @@ function BranchingPr({bookmark, provider}: {bookmark: string; provider: UICodeRe
 
 function CommitLabel({children}: {children?: ReactNode}) {
   return <div className={css.commitLabel}>{children}</div>;
+}
+
+/**
+ * A label naming a sibling worktree currently checked out (`.`) at this commit,
+ * followed by buttons to open, rename, and (for linked worktrees) remove it.
+ */
+export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
+  const name =
+    wt.label != null && wt.label !== '' ? wt.label : basename(wt.path, guessPathSep(wt.path));
+  const hoverTitle = t('Checked out in worktree $name', {replace: {$name: name}});
+
+  return (
+    <span className={css.checkedOutElsewhereGroup}>
+      <Tooltip title={hoverTitle}>
+        <Tag
+          className={css.checkedOutElsewhereTag}
+          data-testid="checked-out-elsewhere-badge"
+          aria-label={hoverTitle}>
+          <Icon icon="worktree" size="XS" aria-hidden="true" />
+          {name}
+        </Tag>
+      </Tooltip>
+      <OpenWorktreeButton wt={wt} name={name} />
+      <RenameWorktreeButton wt={wt} name={name} />
+      {wt.role === 'main' ? null : <RemoveWorktreeButton wt={wt} name={name} />}
+    </span>
+  );
+}
+
+/**
+ * On VS Code, opens a menu to choose current vs. new window; elsewhere (no
+ * concept of "windows") it switches cwd directly.
+ */
+function OpenWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
+  const appInfo = useAtomValue(applicationinfo);
+  const isVSCode = platform.platformName === 'vscode';
+  const openMenu = useContextMenu<HTMLButtonElement>((): Array<ContextMenuItem> => [
+    ...(appInfo?.isBasecamp
+      ? []
+      : [
+          {
+            label: t('Open in Current Window'),
+            onClick: () => openWorktreeInWindow(wt.path, false),
+          } as ContextMenuItem,
+        ]),
+    {
+      label: appInfo?.isBasecamp ? t('Open in New Tile') : t('Open in New Window'),
+      onClick: () => openWorktreeInWindow(wt.path, true),
+    },
+  ]);
+  const title = isVSCode
+    ? t('Open worktree $name', {replace: {$name: name}})
+    : t('Switch to worktree $name', {replace: {$name: name}});
+  return (
+    <Tooltip title={title} delayMs={250}>
+      <Button
+        icon
+        aria-label={title}
+        aria-haspopup={isVSCode ? 'menu' : undefined}
+        data-testid="checked-out-elsewhere-open-button"
+        onClick={e => {
+          if (isVSCode) {
+            // useContextMenu already stops propagation and prevents default.
+            openMenu(e);
+            return;
+          }
+          e.stopPropagation();
+          e.preventDefault();
+          changeCwd(wt.path);
+        }}>
+        <Icon icon="arrow-swap" />
+      </Button>
+    </Tooltip>
+  );
+}
+
+function RenameWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
+  const runOperation = useRunOperation();
+  const title = t('Rename worktree $name', {replace: {$name: name}});
+  return (
+    <Tooltip title={title} delayMs={250}>
+      <Button
+        icon
+        aria-label={title}
+        data-testid="checked-out-elsewhere-rename-button"
+        onClick={async e => {
+          e.stopPropagation();
+          e.preventDefault();
+          const result = await showModal<string | undefined>({
+            type: 'custom',
+            title: <T>Rename Worktree</T>,
+            icon: 'worktree',
+            component: ({returnResultAndDismiss}) => (
+              <RenameWorktreeModal
+                returnResultAndDismiss={returnResultAndDismiss}
+                currentLabel={wt.label ?? ''}
+                wtBasename={name}
+              />
+            ),
+          });
+          if (result !== undefined) {
+            await runOperation(new RenameWorktreeOperation(wt.path, result || undefined), true);
+          }
+        }}>
+        <Icon icon="edit" />
+      </Button>
+    </Tooltip>
+  );
+}
+
+function RemoveWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
+  const runOperation = useRunOperation();
+  const title = t('Remove worktree $name', {replace: {$name: name}});
+  return (
+    <Tooltip title={title} delayMs={250}>
+      <Button
+        icon
+        aria-label={title}
+        data-testid="checked-out-elsewhere-remove-button"
+        onClick={async e => {
+          e.stopPropagation();
+          e.preventDefault();
+          const confirmed = await showModal({
+            type: 'confirm',
+            title: <T>Remove Worktree</T>,
+            icon: 'worktree',
+            message: (
+              <span>
+                <Row>
+                  <T replace={{$path: <code>{name}</code>}}>
+                    Are you sure you want to remove the worktree $path?
+                  </T>
+                </Row>
+                <Row style={{marginTop: 'var(--pad)'}}>
+                  <Subtle>
+                    <T>
+                      Any uncommitted changes and shelves in this worktree will be lost forever.
+                    </T>
+                  </Subtle>
+                </Row>
+              </span>
+            ),
+            buttons: [{label: t('Cancel')}, {label: t('Remove'), primary: true}],
+          });
+          if (confirmed?.label === t('Remove')) {
+            await runOperation(new RemoveWorktreeOperation(wt.path), true);
+          }
+        }}>
+        <Icon icon="trash" />
+      </Button>
+    </Tooltip>
+  );
 }
 
 export function InlineProgressSpan(props: {message: string}) {
@@ -982,8 +1160,9 @@ async function maybeWarnAboutOldDestination(dest: CommitInfo): Promise<WarningCh
     return WarningCheckResult.PASS;
   }
 
-  const confirmed = await platform.confirm(
-    t(
+  const confirmed = await showConfirmation({
+    title: t('Go to Older Commit?'),
+    message: t(
       Internal.warnAboutOldGotoReason ??
         'The destination commit is $age older than the current commit. ' +
           "Going here may be slow. It's often faster to rebase the commit to a newer base before going. " +
@@ -994,7 +1173,8 @@ async function maybeWarnAboutOldDestination(dest: CommitInfo): Promise<WarningCh
         },
       },
     ),
-  );
+    confirmLabel: t('Goto Anyway'),
+  });
   return confirmed ? WarningCheckResult.BYPASS : WarningCheckResult.FAIL;
 }
 

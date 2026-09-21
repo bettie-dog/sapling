@@ -86,6 +86,7 @@ use edenapi_types::ListBookmarkPatternsResponse;
 use edenapi_types::LookupRequest;
 use edenapi_types::LookupResponse;
 use edenapi_types::LookupResult;
+use edenapi_types::MirrorBookmarkMove;
 use edenapi_types::OtherRepoWorkspacesRequest;
 use edenapi_types::PathHistoryRequest;
 use edenapi_types::PathHistoryRequestPaginationCursor;
@@ -94,6 +95,8 @@ use edenapi_types::PushVar;
 use edenapi_types::ReferencesDataResponse;
 use edenapi_types::RenameWorkspaceRequest;
 use edenapi_types::RenameWorkspaceResponse;
+use edenapi_types::ReplayIdenticalMovesRequest;
+use edenapi_types::ReplayIdenticalMovesResponse;
 use edenapi_types::RepoPathBuf;
 use edenapi_types::RollbackWorkspaceRequest;
 use edenapi_types::RollbackWorkspaceResponse;
@@ -213,6 +216,7 @@ pub mod paths {
     pub const LAND_STACK: &str = "land";
     pub const LOOKUP: &str = "lookup";
     pub const SET_BOOKMARK: &str = "bookmarks/set";
+    pub const REPLAY_IDENTICAL_MOVES: &str = "bookmarks/replay_identical_moves";
     pub const STREAMING_CLONE: &str = "streaming_clone";
     pub const SUFFIXQUERY: &str = "suffix_query";
     pub const TREES: &str = "trees";
@@ -579,7 +583,7 @@ impl Client {
         let name = format!("{timestamp}_{label}.log");
         let path = log_dir.join(name);
 
-        let _ = async_runtime::spawn_blocking(move || {
+        std::mem::drop(async_runtime::spawn_blocking(move || {
             if let Err(e) = || -> std::io::Result<()> {
                 create_dir_all(&log_dir)?;
                 let data = pprint::pformat_value(&value);
@@ -587,7 +591,7 @@ impl Client {
             }() {
                 tracing::warn!("Failed to log request: {:?}", &e);
             }
-        });
+        }));
     }
 
     pub(crate) async fn fetch_trees(
@@ -1210,6 +1214,36 @@ impl Client {
         self.fetch_single::<SetBookmarkResponse>(req).await
     }
 
+    async fn replay_identical_moves_attempt(
+        &self,
+        bookmark: String,
+        moves: Vec<MirrorBookmarkMove>,
+        pushvars: HashMap<String, String>,
+    ) -> Result<ReplayIdenticalMovesResponse, SaplingRemoteApiError> {
+        tracing::info!(
+            "Mirror {} bookmark move(s) for '{}'",
+            moves.len(),
+            &bookmark
+        );
+        let url = self.build_url(paths::REPLAY_IDENTICAL_MOVES)?;
+        let req_body = ReplayIdenticalMovesRequest {
+            bookmark,
+            moves,
+            pushvars: pushvars
+                .into_iter()
+                .map(|(k, v)| PushVar { key: k, value: v })
+                .collect(),
+        };
+        self.log_request(&req_body, "replay_identical_moves");
+        let req = self
+            .configure_request(paths::REPLAY_IDENTICAL_MOVES, self.inner.client.post(url))?
+            .min_transfer_speed(None)
+            .cbor(&req_body.to_wire())
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        self.fetch_single::<ReplayIdenticalMovesResponse>(req).await
+    }
+
     /// Land a stack of commits, rebasing them onto the specified bookmark
     /// and updating the bookmark to the top of the rebased stack
     async fn land_stack_attempt(
@@ -1492,7 +1526,8 @@ impl SaplingRemoteApi for Client {
 
                 let req =
                     client.configure_request(paths::HEALTH_CHECK, client.inner.client.get(url))?;
-                let res = raise_for_status(req.send_async().await?).await?;
+                let response = client.inner.client.send_async_single(req)?;
+                let res = raise_for_status(response.await?).await?;
 
                 Ok(ResponseMeta::from(&res))
             }
@@ -1508,7 +1543,8 @@ impl SaplingRemoteApi for Client {
                 let url = client.build_url(paths::CAPABILITIES)?;
                 let req =
                     client.configure_request(paths::CAPABILITIES, client.inner.client.get(url))?;
-                let res = raise_for_status(req.send_async().await?).await?;
+                let response = client.inner.client.send_async_single(req)?;
+                let res = raise_for_status(response.await?).await?;
                 let body: Vec<u8> = res.into_body().decoded().try_concat().await?;
                 let caps = serde_json::from_slice(&body)
                     .map_err(|e| SaplingRemoteApiError::ParseResponse(e.to_string()))?;
@@ -1675,6 +1711,19 @@ impl SaplingRemoteApi for Client {
     ) -> Result<SetBookmarkResponse, SaplingRemoteApiError> {
         self.with_retry(|this| {
             this.set_bookmark_attempt(bookmark.clone(), to, from, pushvars.clone())
+                .boxed()
+        })
+        .await
+    }
+
+    async fn replay_identical_moves(
+        &self,
+        bookmark: String,
+        moves: Vec<MirrorBookmarkMove>,
+        pushvars: HashMap<String, String>,
+    ) -> Result<ReplayIdenticalMovesResponse, SaplingRemoteApiError> {
+        self.with_retry(|this| {
+            this.replay_identical_moves_attempt(bookmark.clone(), moves.clone(), pushvars.clone())
                 .boxed()
         })
         .await

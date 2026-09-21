@@ -40,6 +40,8 @@ impl AddScubaParams for BTreeSet<thrift::CommitIdentityScheme> {
 
 impl AddScubaParams for thrift::ListReposParams {}
 
+impl AddScubaParams for thrift::RepoExistsParams {}
+
 impl AddScubaParams for thrift::RepoCreateCommitParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add(
@@ -178,6 +180,28 @@ impl AddScubaParams for thrift::RepoLandStackParams {
         scuba.add("bookmark_name", self.bookmark.as_str());
         scuba.add("commit", self.head.to_string());
         scuba.add("param_base", self.base.to_string());
+        self.identity_schemes.add_scuba_params(scuba);
+        if let Some(old_identity_schemes) = &self.old_identity_schemes {
+            scuba.add(
+                "old_identity_schemes",
+                old_identity_schemes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<ScubaValue>(),
+            );
+        }
+        if let Some(service_identity) = self.service_identity.as_deref() {
+            scuba.add("service_identity", service_identity);
+        }
+    }
+}
+
+impl AddScubaParams for thrift::RepoRebaseStackParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("commit", self.head.to_string());
+        scuba.add("param_base", self.base.to_string());
+        scuba.add("param_onto", self.onto.to_string());
+        scuba.add("merge_resolution", self.merge_resolution.to_string());
         self.identity_schemes.add_scuba_params(scuba);
         if let Some(old_identity_schemes) = &self.old_identity_schemes {
             scuba.add(

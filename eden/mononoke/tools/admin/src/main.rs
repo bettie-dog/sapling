@@ -8,6 +8,7 @@
 #![feature(trait_alias)]
 
 use anyhow::Result;
+use arg_extensions::ArgDefaults;
 use clap::Parser;
 use cmdlib_scrubbing::ScrubAppExtension;
 use fbinit::FacebookInit;
@@ -29,8 +30,26 @@ struct AdminArgs {
     use_monitoring: bool,
 }
 
+struct AdminArgDefaults;
+
+impl ArgDefaults for AdminArgDefaults {
+    fn arg_defaults(&self) -> Vec<(&'static str, String)> {
+        vec![("log_level", "OFF".to_owned())]
+    }
+}
+
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
+    // Continue an inbound Artillery trace (if any) for this whole invocation so
+    // the work below joins the caller's trace (e.g. an agent that shelled out to
+    // `mononoke_admin`). Inert no-op when not traced; art_cli_lite hydrates from
+    // the env waterfall and stamps the attested agent id from our TLS cert SAN.
+    // Held on the main thread for the run; the process-wide context it publishes
+    // is what the tokio-runtime thrift calls pick up. fbcode-only: art_cli_lite
+    // is not part of the OSS build.
+    #[cfg(fbcode_build)]
+    let _artillery_trace_block = art_cli_lite_rs::trace_cli("mononoke_admin");
+
     let mut subcommands = commands::subcommands();
 
     #[cfg(fbcode_build)]
@@ -41,6 +60,7 @@ fn main(fb: FacebookInit) -> Result<()> {
     subcommands.sort_unstable_by(|a, b| a.get_name().cmp(b.get_name()));
 
     let app = MononokeAppBuilder::new(fb)
+        .with_arg_defaults(AdminArgDefaults)
         .with_app_extension(ScrubAppExtension::new())
         .with_app_extension(MonitoringAppExtension {})
         .build_with_subcommands::<AdminArgs>(subcommands)?;

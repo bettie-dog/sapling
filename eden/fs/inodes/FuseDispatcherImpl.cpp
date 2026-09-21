@@ -231,9 +231,10 @@ ImmediateFuture<FuseDispatcher::Attr> FuseDispatcherImpl::setattr(
     const fuse_setattr_in& attr,
     const ObjectFetchContextPtr& context) {
   // Even though mounts are created with the nosuid flag, explicitly disallow
-  // setting suid, sgid, and sticky bits on any inodes. This lets us avoid
-  // explicitly clearing these bits on writes() which is required for correct
-  // behavior under FUSE_HANDLE_KILLPRIV.
+  // setting suid, sgid, and sticky bits on any inodes. Together with create
+  // and mknod stripping them, this lets us avoid explicitly clearing these
+  // bits on write, truncate and chown, which FUSE_HANDLE_KILLPRIV and
+  // FUSE_HANDLE_KILLPRIV_V2 otherwise require.
   if ((attr.valid & FATTR_MODE) &&
       (attr.mode & (S_ISUID | S_ISGID | S_ISVTX))) {
     folly::throwSystemErrorExplicit(EPERM, "Extra mode bits are disallowed");
@@ -299,6 +300,16 @@ ImmediateFuture<uint64_t> FuseDispatcherImpl::open(
   return 0ull;
 }
 
+namespace {
+/**
+ * The mode bits a new file never gets: setattr refuses to set them, and the
+ * kernel is told (FUSE_HANDLE_KILLPRIV_V2) that files never carry them.
+ */
+mode_t stripPrivilegeBits(mode_t mode) {
+  return mode & ~static_cast<mode_t>(S_ISUID | S_ISGID | S_ISVTX);
+}
+} // namespace
+
 ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::create(
     InodeNumber parent,
     PathComponentPiece name,
@@ -307,7 +318,7 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::create(
     const ObjectFetchContextPtr& context) {
   // force 'mode' to be regular file, in which case rdev arg to mknod is ignored
   // (and thus can be zero)
-  mode = S_IFREG | (07777 & mode);
+  mode = S_IFREG | stripPrivilegeBits(mode & 07777);
   return inodeMap_->lookupTreeInode(parent).thenValue(
       [this, mode, childName = PathComponent{name}, context = context.copy()](
           const TreeInodePtr& inode) {
@@ -341,8 +352,19 @@ ImmediateFuture<size_t> FuseDispatcherImpl::write(
     folly::StringPiece data,
     off_t off,
     const ObjectFetchContextPtr& context) {
-  return inodeMap_->lookupFileInode(ino).thenValue(
-      [copy = data.str(), off, context = context.copy()](FileInodePtr&& inode) {
+  auto inodeFuture = inodeMap_->lookupFileInode(ino);
+  if (inodeFuture.isReady() &&
+      mount_->getEdenConfig()->experimentalFuseAvoidWriteCopy.getValue()) {
+    return std::move(inodeFuture)
+        .thenValue([data, off, context = context.copy()](FileInodePtr&& inode) {
+          // FileInode copies data if it has to materialize asynchronously.
+          return inode->write(data, off, context);
+        });
+  }
+
+  return std::move(inodeFuture)
+      .thenValue([copy = data.str(), off, context = context.copy()](
+                     FileInodePtr&& inode) {
         return inode->write(copy, off, context);
       });
 }
@@ -424,7 +446,7 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::mknod(
   return inodeMap_->lookupTreeInode(parent).thenValue(
       [this,
        childName = PathComponent{name},
-       mode,
+       mode = S_ISDIR(mode) ? mode : stripPrivilegeBits(mode),
        rdev,
        context = context.copy()](const TreeInodePtr& inode) {
         auto child =
@@ -506,23 +528,68 @@ ImmediateFuture<folly::Unit> FuseDispatcherImpl::rename(
     InodeNumber newParent,
     PathComponentPiece newNamePiece,
     const ObjectFetchContextPtr& context) {
+  return renameImpl(parent, namePiece, newParent, newNamePiece, false, context);
+}
+
+ImmediateFuture<folly::Unit> FuseDispatcherImpl::rename2(
+    InodeNumber parent,
+    PathComponentPiece namePiece,
+    InodeNumber newParent,
+    PathComponentPiece newNamePiece,
+    uint32_t flags,
+    const ObjectFetchContextPtr& context) {
+  if (!mount_->getEdenConfig()->experimentalFuseRenameNoReplace.getValue()) {
+    // ENOSYS is deliberate: the kernel then stops sending FUSE_RENAME2 for
+    // the life of the mount and fails flagged renames with EINVAL itself,
+    // which is what callers expect from a filesystem without flag support.
+    // Enabling the setting takes effect on the next mount.
+    FUSELL_NOT_IMPL();
+  }
+
+  constexpr uint32_t kRenameNoReplace = 1;
+  if ((flags & ~kRenameNoReplace) != 0) {
+    folly::throwSystemErrorExplicit(EINVAL, "unsupported FUSE_RENAME2 flags");
+  }
+
+  return renameImpl(
+      parent,
+      namePiece,
+      newParent,
+      newNamePiece,
+      (flags & kRenameNoReplace) != 0,
+      context);
+}
+
+ImmediateFuture<folly::Unit> FuseDispatcherImpl::renameImpl(
+    InodeNumber parent,
+    PathComponentPiece namePiece,
+    InodeNumber newParent,
+    PathComponentPiece newNamePiece,
+    bool noReplace,
+    const ObjectFetchContextPtr& context) {
   // Start looking up both parents
   auto parentFuture = inodeMap_->lookupTreeInode(parent);
   auto newParentFuture = inodeMap_->lookupTreeInode(newParent);
   // Do the rename once we have looked up both parents.
   return std::move(parentFuture)
-      .thenValue([npFuture = std::move(newParentFuture),
-                  name = PathComponent{namePiece},
-                  newName = PathComponent{newNamePiece},
-                  context =
-                      context.copy()](const TreeInodePtr& parent) mutable {
-        return std::move(npFuture).thenValue(
-            [parent, name, newName, context = context.copy()](
-                const TreeInodePtr& newParent) {
-              return parent->rename(
-                  name, newParent, newName, InvalidationRequired::No, context);
-            });
-      });
+      .thenValue(
+          [npFuture = std::move(newParentFuture),
+           name = PathComponent{namePiece},
+           newName = PathComponent{newNamePiece},
+           noReplace,
+           context = context.copy()](const TreeInodePtr& parent) mutable {
+            return std::move(npFuture).thenValue(
+                [parent, name, newName, noReplace, context = context.copy()](
+                    const TreeInodePtr& newParent) {
+                  return parent->rename(
+                      name,
+                      newParent,
+                      newName,
+                      InvalidationRequired::No,
+                      context,
+                      noReplace);
+                });
+          });
 }
 
 ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::link(

@@ -175,7 +175,7 @@ def mononoke(args: List[str], stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
                 stderr=outfile,
                 env=localenv,
             )
-        except:
+        except Exception:
             stderr.write(
                 f"Error when running mononoke with command {mononoke_command} and stdout file {test_tmp}/mononoke.out\n".encode()
             )
@@ -912,6 +912,9 @@ concurrency = 24
 
     if env.getenv("REDACTION_DISABLED"):
         append_config("redaction=false")
+
+    if env.getenv("MIRROR_UPLOAD_REDACTION_BYPASS_ENABLED"):
+        append_config("mirror_upload_redaction_bypass_enabled=true")
 
     if env.getenv("LIST_KEYS_PATTERNS_MAX"):
         list_keys_patterns_max = env.getenv("LIST_KEYS_PATTERNS_MAX")

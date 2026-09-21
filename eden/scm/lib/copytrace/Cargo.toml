@@ -14,7 +14,7 @@ name = "copytrace"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bytecount = "0.6.9"
 lru-cache = "0.1.2"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
@@ -30,10 +30,10 @@ sapling-storemodel = { version = "0.1.0", path = "../storemodel" }
 sapling-types = { version = "0.1.0", path = "../types" }
 sapling-xdiff = { version = "0.1.0", path = "../xdiff" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree", features = ["for-tests"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

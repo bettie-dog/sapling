@@ -72,6 +72,10 @@ impl Default for Inner {
 const METADATA_FINGERPRINT_UNKNOWN: u64 = 0;
 const METADATA_FINGERPRINT_PERSISTING: u64 = 1;
 
+/// How long bookkeeping operations (GC, metadata persistence) can take before
+/// we warn that they were slow.
+const SLOW_OPERATION_THRESHOLD: Duration = Duration::from_millis(100);
+
 fn metadata_fingerprint(entries: &[(RepoPathBuf, usize, usize)]) -> u64 {
     let (xor, sum) = entries
         .iter()
@@ -227,7 +231,7 @@ impl Detector {
             .store(metadata_fingerprint(&entries), Ordering::Release);
 
         let elapsed = start.elapsed();
-        if elapsed > Duration::from_millis(10) {
+        if elapsed > SLOW_OPERATION_THRESHOLD {
             tracing::warn!(
                 ?elapsed,
                 count = entries.len(),
@@ -256,7 +260,7 @@ impl Detector {
 
         if !self.try_claim_metadata_persist(fingerprint) {
             let elapsed = start.elapsed();
-            if elapsed > Duration::from_millis(10) {
+            if elapsed > SLOW_OPERATION_THRESHOLD {
                 tracing::warn!(
                     ?elapsed,
                     count = entries.len(),
@@ -287,7 +291,7 @@ impl Detector {
             let elapsed = start.elapsed();
             if result.is_ok() {
                 self.set_last_persisted_metadata_fingerprint(fingerprint);
-                if elapsed > Duration::from_millis(10) {
+                if elapsed > SLOW_OPERATION_THRESHOLD {
                     tracing::warn!(?elapsed, ?path, "persisting empty walk metadata was slow");
                 }
             } else {
@@ -319,7 +323,7 @@ impl Detector {
         match result {
             Ok(()) => {
                 self.set_last_persisted_metadata_fingerprint(fingerprint);
-                if elapsed > Duration::from_millis(10) {
+                if elapsed > SLOW_OPERATION_THRESHOLD {
                     tracing::warn!(
                         ?elapsed,
                         count = entries.len(),
@@ -999,7 +1003,7 @@ impl Inner {
 
         let elapsed = start.elapsed();
 
-        if elapsed > Duration::from_millis(10) {
+        if elapsed > SLOW_OPERATION_THRESHOLD {
             tracing::warn!(
                 ?elapsed,
                 deleted_nodes = result.deleted_nodes,
@@ -1500,7 +1504,7 @@ impl Walk {
                 dir_loads = self.dir_loads.load(Ordering::Relaxed),
                 dir_reads = self.dir_reads.load(Ordering::Relaxed),
                 walk_depth = self.depth,
-                walker_detail = self.pid_detail.get(),
+                walker_detail = self.pid_detail.get().map(String::as_str).unwrap_or_default(),
                 walk_duration = duration,
             );
         }

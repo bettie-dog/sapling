@@ -520,7 +520,12 @@ class EdenDoctor(EdenDoctorChecker):
 
         if fixer.num_problems == 0:
             if not fixer.using_edenfs:
-                out.writeln("EdenFS is not in use.")
+                out.writeln(
+                    "EdenFS daemon is not running. No Eden checkouts are "
+                    "configured, so this is not considered an issue. "
+                    "If you need Eden checkouts, create one with "
+                    "'fbclone <repo> --eden'."
+                )
             else:
                 out.writeln("No issues detected.", fg=out.GREEN)
             return 0
@@ -1165,10 +1170,15 @@ def check_running_mount(
         except Exception as ex:
             raise RuntimeError("Failed to check Sapling status") from ex
 
-        try:
-            check_filesystems.check_hg_status_match_hg_diff(tracker, instance, checkout)
-        except Exception as ex:
-            raise RuntimeError("Failed to compare `sl status` with `sl diff`") from ex
+        if not fast:
+            try:
+                check_filesystems.check_hg_status_match_hg_diff(
+                    tracker, instance, checkout
+                )
+            except Exception as ex:
+                raise RuntimeError(
+                    "Failed to compare `sl status` with `sl diff`"
+                ) from ex
 
 
 class CheckoutNotConfigured(Problem):

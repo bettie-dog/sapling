@@ -125,9 +125,12 @@ size_t roundUpToPageSize(size_t size) {
   return ((size + pageSize - 1) / pageSize) * pageSize;
 }
 
-void pinThreadToCpu(size_t cpu, size_t cpuCount) {
+// Returns false if the thread was not pinned, in which case its affinity is
+// whatever it was before the call -- callers that pin repeatedly need to know,
+// since a stale mask is worse than none.
+bool pinThreadToCpu(size_t cpu, size_t cpuCount) {
   if (cpuCount == 0) {
-    return;
+    return false;
   }
 
   // cpu_set_t has a fixed capacity, so clamp the affinity domain to the CPUs
@@ -142,11 +145,69 @@ void pinThreadToCpu(size_t cpu, size_t cpuCount) {
     const auto savedErrno = errno;
     XLOGF(
         WARN,
-        "failed to pin io_uring worker to cpu {}: {}",
+        "failed to pin io_uring thread to cpu {}: {}",
         cpu,
         std::generic_category().message(savedErrno));
+    return false;
   }
+  return true;
 }
+
+// Restores the calling thread's CPU affinity on scope exit, so a function that
+// pins itself temporarily does not leave the thread bound to whatever CPU it
+// touched last.
+class ScopedThreadAffinity {
+ public:
+  ScopedThreadAffinity() {
+    saved_ = sched_getaffinity(0, sizeof(original_), &original_) == 0;
+    if (!saved_) {
+      const auto savedErrno = errno;
+      XLOGF(
+          WARN,
+          "failed to read thread CPU affinity: {}",
+          std::generic_category().message(savedErrno));
+    }
+  }
+
+  ~ScopedThreadAffinity() {
+    restore();
+  }
+
+  // Puts the captured mask back. Idempotent, and a no-op when the original
+  // mask was never captured, so a caller can also use it to undo a partial pin
+  // mid-scope.
+  void restore() {
+    if (!saved_) {
+      return;
+    }
+    if (sched_setaffinity(0, sizeof(original_), &original_) != 0) {
+      const auto savedErrno = errno;
+      // Worth a warning rather than a silent return: threads spawned after
+      // this point inherit whatever mask is left behind, and not all of them
+      // pin themselves afterwards.
+      XLOGF(
+          WARN,
+          "failed to restore thread CPU affinity: {}",
+          std::generic_category().message(savedErrno));
+    }
+  }
+
+  // Strictly scope-bound: a movable guard could restore twice, or not at all.
+  ScopedThreadAffinity(const ScopedThreadAffinity&) = delete;
+  ScopedThreadAffinity& operator=(const ScopedThreadAffinity&) = delete;
+  ScopedThreadAffinity(ScopedThreadAffinity&&) = delete;
+  ScopedThreadAffinity& operator=(ScopedThreadAffinity&&) = delete;
+
+  // False when the original mask could not be captured, in which case the
+  // caller must not pin: there would be no way to undo it.
+  bool canRestore() const {
+    return saved_;
+  }
+
+ private:
+  cpu_set_t original_{};
+  bool saved_{false};
+};
 
 std::optional<QueueSetupError> setupQueue(
     uint32_t queueDepth,
@@ -214,12 +275,15 @@ std::optional<QueueSetupError> setupQueue(
 
 IoUringFuseTransport::IoUringFuseTransport(
     uint32_t queueDepth,
-    bool disableIoWait)
+    bool disableIoWait,
+    bool skipSelfWakeup)
     : queueDepth_{queueDepth} {
 #if EDEN_HAVE_FUSE_IO_URING
   disableIoWait_ = disableIoWait;
+  skipSelfWakeup_ = skipSelfWakeup;
 #else
   (void)disableIoWait;
+  (void)skipSelfWakeup;
 #endif
 }
 
@@ -244,11 +308,12 @@ IoUringFuseTransport::RingQueue::~RingQueue() noexcept {
 IoUringFuseTransport::RingQueue::RingQueue(RingQueue&& other) noexcept
     : pool{other.pool},
       queueId{other.queueId},
-      eventFd{other.eventFd},
+      eventFd{other.eventFd.exchange(-1, std::memory_order_acq_rel)},
       requestHeaderSize{other.requestHeaderSize},
       ownerThreadId{other.ownerThreadId},
       ring{other.ring},
       ringInitialized{other.ringInitialized},
+      buffersAllocated{other.buffersAllocated},
       entries{std::move(other.entries)},
       pendingCommits{std::move(other.pendingCommits)} {
   other.resetMovedFrom();
@@ -264,11 +329,14 @@ IoUringFuseTransport::RingQueue& IoUringFuseTransport::RingQueue::operator=(
 
   pool = other.pool;
   queueId = other.queueId;
-  eventFd = other.eventFd;
+  eventFd.store(
+      other.eventFd.exchange(-1, std::memory_order_acq_rel),
+      std::memory_order_release);
   requestHeaderSize = other.requestHeaderSize;
   ownerThreadId = other.ownerThreadId;
   ring = other.ring;
   ringInitialized = other.ringInitialized;
+  buffersAllocated = other.buffersAllocated;
   entries = std::move(other.entries);
   pendingCommits = std::move(other.pendingCommits);
 
@@ -280,12 +348,14 @@ IoUringFuseTransport::RingQueue& IoUringFuseTransport::RingQueue::operator=(
 void IoUringFuseTransport::RingQueue::resetMovedFrom() noexcept {
   pool = nullptr;
   queueId = 0;
-  eventFd = -1;
+  eventFd.store(-1, std::memory_order_relaxed);
   requestHeaderSize = sizeof(fuse_uring_req_header);
   ownerThreadId = {};
   ring = {};
   ring.ring_fd = -1;
   ringInitialized = false;
+  // entries (and the buffers they own) were moved out along with the vector.
+  buffersAllocated = false;
 }
 
 void IoUringFuseTransport::RingQueue::reset() noexcept {
@@ -296,8 +366,9 @@ void IoUringFuseTransport::RingQueue::reset() noexcept {
     ring.ring_fd = -1;
   }
 
-  if (eventFd >= 0) {
-    if (close(eventFd) != 0) {
+  const auto fd = eventFd.exchange(-1, std::memory_order_acq_rel);
+  if (fd >= 0) {
+    if (close(fd) != 0) {
       const auto savedErrno = errno;
       XLOGF(
           WARN,
@@ -305,7 +376,6 @@ void IoUringFuseTransport::RingQueue::reset() noexcept {
           queueId,
           savedErrno);
     }
-    eventFd = -1;
   }
 }
 
@@ -337,6 +407,14 @@ void IoUringFuseTransport::initializeRingPool(
     size_t queueCount,
     size_t maxRequestPayloadSize) {
   auto ringPool = std::make_unique<RingPool>();
+  const auto stopFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (stopFd < 0) {
+    throw std::system_error(
+        errno,
+        std::generic_category(),
+        "failed to create companion FUSE reader wakeup fd");
+  }
+  ringPool->devFuseStopFd = folly::File{stopFd, /*ownsFd=*/true};
   ringPool->queueDepth = queueDepth_;
   ringPool->maxRequestPayloadSize = maxRequestPayloadSize;
   ringPool->queues.resize(queueCount);
@@ -348,6 +426,7 @@ void IoUringFuseTransport::initializeRingPool(
     queue.entries.resize(queueDepth_);
   }
 
+  std::unique_lock lock{ringPoolMutex_};
   ringPool_ = std::move(ringPool);
 }
 
@@ -362,9 +441,98 @@ void IoUringFuseTransport::initializeSession(FuseChannel& channel) {
   });
 }
 
-void IoUringFuseTransport::initializeQueue(RingQueue& queue, int fuseFd) const {
+std::optional<std::string> IoUringFuseTransport::prepareAllQueues(
+    FuseChannel& channel) {
+  try {
+    initializeSession(channel);
+  } catch (const std::exception& ex) {
+    destroyRingPool();
+    return fmt::format("failed to prepare io_uring ring pool: {}", ex.what());
+  }
+  if (!ringPool_) {
+    return "io_uring ring pool was not created";
+  }
+
+  // This all runs on one thread, so each queue is pinned to the CPU whose
+  // worker will later claim it before its ring is created. io_uring_setup()
+  // allocates the ring on the calling thread's NUMA node -- it passes
+  // numa_node_id() as the preferred node, with no __GFP_THISNODE, so it is a
+  // preference rather than a hard bind -- and without this the entire pool
+  // would land on whichever node happens to run FUSE_INIT.
+  //
+  // The mapping must stay identical to the one processSession() uses, clamp
+  // included, or queues end up deliberately placed on the wrong node instead
+  // of merely unpinned. Reusing pinThreadToCpu() is what keeps them in sync.
+  //
+  // Only the ring is affected. The per-entry buffers dominate the footprint
+  // (~1 MiB per queue against ~8 KiB for the ring) but are never written here,
+  // so first-touch still places them on the worker that eventually uses them.
+  //
+  // Unpins on the way out. This thread goes on to call startWorkerThreads(),
+  // and spawned threads inherit the creator's affinity mask -- the io_uring
+  // workers re-pin themselves, but the invalidation threads never do and would
+  // stay stuck on one CPU for the life of the mount.
+  ScopedThreadAffinity restoreAffinity;
+  const auto configuredCpuCount = get_nprocs_conf();
+  // Skip pinning outright if the mask could not be captured. Losing NUMA
+  // locality is a far better outcome than pinning with no way back.
+  const bool pinToQueueCpu =
+      restoreAffinity.canRestore() && configuredCpuCount > 0;
+
+  const auto queueCount = ringPool_->queues.size();
+  const auto fuseFd = channel.getFuseDeviceFd();
+  for (auto& queue : ringPool_->queues) {
+    if (pinToQueueCpu &&
+        !pinThreadToCpu(
+            queue.queueId, static_cast<size_t>(configuredCpuCount))) {
+      // A failed pin leaves the *previous* queue's mask in place, which would
+      // put this ring on a deliberately wrong node rather than an arbitrary
+      // one. Fall back to the original mask so the placement degrades to
+      // unpinned.
+      restoreAffinity.restore();
+    }
+    try {
+      if (!queue.ringInitialized) {
+        createQueueRing(queue, fuseFd);
+      }
+      if (!queue.buffersAllocated) {
+        allocateQueueBuffers(queue);
+      }
+    } catch (const std::exception& ex) {
+      auto error = fmt::format(
+          "failed to prepare io_uring queue {} of {}: {}",
+          queue.queueId,
+          queueCount,
+          ex.what());
+      // Release the queues prepared so far rather than holding a partial pool
+      // for the lifetime of the transport. sessionInitFlag_ stays set, so the
+      // pool is not rebuilt later: this transport is spent and the caller is
+      // expected to drop it.
+      destroyRingPool();
+      return error;
+    }
+  }
+
+  XLOGF(DBG3, "prepared {} io_uring queues before FUSE_INIT", queueCount);
+  return std::nullopt;
+}
+
+void IoUringFuseTransport::createQueueRing(RingQueue& queue, int fuseFd) const {
+  int eventFd = -1;
   auto maybeSetupError = setupQueue(
-      queueDepth_, fuseFd, queue.eventFd, queue.ring, queue.ringInitialized);
+      queueDepth_, fuseFd, eventFd, queue.ring, queue.ringInitialized);
+  const auto previousEventFdState =
+      queue.eventFd.exchange(eventFd, std::memory_order_acq_rel);
+  if (previousEventFdState == kStopRequestedBeforeReady && eventFd >= 0) {
+    // requestStopWakeup() ran before this queue's eventfd was published, so
+    // that wakeup would otherwise have been silently dropped. Self-notify now
+    // that the fd is known -- before throwing below on setup failure -- so
+    // the worker doesn't block indefinitely in io_uring_submit_and_wait() if
+    // it somehow reached that loop despite the error, and so the pending
+    // wakeup isn't discarded by the exchange() above without ever being
+    // acted on.
+    notifyWorker(queue);
+  }
   if (maybeSetupError.has_value()) {
     throwIoUringSetupError(*maybeSetupError, queue.queueId);
   }
@@ -385,21 +553,14 @@ void IoUringFuseTransport::initializeQueue(RingQueue& queue, int fuseFd) const {
   }
 }
 
-void IoUringFuseTransport::initializeQueueForWorker(
-    RingQueue& queue,
-    int fuseFd) const {
-  XLOGF(
-      DBG6,
-      "io_uring worker initializing queueId={} queueDepth={} payloadSize={}",
-      queue.queueId,
-      queue.entries.size(),
-      queue.pool->maxRequestPayloadSize);
-
-  initializeQueue(queue, fuseFd);
+void IoUringFuseTransport::allocateQueueBuffers(RingQueue& queue) const {
   for (auto& entry : queue.entries) {
     initializeEntryBuffers(queue, entry);
   }
+  queue.buffersAllocated = true;
+}
 
+void IoUringFuseTransport::registerQueueWithFuse(RingQueue& queue) const {
   prepareFetchRequests(queue);
   auto rc = io_uring_submit(&queue.ring);
   if (rc < 0) {
@@ -417,8 +578,29 @@ void IoUringFuseTransport::initializeQueueForWorker(
       queue.queueId,
       queue.entries.size(),
       rc,
-      queue.eventFd,
+      queue.eventFd.load(std::memory_order_acquire),
       queue.ring.ring_fd);
+}
+
+void IoUringFuseTransport::initializeQueueForWorker(
+    RingQueue& queue,
+    int fuseFd) const {
+  XLOGF(
+      DBG6,
+      "io_uring worker initializing queueId={} queueDepth={} payloadSize={}",
+      queue.queueId,
+      queue.entries.size(),
+      queue.pool->maxRequestPayloadSize);
+
+  // The ring and buffers may already exist if they were set up ahead of
+  // FUSE_INIT; only do the work here that the worker is first to reach.
+  if (!queue.ringInitialized) {
+    createQueueRing(queue, fuseFd);
+  }
+  if (!queue.buffersAllocated) {
+    allocateQueueBuffers(queue);
+  }
+  registerQueueWithFuse(queue);
 }
 
 void IoUringFuseTransport::initializeEntryBuffers(
@@ -669,7 +851,8 @@ void IoUringFuseTransport::queueCommitAndFetch(
     RingEntry& entry,
     const EdenStatsPtr& stats) const {
   auto& queue = entry.pool->queues.at(entry.queueId);
-  if (std::this_thread::get_id() == queue.ownerThreadId) {
+  const bool sameThread = std::this_thread::get_id() == queue.ownerThreadId;
+  if (sameThread) {
     stats->increment(&FuseStats::ioUringReplySameThread);
   } else {
     stats->increment(&FuseStats::ioUringReplyCrossThread);
@@ -678,7 +861,13 @@ void IoUringFuseTransport::queueCommitAndFetch(
     auto pendingCommits = queue.pendingCommits->wlock();
     pendingCommits->push_back(&entry);
   }
-  notifyWorker(queue);
+  // The owner thread drains pendingCommits after its CQE loop and before
+  // the next io_uring_submit_and_wait, so a reply queued from the owner
+  // thread itself needs no eventfd nudge. Only cross-thread replies must
+  // wake the worker.
+  if (!sameThread || !skipSelfWakeup_) {
+    notifyWorker(queue);
+  }
 }
 
 void IoUringFuseTransport::processPendingCommits(RingQueue& queue) const {
@@ -726,13 +915,41 @@ bool IoUringFuseTransport::shouldExitWorkerLoop(
 }
 
 void IoUringFuseTransport::notifyWorker(const RingQueue& queue) const {
-  if (eventfd_write(queue.eventFd, 1) != 0) {
+  // Every caller (queueCommitAndFetch(), the self-notify in
+  // createQueueRing(), and requestQueueStopWakeup()'s fallback) already
+  // guarantees the eventfd is published before calling this. Don't silently
+  // ignore an unpublished/invalid fd here, since that would mask a genuine
+  // caller bug instead of surfacing it.
+  const auto eventFd = queue.eventFd.load(std::memory_order_acquire);
+  if (eventfd_write(eventFd, 1) != 0) {
     throw std::system_error(
         errno,
         std::generic_category(),
         fmt::format(
             "failed to notify io_uring worker for queue {}", queue.queueId));
   }
+}
+
+void IoUringFuseTransport::requestQueueStopWakeup(RingQueue& queue) const {
+  auto fd = queue.eventFd.load(std::memory_order_acquire);
+  while (fd < 0 && fd != kStopRequestedBeforeReady) {
+    // The owning worker hasn't published its eventfd yet. Record that a stop
+    // wakeup is owed so createQueueRing() can self-notify once it publishes
+    // the fd, instead of silently dropping this wakeup the way a plain
+    // load-then-write would.
+    if (queue.eventFd.compare_exchange_weak(
+            fd,
+            kStopRequestedBeforeReady,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return;
+    }
+  }
+  if (fd == kStopRequestedBeforeReady) {
+    // Another call already recorded the pending wakeup.
+    return;
+  }
+  notifyWorker(queue);
 }
 
 void IoUringFuseTransport::prepareCommitAndFetchSqe(
@@ -764,7 +981,17 @@ fuse_uring_ent_in_out& IoUringFuseTransport::getRingEntryInOut(
 }
 
 void IoUringFuseTransport::destroyRingPool() noexcept {
-  ringPool_.reset();
+  // Take the pool out under the exclusive lock so this waits for any
+  // requestStopWakeup() call already iterating queues under the shared lock
+  // to finish first, and so any later requestStopWakeup() call observes
+  // ringPool_ as null instead of a dangling pointer. The actual teardown
+  // (io_uring_queue_exit(), closing fds) happens after releasing the lock,
+  // since by then no reader can still be holding a reference to `pool`.
+  std::unique_ptr<RingPool> pool;
+  {
+    std::unique_lock lock{ringPoolMutex_};
+    pool = std::move(ringPool_);
+  }
 }
 
 void* IoUringFuseTransport::allocatePageAlignedBuffer(size_t size) {
@@ -951,7 +1178,9 @@ const char* IoUringFuseTransport::getName() const {
 size_t IoUringFuseTransport::getWorkerThreadCount(
     size_t defaultThreadCount) const {
 #if EDEN_HAVE_FUSE_IO_URING
-  return getConfiguredQueueCount(defaultThreadCount);
+  // FORGETs still arrive on /dev/fuse, so keep one dedicated reader in
+  // addition to the io_uring queue workers.
+  return getConfiguredQueueCount(defaultThreadCount) + 1;
 #else
   return defaultThreadCount;
 #endif
@@ -959,13 +1188,31 @@ size_t IoUringFuseTransport::getWorkerThreadCount(
 
 void IoUringFuseTransport::requestStopWakeup() {
 #if EDEN_HAVE_FUSE_IO_URING
+  // May run on a thread that never called initializeSession()/
+  // initializeRingPool(), so ringPool_ itself (a plain unique_ptr) cannot be
+  // read directly here without racing its publication in initializeRingPool()
+  // or its teardown in destroyRingPool(). Hold the shared lock for the
+  // entire loop below (not just to fetch the pointer) so destroyRingPool()
+  // cannot free the pool out from under an in-progress iteration.
+  std::shared_lock lock{ringPoolMutex_};
   if (!ringPool_) {
     return;
   }
 
-  for (const auto& queue : ringPool_->queues) {
+  int result;
+  do {
+    result = eventfd_write(ringPool_->devFuseStopFd.fd(), 1);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0 && errno != EAGAIN) {
+    XLOGF(
+        ERR,
+        "failed to wake companion FUSE reader during shutdown: {}",
+        folly::errnoStr(errno));
+  }
+
+  for (auto& queue : ringPool_->queues) {
     try {
-      notifyWorker(queue);
+      requestQueueStopWakeup(queue);
     } catch (const std::exception& ex) {
       XLOGF(
           ERR,
@@ -989,15 +1236,28 @@ void IoUringFuseTransport::processSession(FuseChannel& channel) {
 #if EDEN_HAVE_FUSE_IO_URING
   initializeSession(channel);
 
-  const auto queueId = nextQueueId_.fetch_add(1, std::memory_order_acq_rel);
-  if (!ringPool_ || queueId >= ringPool_->queues.size()) {
+  const auto workerId = nextWorkerId_.fetch_add(1, std::memory_order_acq_rel);
+  if (!ringPool_ || workerId > ringPool_->queues.size()) {
     throw std::runtime_error(
         fmt::format(
-            "failed to assign io_uring queue {} (queue_count={})",
-            queueId,
+            "failed to assign io_uring worker {} (queue_count={})",
+            workerId,
             ringPool_ ? ringPool_->queues.size() : 0));
   }
 
+  const auto workerCount = ringPool_->queues.size() + 1;
+  if (workerId == 0) {
+    // FORGET and other control requests remain on /dev/fuse after io_uring
+    // negotiation. This reader shares the managed workers' stop/join lifetime.
+    devFuseTransport_.processSession(
+        channel, ringPool_->devFuseStopFd.fd(), [&] {
+          channel.notifyTransportWorkerReady(
+              ringPool_->queues.size(), workerCount);
+        });
+    return;
+  }
+
+  const auto queueId = workerId - 1;
   auto& queue = ringPool_->queues[queueId];
   queue.ownerThreadId = std::this_thread::get_id();
   const auto myPid = getpid();
@@ -1014,7 +1274,7 @@ void IoUringFuseTransport::processSession(FuseChannel& channel) {
   }
 
   initializeQueueForWorker(queue, channel.getFuseDeviceFd());
-  channel.notifyTransportWorkerReady(queue.queueId, ringPool_->queues.size());
+  channel.notifyTransportWorkerReady(queue.queueId, workerCount);
 
   while (true) {
     processPendingCommits(queue);
@@ -1055,7 +1315,13 @@ void IoUringFuseTransport::processSession(FuseChannel& channel) {
       auto result = handleCqe(queue, *cqe, channel.isStopRequested());
       switch (result.action) {
         case CqeResult::Action::DispatchRequest: {
-          XCHECK(result.request.has_value());
+          // A DispatchRequest action always carries a decoded request.
+          if (!result.request.has_value()) {
+            throw std::runtime_error(
+                fmt::format(
+                    "io_uring dispatch on queue {} produced no request",
+                    queue.queueId));
+          }
           auto& request = *result.request;
           if (channel.isStopRequested()) {
             // COMMIT_AND_FETCH can return another request while shutdown is
@@ -1066,6 +1332,7 @@ void IoUringFuseTransport::processSession(FuseChannel& channel) {
           }
           registerOutstandingEntry(request.header.unique, *request.entry);
           channel.dispatchRequestFromTransport(
+              *this,
               request.header,
               folly::ByteRange{
                   request.arguments.data(), request.arguments.size()},
@@ -1113,6 +1380,13 @@ void IoUringFuseTransport::replyError(
   (void)errorCode;
   throwIoUringNotImplemented("replyError", queueDepth_);
 #endif
+}
+
+void IoUringFuseTransport::replyNone(
+    FuseChannel& channel,
+    const fuse_in_header& request) const {
+  // A request without a FUSE reply still owns a ring entry to recycle.
+  replyError(channel, request, 0);
 }
 
 void IoUringFuseTransport::sendRawReply(

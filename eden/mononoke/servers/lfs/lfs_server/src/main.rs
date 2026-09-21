@@ -33,7 +33,6 @@ use futures::future::try_select;
 use futures::pin_mut;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ArtilleryMiddleware;
-use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
 use gotham_ext::middleware::LogMiddleware;
 use gotham_ext::middleware::MetadataMiddleware;
@@ -55,7 +54,6 @@ use mononoke_app::args::TLSArgs;
 use mononoke_app::args::parse_config_spec_to_path;
 use mononoke_app::monitoring::AliveService;
 use mononoke_app::monitoring::MonitoringAppExtension;
-use mononoke_configs::MononokeConfigs;
 use mononoke_repos::MononokeRepos;
 use repo_blobstore::RepoBlobstore;
 use repo_identity::RepoIdentity;
@@ -182,7 +180,6 @@ struct LfsServerArgs {
 #[derive(Clone)]
 pub struct LfsRepos {
     pub(crate) repos: Arc<MononokeRepos<Repo>>,
-    pub(crate) config: Arc<MononokeConfigs>,
 }
 
 impl LfsRepos {
@@ -191,8 +188,7 @@ impl LfsRepos {
             .open_managed_repos(Some(ShardedService::LargeFilesService))
             .await?;
         let repos = repos_mgr.repos().clone();
-        let config = repos_mgr.configs().clone();
-        Ok(Self { repos, config })
+        Ok(Self { repos })
     }
 
     pub(crate) fn get(&self, repo_name: &str) -> Option<Arc<Repo>> {
@@ -320,8 +316,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 force_http_for_header,
             )?;
 
-            let repos_config = repos.config.clone();
-
             let bandwidth = get_bandwidth();
 
             let ctx = LfsServerContext::new(
@@ -343,7 +337,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
             let handler = MononokeHttpHandler::builder()
                 .add(TlsSessionDataMiddleware::new(tls_session_data_log)?)
-                .add(ConfigInfoMiddleware::new(repos_config))
                 .add(MetadataMiddleware::new(
                     fb,
                     internal_identity,

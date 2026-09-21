@@ -108,13 +108,6 @@ pub fn http_config(
         hc.limit_requests = limit;
     }
 
-    if let Some(limit) = config
-        .get_opt("http", "limit-response-buffering")
-        .unwrap_or_default()
-    {
-        hc.limit_response_buffering = limit;
-    }
-
     if let Some(follow) = config
         .get_opt("http", "follow-redirects")
         .unwrap_or_default()
@@ -127,6 +120,13 @@ pub fn http_config(
         .unwrap_or_default()
     {
         hc.http_worker_threads = threads;
+    }
+
+    if let Some(length) = config
+        .get_opt("http", "response-buffer-length")
+        .unwrap_or_default()
+    {
+        hc.response_buffer_length = length;
     }
 
     let using_auth_proxy = hc.unix_socket_path.is_some()

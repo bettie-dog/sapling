@@ -7,11 +7,13 @@
 # pyre-strict
 
 import argparse
+import json
 import os
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import toml
 from eden.fs.cli import config as config_mod, main as main_mod, telemetry, util
 from eden.fs.cli.config import (
     CheckoutConfig,
@@ -20,6 +22,7 @@ from eden.fs.cli.config import (
     EdenInstance,
 )
 from eden.fs.service.eden.thrift_types import MountInfo, MountState
+from eden.test_support.temporary_directory import TemporaryDirectoryMixin
 
 from .lib.output import TestOutput
 
@@ -147,6 +150,56 @@ class GlobalOptionEnvDefaultsTest(unittest.TestCase):
         self.assertEqual(args.config_dir, "/expanded/base/cfg")
 
 
+class UnmountRedirectionsTest(unittest.TestCase, TemporaryDirectoryMixin):
+    def test_uses_global_path_environment_defaults(self) -> None:
+        for policy_path in ("home/.edenrc", "etc/edenfs.rc"):
+            with self.subTest(policy_path=policy_path):
+                root = Path(self.make_temporary_directory()).resolve()
+                checkout = root / "checkout"
+                client = root / "state" / "clients" / "checkout"
+                client.mkdir(parents=True)
+                (root / "home").mkdir()
+                (root / "etc").mkdir()
+                for name in ("remove", "keep"):
+                    (checkout / name).mkdir(parents=True)
+                    (checkout / name / "file").write_text("contents\n")
+                (root / "state" / "config.json").write_text(
+                    json.dumps({str(checkout): "checkout"})
+                )
+                (client / "config.toml").write_text(
+                    toml.dumps(
+                        {
+                            "repository": {"path": str(root / "backing"), "type": "hg"},
+                            "redirections": {"remove": "bind", "keep": "bind"},
+                        }
+                    )
+                )
+                for path, allowed in ((".edenrc", "keep"), (policy_path, "remove")):
+                    (root / path).write_text(
+                        toml.dumps(
+                            {
+                                "redirections": {
+                                    "redirect-fixup-deletable-paths": [allowed]
+                                }
+                            }
+                        )
+                    )
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "HOME": str(root),
+                        "EDENFSCTL_CONFIG_DIR": str(root / "state"),
+                        "EDENFSCTL_ETC_EDEN_DIR": str(root / "etc"),
+                        "EDENFSCTL_HOME_DIR": str(root / "home"),
+                    },
+                ):
+                    main_mod.unmount_redirections_for_path(str(checkout), True)
+
+                self.assertFalse((checkout / "remove").exists())
+                self.assertEqual("contents\n", (checkout / "keep" / "file").read_text())
+
+
 class CloneProtocolDefaultTest(unittest.TestCase):
     def test_platform_default(self) -> None:
         cases = (
@@ -171,6 +224,7 @@ class RestartTest(unittest.TestCase):
         restart_cmd.args = argparse.Namespace(
             allow_root=False,
             daemon_binary=None,
+            force_restart=False,
             migrate_to=None,
             preserved_vars=None,
             prompt=False,
@@ -264,6 +318,56 @@ class RestartTest(unittest.TestCase):
         telemetry_sample = telemetry_logger.samples[0]
         self.assertNotIn("reason", telemetry_sample.strings)
         self.assertNotIn("transport_name", telemetry_sample.strings)
+
+    def make_std_stream_mock(self, isatty: bool) -> MagicMock:
+        stream = MagicMock()
+        stream.isatty.return_value = isatty
+        return stream
+
+    def test_full_restart_skips_prompt_when_stdout_is_not_a_tty(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        instance = MagicMock()
+        stdout_mock = self.make_std_stream_mock(False)
+
+        with (
+            patch.object(main_mod.sys, "stdin", self.make_std_stream_mock(True)),
+            patch.object(main_mod.sys, "stdout", stdout_mock),
+            patch.object(main_mod, "prompt_confirmation") as prompt_confirmation,
+            patch.object(restart_cmd, "_do_stop") as do_stop,
+            patch.object(
+                restart_cmd, "_finish_restart", return_value=0
+            ) as finish_restart,
+        ):
+            self.assertEqual(
+                0, restart_cmd._full_restart(instance, 1234, None, True, False)
+            )
+
+        prompt_confirmation.assert_not_called()
+        do_stop.assert_called_once_with(
+            instance, 1234, timeout=main_mod.DEFAULT_STOP_TIMEOUT
+        )
+        finish_restart.assert_called_once_with(instance, allow_root=False)
+        written = "".join(str(c.args[0]) for c in stdout_mock.write.call_args_list)
+        self.assertIn("skipping confirmation", written)
+
+    def test_full_restart_prompts_when_stdin_and_stdout_are_ttys(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        instance = MagicMock()
+
+        with (
+            patch.object(main_mod.sys, "stdin", self.make_std_stream_mock(True)),
+            patch.object(main_mod.sys, "stdout", self.make_std_stream_mock(True)),
+            patch.object(
+                main_mod, "prompt_confirmation", return_value=False
+            ) as prompt_confirmation,
+            patch.object(restart_cmd, "_do_stop") as do_stop,
+        ):
+            self.assertEqual(
+                1, restart_cmd._full_restart(instance, 1234, None, True, False)
+            )
+
+        prompt_confirmation.assert_called_once_with("Proceed?")
+        do_stop.assert_not_called()
 
 
 class ListTest(unittest.TestCase):

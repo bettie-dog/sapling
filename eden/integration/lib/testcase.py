@@ -4,8 +4,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
-
 import configparser
 import errno
 import inspect
@@ -46,7 +44,7 @@ from eden.fs.service.eden.thrift_types import (
 )
 from eden.test_support.testcase import EdenTestCaseBase
 
-from . import edenclient, gitrepo, hgrepo, repobase, skip
+from . import edenclient, gitrepo, hgrepo, mount_namespace, repobase, skip
 from .find_executables import FindExe
 
 
@@ -54,6 +52,8 @@ if not FindExe.is_buck_build() or os.environ.get("EDENFS_SUFFIX", "") != "":
     _build_flavor = "open_source"
 else:
     _build_flavor = "facebook"
+
+mount_namespace.maybe_reexec_in_private_mount_namespace()
 
 
 class IntegrationTestCase(EdenTestCaseBase):
@@ -95,6 +95,9 @@ class EdenTestCase(EdenTestCaseBase):
         self.last_event = now
 
     def setUp(self) -> None:
+        if self.use_io_uring():
+            edenclient.require_io_uring_kernel()
+
         self.start = time.time()
         self.last_event = self.start
         self.system_hgrc: Optional[str] = None
@@ -105,9 +108,10 @@ class EdenTestCase(EdenTestCaseBase):
 
         super().setUp()
 
-        # Set an environment variable to prevent telemetry logging
-        # during integration tests
-        self.setenv("INTEGRATION_TEST", "1")
+        # Set environment variables to prevent telemetry logging during
+        # integration tests.
+        self.setenv("EDENFS_INTEGRATION_TEST", "1")
+        self.setenv("EDENFS_NO_TELEMETRY", "1")
 
         # Set this environment variable to enable Sl tracing during the test
         # self.setenv("SL_LOG", "trace")
@@ -182,19 +186,20 @@ class EdenTestCase(EdenTestCaseBase):
         # to point to our test home directory for the duration of the test.
         self.setenv("HOME", str(self.eden.home_dir))
 
-        extra_config = self.edenfs_extra_config()
-        if extra_config:
-            self.write_configs(extra_config, self.eden.system_rc_path)
+        extra_config = dict(self.edenfs_extra_config() or {})
+        fuse_config = list(extra_config.get("fuse", []))
+        extra_config["fuse"] = fuse_config
+        fuse_config.extend(edenclient.fuse_transport_config(self.use_io_uring()))
+        self.write_configs(extra_config, self.eden.system_rc_path)
 
         # Default to using the Rust version of commands when running
         # integration tests. An empty edenfsctl_rollout file means that all
         # subcommands should use the Rust implementation if available.
         self.set_rust_rollout_config({})
 
-        self.eden.start()
-
         # Store a lambda in case self.eden is replaced during the test.
         self.addCleanup(lambda: self.eden.cleanup())
+        self.eden.start()
         self.report_time("eden daemon started")
 
         self.mount = os.path.join(self.mounts_dir, "main")
@@ -216,6 +221,7 @@ class EdenTestCase(EdenTestCaseBase):
             logging_settings=logging_settings,
             extra_args=extra_args,
             storage_engine=storage_engine,
+            expected_fuse_transport="io_uring" if self.use_io_uring() else "devfuse",
         )
 
     def write_configs(
@@ -299,6 +305,9 @@ class EdenTestCase(EdenTestCaseBase):
         """
         return []
 
+    def use_io_uring(self) -> bool:
+        return False
+
     def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
         """
         Get additional configs to write to the edenfs.rc file before starting
@@ -311,15 +320,24 @@ class EdenTestCase(EdenTestCaseBase):
             "experimental": [
                 "enable-nfs-server = true",
                 "propagate-checkout-errors = true",
-                "filteredfs-optimize-unfiltered = true",
-                "prefetch-optimizations-v2 = true",
+                "overlay-direct-file-create = true",
+                "overlay-cache-wal-files = true",
+                'overlay-wal-min-compaction-threshold = "50"',
+                "overlay-reuse-created-fds = true",
+                "fuse-avoid-write-copy = true",
+                "fuse-io-uring-skip-self-wakeup = true",
             ],
             # Defaulting to 8 retry threads is excessive when the test
             # framework runs tests on each CPU core.
             "hg": ['num-retry-threads = "2"'],
             "overlay": [
                 "direct-file-writes = true",
+                'file-prealloc-pool-size = "64"',
+                'dir-prealloc-pool-size = "64"',
             ],
+            # Keep test daemons out of the production Scuba tables regardless
+            # of build mode. EDENFS_INTEGRATION_TEST only reaches the CLIs.
+            "telemetry": ['enable-scribe-logging = "false"'],
         }
 
         # Collect experimental configs from mixins
@@ -826,6 +844,7 @@ def test_replicator(
 def _replicate_eden_nfs_repo_test(
     test_class: Type[EdenRepoTest],
     run_coroutines: bool = False,
+    run_io_uring: bool = True,
 ) -> Iterable[Tuple[str, Type[EdenRepoTest]]]:
     class CoroRepoTest(CoroutinesTestMixin, test_class):
         pass
@@ -844,7 +863,28 @@ def _replicate_eden_nfs_repo_test(
     if run_coroutines:
         variants.append(("Coroutines", typing.cast(Type[EdenRepoTest], CoroRepoTest)))
 
-    return variants
+    result = []
+    for label, base in variants:
+
+        class CustomRepoTest(base):
+            pass
+
+        result.append((label, typing.cast(Type[EdenRepoTest], CustomRepoTest)))
+        # This helper also generates default FUSE variants, despite its NFS name.
+        if (
+            run_io_uring
+            and sys.platform == "linux"
+            and not issubclass(base, NFSTestMixin)
+        ):
+
+            class IoUringRepoTest(IoUringTestMixin, base):
+                pass
+
+            result.append(
+                (f"{label}IoUring", typing.cast(Type[EdenRepoTest], IoUringRepoTest))
+            )
+
+    return result
 
 
 # A decorator to duplicate the test to use NFS
@@ -874,6 +914,7 @@ class WalEnabledMixin:
 
 def _replicate_eden_nfs_repo_test_with_wal_variant(
     test_class: Type[EdenRepoTest],
+    run_io_uring: bool = True,
 ) -> Iterable[Tuple[str, Type[EdenRepoTest]]]:
     """Variant generator: every `eden_nfs_repo_test` variant, plus a
     WAL flavor of each.
@@ -883,7 +924,9 @@ def _replicate_eden_nfs_repo_test_with_wal_variant(
     base variants automatically if `_replicate_eden_nfs_repo_test`
     grows them.
     """
-    base_variants = list(_replicate_eden_nfs_repo_test(test_class))
+    base_variants = list(
+        _replicate_eden_nfs_repo_test(test_class, run_io_uring=run_io_uring)
+    )
     # WAL is only implemented for the Legacy/LegacyDev FsInodeCatalog
     # (Linux/macOS). Windows uses the Sqlite catalog, so the WAL variants
     # would exercise the same code path as the base variants.
@@ -912,11 +955,13 @@ eden_nfs_repo_test_with_wal_variant = test_replicator(
 MixinList = List[Tuple[str, List[Type[Any]]]]
 
 
-def _replicate_eden_repo_test(
+# The complexity check includes the methods of these generated classes.
+def _replicate_eden_repo_test(  # noqa: C901
     test_class: Type[EdenRepoTest],
     run_on_nfs: bool = True,
     case_sensitivity_dependent: bool = False,
     run_coroutines: bool = True,
+    run_io_uring: bool = True,
 ) -> Iterable[Tuple[str, Type[EdenRepoTest]]]:
     nfs_variants: MixinList = [("", [])]
     if run_on_nfs and eden.config.HAVE_NFS:
@@ -942,7 +987,7 @@ def _replicate_eden_repo_test(
         for scm_label, scm_mixins in scm_variants:
             for case_label, case_mixins in case_variants:
 
-                class VariantRepoTest(
+                class VariantRepoTestBase(
                     # pyrefly: ignore [invalid-inheritance]
                     *nfs_mixins,
                     # pyrefly: ignore [invalid-inheritance]
@@ -953,24 +998,51 @@ def _replicate_eden_repo_test(
                 ):
                     pass
 
+                class VariantRepoTest(VariantRepoTestBase):
+                    pass
+
                 variants.append(
                     (
                         f"{nfs_label}{scm_label}{case_label}",
                         typing.cast(Type[EdenRepoTest], VariantRepoTest),
                     )
                 )
+                if run_io_uring and sys.platform == "linux" and not nfs_mixins:
+
+                    class IoUringVariantRepoTest(IoUringTestMixin, VariantRepoTestBase):
+                        pass
+
+                    label = f"{scm_label}{case_label}IoUring"
+                    # Keep the original Hg io_uring variant's test names stable.
+                    if label == "HgIoUring":
+                        label = "IoUring"
+                    variants.append(
+                        (label, typing.cast(Type[EdenRepoTest], IoUringVariantRepoTest))
+                    )
 
     # Add a single Coroutines variant after all other combinations
     if run_coroutines:
 
-        class CoroutinesVariantRepoTest(
-            CoroutinesTestMixin, HgRepoTestMixin, test_class
-        ):
+        class CoroutinesRepoTestBase(CoroutinesTestMixin, HgRepoTestMixin, test_class):
+            pass
+
+        class CoroutinesVariantRepoTest(CoroutinesRepoTestBase):
             pass
 
         variants.append(
             ("Coroutines", typing.cast(Type[EdenRepoTest], CoroutinesVariantRepoTest))
         )
+        if run_io_uring and sys.platform == "linux":
+
+            class IoUringCoroutinesRepoTest(IoUringTestMixin, CoroutinesRepoTestBase):
+                pass
+
+            variants.append(
+                (
+                    "CoroutinesIoUring",
+                    typing.cast(Type[EdenRepoTest], IoUringCoroutinesRepoTest),
+                )
+            )
 
     return variants
 
@@ -1035,6 +1107,11 @@ class NFSTestMixin:
         return True
 
 
+class IoUringTestMixin:
+    def use_io_uring(self) -> bool:
+        return True
+
+
 class CaseSensitiveTestMixin:
     is_case_sensitive = True
 
@@ -1051,24 +1128,28 @@ class CoroutinesTestMixin:
 
     def get_coroutines_configs(self) -> List[str]:
         return [
-            "enable-phase5 = true",
-            "enable-phase4 = true",
-            "enable-phase6 = true",
             "enable-phase7 = true",
             "enable-phase8 = true",
             "enable-phase9 = true",
-            "enable-phase11 = true",
             "enable-phase10 = true",
         ]
 
 
 def _replicate_eden_test(
     test_class: Type[unittest.TestCase],
+    run_io_uring: bool = False,
 ) -> Iterable[Tuple[str, Type[unittest.TestCase]]]:
     class EdenTest(test_class):
         pass
 
-    return [("Default", typing.cast(Type[unittest.TestCase], EdenTest))]
+    variants = [("Default", typing.cast(Type[unittest.TestCase], EdenTest))]
+    if run_io_uring and sys.platform == "linux":
+
+        class IoUringTest(IoUringTestMixin, test_class):
+            pass
+
+        variants.append(("IoUring", typing.cast(Type[unittest.TestCase], IoUringTest)))
+    return variants
 
 
 eden_test = test_replicator(_replicate_eden_test)

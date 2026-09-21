@@ -54,7 +54,7 @@ cmdversion = { version = "0.1.0", path = "commands/cmdversion" }
 cmdwhereami = { version = "0.1.0", path = "commands/cmdwhereami" }
 cmdworktree = { version = "0.1.0", path = "commands/cmdworktree", optional = true }
 ctrlc = { version = "3.5.2", features = ["termination"] }
-flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
 hostname = "0.4.2"
 libc = "0.2.186"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
@@ -96,9 +96,10 @@ sapling-worktree-registry = { version = "0.1.0", path = "../worktree" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
-zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }
+zstd = { version = "0.14.0", features = ["experimental", "zstdmt"] }
 
 [features]
+cas = []
 default = []
 eden = ["cmdclone/eden", "cmddebugwait/eden", "cmdgoto/eden", "cmdworktree", "pycheckout/eden", "pyworkingcopy/eden", "pyworkingcopyclient/eden", "sapling-clidispatch/eden"]
 fb = ["cmddebugdumpinternalconfig/fb", "cmddebugrefreshconfig/fb", "cmdpy/fb", "cmdversion/fb", "sapling-identity/fb", "sapling-indexedlog/metrics"]

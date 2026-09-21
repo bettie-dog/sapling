@@ -10,6 +10,7 @@ license = "GPLv2+"
 [dependencies]
 acl_manifest = { version = "0.1.0", path = "../../derived_data/acl_manifest" }
 anyhow = "1.0.104"
+arg_extensions = { version = "0.1.0", path = "../../cmdlib/extensions" }
 async-stream = "0.3"
 async_requests = { version = "0.1.0", path = "../../features/async_requests" }
 async_requests_client = { version = "0.1.0", path = "../../features/async_requests/client" }
@@ -56,9 +57,10 @@ dbbookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks/dbboo
 deleted_manifest = { version = "0.1.0", path = "../../derived_data/deleted_manifest" }
 deletion_log = { version = "0.1.0", path = "../../repo_attributes/deletion_log" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
+derive_more = { version = "2.1.1", features = ["full"] }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
 directory_branch_cluster_manifest = { version = "0.1.0", path = "../../derived_data/directory_branch_cluster_manifest" }
-either = "1.16.0"
+either = "1.18.0"
 enabled_derived_data_types = { version = "0.1.0", path = "../../repo_attributes/enabled_derived_data_types" }
 ephemeral_blobstore = { version = "0.1.0", path = "../../blobstore/ephemeral_blobstore" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
@@ -67,9 +69,9 @@ fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git"
 fileblob = { version = "0.1.0", path = "../../blobstore/fileblob" }
 filenodes = { version = "0.1.0", path = "../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_ref_content_mapping = { version = "0.1.0", path = "../../repo_attributes/git_ref_content_mapping" }
 git_source_of_truth = { version = "0.1.0", path = "../../repo_attributes/git_source_of_truth" }
@@ -79,10 +81,11 @@ gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
 hex = { version = "0.4.3", features = ["alloc"] }
 history_manifest = { version = "0.1.0", path = "../../derived_data/history_manifest" }
+hook_manager = { version = "0.1.0", path = "../../repo_attributes/hook_manager/hook_manager" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.15.0"
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
-k8s-openapi = { version = "0.27.1", features = ["latest"] }
+k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"] }
 live_commit_sync_config = { version = "0.1.0", path = "../../features/commit_rewriting/live_commit_sync_config" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 maplit = "1.0"
@@ -92,6 +95,7 @@ megarepolib = { version = "0.1.0", path = "../../features/commit_rewriting/megar
 mercurial_derivation = { version = "0.1.0", path = "../../derived_data/mercurial_derivation" }
 mercurial_mutation = { version = "0.1.0", path = "../../mercurial/mutation" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
+metaconfig_parser = { version = "0.1.0", path = "../../metaconfig/parser" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 metadata = { version = "0.1.0", path = "../../common/metadata" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
@@ -111,6 +115,7 @@ prettytable-rs = "0.10"
 print_graph = { version = "0.1.0", path = "../../cmdlib/displaying/graph" }
 protocol = { version = "0.1.0", path = "../../git/protocol" }
 pushrebase = { version = "0.1.0", path = "../../features/pushrebase" }
+pushrebase_client = { version = "0.1.0", path = "../../features/pushrebase/pushrebase_client" }
 pushrebase_hooks = { version = "0.1.0", path = "../../features/pushrebase/pushrebase_hooks" }
 pushrebase_mutation_mapping = { version = "0.1.0", path = "../../repo_attributes/pushrebase_mutation_mapping" }
 pushredirect = { version = "0.1.0", path = "../../megarepo_api/pushredirect" }
@@ -118,6 +123,7 @@ redactedblobstore = { version = "0.1.0", path = "../../blobstore/redactedblobsto
 redaction = { version = "0.1.0", path = "../../features/redaction" }
 redaction_set = { version = "0.1.0", path = "../../../../configerator/structs/scm/mononoke/redaction" }
 regex = "1.13.1"
+repo_authorization = { version = "0.1.0", path = "../../repo_authorization" }
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
 repo_bookmark_attrs = { version = "0.1.0", path = "../../repo_attributes/repo_bookmark_attrs" }
 repo_cross_repo = { version = "0.1.0", path = "../../repo_attributes/repo_cross_repo" }
@@ -126,6 +132,7 @@ repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_deri
 repo_factory = { version = "0.1.0", path = "../../repo_factory" }
 repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }
 repo_lock = { version = "0.1.0", path = "../../repo_attributes/repo_lock/repo_lock" }
+repo_permission_checker = { version = "0.1.0", path = "../../repo_attributes/repo_permission_checker" }
 repo_spec_writer = { version = "0.1.0", path = "../repo_spec_writer" }
 repo_update_logger = { version = "0.1.0", path = "../../features/repo_update_logger" }
 repos = { version = "0.1.0", path = "../../../../configerator/structs/scm/mononoke/repos/repos" }
@@ -140,22 +147,24 @@ serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 skeleton_manifest_v2 = { version = "0.1.0", path = "../../derived_data/skeleton_manifest_v2" }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
+sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 sql_query_config = { version = "0.1.0", path = "../../repo_attributes/sql_query_config" }
 strum = { version = "0.28.0", features = ["derive"] }
 synced_commit_mapping = { version = "0.1.0", path = "../../features/commit_rewriting/synced_commit_mapping" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 time_measuring = { version = "0.1.0", path = "../../common/time_measuring" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
+uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 walkdir = "2.3"
 
 [dev-dependencies]

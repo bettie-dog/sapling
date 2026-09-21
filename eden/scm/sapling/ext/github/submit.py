@@ -14,15 +14,20 @@ from sapling import error, formatter, git, hintutil, templatekw
 from sapling.context import changectx
 from sapling.i18n import _
 from sapling.node import hex, nullid
-from sapling.result import Ok, Result
+from sapling.result import Result
 
-from . import gh_submit, github_repo_util
+from . import gh_submit, github_repo_util, native_stacks
 from .archive_commit import add_commit_to_archives
 from .gh_submit import PullRequestDetails, PullRequestState, Repository
 from .github_repo_util import check_github_repo, GitHubRepo
 from .none_throws import none_throws
 from .pr_parser import get_pull_request_for_context
-from .pull_request_body import create_pull_request_title_and_body, title_and_body
+from .pull_request_body import (
+    create_pull_request_title_and_body,
+    DEFAULT_REVIEW_TOOL_NAME,
+    DEFAULT_REVIEW_URL_TEMPLATE,
+    title_and_body,
+)
 from .pullrequest import PullRequestId
 from .pullrequeststore import PullRequestStore
 from .run_git_command import run_git_command
@@ -34,9 +39,15 @@ def submit(ui, repo, *args, **opts) -> int:
     github_repo = check_github_repo(repo)
     is_draft = opts.get("draft")
     is_open = opts.get("open")
+    rebuild_stack = bool(opts.get("rebuild_stack"))
     return asyncio.run(
         update_commits_in_stack(
-            ui, repo, github_repo, is_draft=is_draft, is_open=is_open
+            ui,
+            repo,
+            github_repo,
+            is_draft=is_draft,
+            is_open=is_open,
+            rebuild_stack=rebuild_stack,
         )
     )
 
@@ -197,7 +208,12 @@ async def get_partitions(ui, repo, store, filter) -> List[List[CommitData]]:
 
 
 async def update_commits_in_stack(
-    ui, repo, github_repo: GitHubRepo, is_draft: bool, is_open: bool = False
+    ui,
+    repo,
+    github_repo: GitHubRepo,
+    is_draft: bool,
+    is_open: bool = False,
+    rebuild_stack: bool = False,
 ) -> int:
     parents = repo.dirstate.parents()
     if parents[0] == nullid:
@@ -264,7 +280,7 @@ async def update_commits_in_stack(
                 repository = await get_repository_for_origin(
                     origin, github_repo.hostname
                 )
-            await sync_native_stack(ui, partitions, repository)
+            await native_stacks.sync_native_stack(ui, partitions, repository)
         return 0
 
     repository = params.repository
@@ -289,7 +305,14 @@ async def update_commits_in_stack(
                 # part of a native stack, so only retarget when a base
                 # actually changed, dissolving the stack first if necessary
                 # (it is re-linked after the push).
-                await prepare_native_stack_bases(ui, partitions, workflow, repository)
+                await native_stacks.prepare_native_stack_bases(
+                    ui,
+                    partitions,
+                    get_pr_trunk_branch(workflow, repository),
+                    repository,
+                    rebuild_stack=rebuild_stack,
+                    has_new_prs=bool(params.pull_requests_to_create),
+                )
             else:
                 # Update base branches on existing PRs before pushing.
                 # Process from bottom of stack to top so bases are set correctly.
@@ -373,7 +396,7 @@ async def update_commits_in_stack(
     # Link the pull requests into a native GitHub stack, now that they all
     # exist with their bases chained.
     if workflow.use_native_stacks():
-        await sync_native_stack(ui, partitions, repository)
+        await native_stacks.sync_native_stack(ui, partitions, repository)
 
     # Open pull requests in browser if --open flag was specified
     if is_open:
@@ -385,240 +408,6 @@ async def update_commits_in_stack(
     return 0
 
 
-async def _get_stack_for_any(
-    hostname: str, owner: str, name: str, numbers: List[int]
-) -> Result:
-    """Queries the stacks API for each pull request number in turn, returning
-    the first stack found, Ok(None) if none of them is in a stack, or Err on
-    the first API failure.
-    """
-    for number in numbers:
-        result = await gh_submit.get_stack_for_pull_request(
-            hostname, owner, name, number
-        )
-        if result.is_err() or result.unwrap() is not None:
-            return result
-    return Ok(None)
-
-
-async def find_native_stack(
-    partitions: List[List[CommitData]], repository: Repository
-) -> Result:
-    """Returns Ok(PullRequestStack) for the native stack containing the local
-    stack's pull requests, Ok(None) if there is no associated pull request or
-    none is in a stack, or Err on API failure.
-
-    Queries with the bottom-most existing pull request first (the most stable
-    member of an existing stack), then the top-most, to catch stacks whose
-    bottom was reordered or replaced locally.
-    """
-    # partitions is ordered from the top of the stack to the bottom.
-    existing = [p[0].pr.number for p in reversed(partitions) if p[0].pr]
-    candidates = list(dict.fromkeys([existing[0], existing[-1]])) if existing else []
-    return await _get_stack_for_any(
-        repository.hostname, repository.owner, repository.name, candidates
-    )
-
-
-async def prepare_native_stack_bases(
-    ui,
-    partitions: List[List[CommitData]],
-    workflow: SubmitWorkflow,
-    repository: Repository,
-) -> None:
-    """Retargets the base branch of existing open PRs whose position in the
-    local stack changed, dissolving the native GitHub stack first if the PRs
-    are part of one (base branches are locked while stacked). The stack is
-    re-linked after the push by sync_native_stack().
-    """
-    trunk = get_pr_trunk_branch(workflow, repository)
-    mismatched = []
-    for index, partition in enumerate(partitions):
-        pr = partition[0].pr
-        if not pr or pr.state != PullRequestState.OPEN:
-            continue
-        base = trunk
-        if index < len(partitions) - 1:
-            base = none_throws(partitions[index + 1][0].head_branch_name)
-        if pr.base_branch_name != base:
-            mismatched.append((pr, base))
-    if not mismatched:
-        return
-
-    stack_result = await find_native_stack(partitions, repository)
-    if stack_result.is_err():
-        ui.status_err(
-            _("warning: could not query native stack state: %s\n")
-            % stack_result.unwrap_err()
-        )
-    else:
-        stack = stack_result.unwrap()
-        if stack and stack.is_open:
-            local_numbers = [
-                p[0].pr.number
-                for p in partitions
-                if p[0].pr and p[0].pr.state == PullRequestState.OPEN
-            ]
-            foreign = [
-                n for n in stack.open_pr_numbers() if n not in local_numbers
-            ]
-            if foreign:
-                # Same ownership rule as sync_native_stack: never dissolve a
-                # stack containing pull requests that are not ours. But the
-                # bases of our PRs need to change and are locked by the
-                # stack, so pushing now would risk GitHub auto-closing PRs
-                # as merged (see #1275) -- refuse to continue.
-                raise error.Abort(
-                    _(
-                        "cannot update pull request bases: stack #%d contains "
-                        "pull requests not in your local stack (%s); resolve "
-                        "this on GitHub (e.g. with 'gh stack unstack') and "
-                        "re-run"
-                    )
-                    % (stack.number, ", ".join(f"#{n}" for n in foreign))
-                )
-            unstack_result = await gh_submit.unstack_pull_requests(
-                repository.hostname,
-                repository.owner,
-                repository.name,
-                stack.number,
-                stack.open_pr_numbers(),
-            )
-            if unstack_result.is_err():
-                # Pushing reordered branches while bases are locked risks
-                # GitHub auto-closing PRs as "merged" (see #1275), so refuse
-                # to continue.
-                raise error.Abort(
-                    _("cannot update pull request bases while they are in stack #%d: %s")
-                    % (stack.number, unstack_result.unwrap_err())
-                )
-            ui.status_err(
-                _("temporarily unstacked #%d to update pull request bases\n")
-                % stack.number
-            )
-
-    for pr, base in mismatched:
-        result = await gh_submit.update_pull_request(
-            repository.hostname, pr.node_id, pr.title, pr.body, base
-        )
-        if result.is_err():
-            ui.status_err(
-                _("warning, updating base for #%d may not have succeeded: %s\n")
-                % (pr.number, result.unwrap_err())
-            )
-        else:
-            ui.status_err(_("updated base for %s\n") % pr.url)
-
-
-async def sync_native_stack(
-    ui, partitions: List[List[CommitData]], repository: Repository
-) -> None:
-    """Ensures the pull requests for `partitions` are linked into a native
-    GitHub stack, bottom to top.
-
-    Failures are reported as warnings rather than errors: by this point the
-    pull requests already exist with chained bases (plain SINGLE-workflow
-    topology), so linking can be retried on a future submit. This also serves
-    as the fallback for repos where the stacks API (a public preview) is not
-    available.
-    """
-    prs = [p[0].pr for p in partitions]
-    non_open = [pr for pr in prs if pr and pr.state != PullRequestState.OPEN]
-    if non_open:
-        ui.status_err(
-            _("not syncing native stack because #%d is not open\n")
-            % non_open[0].number
-        )
-        return
-    # Bottom to top, as the stacks API expects.
-    desired = [pr.number for pr in reversed(prs) if pr]
-    if len(desired) < 2:
-        # A single pull request is not a stack.
-        return
-
-    hostname = repository.hostname
-    owner = repository.owner
-    name = repository.name
-
-    def warn(err: str) -> None:
-        ui.status_err(
-            _(
-                "warning: failed to sync native GitHub stack: %s\n"
-                "pull requests remain chained and can be linked on a future submit\n"
-            )
-            % err
-        )
-
-    # Query with the bottom pull request first (the most stable member of an
-    # existing stack), then the top, to catch stacks whose bottom was
-    # reordered or replaced locally.
-    result = await _get_stack_for_any(
-        hostname, owner, name, [desired[0], desired[-1]]
-    )
-    if result.is_err():
-        warn(result.unwrap_err())
-        return
-    stack = result.unwrap()
-
-    if stack and stack.is_open:
-        open_members = stack.open_pr_numbers()
-        if open_members == desired:
-            ui.status_err(_("native stack #%d is up-to-date\n") % stack.number)
-            return
-        # Appending is only valid when the new entries chain onto the stack's
-        # ACTUAL top member — GitHub validates each added pull request's base
-        # against the head of the full member list, which includes closed and
-        # merged members. A closed pull request sitting at the stack's tail
-        # (e.g. the top PR of the stack was closed and re-minted under a new
-        # number) makes every append 422 forever; the only correct move then
-        # is dissolve-and-relink below.
-        top_is_open = bool(stack.entries) and stack.entries[-1].state == "open"
-        if top_is_open and open_members == desired[: len(open_members)]:
-            to_add = desired[len(open_members) :]
-            add_result = await gh_submit.add_pull_requests_to_stack(
-                hostname, owner, name, stack.number, to_add
-            )
-            if add_result.is_err():
-                warn(add_result.unwrap_err())
-                return
-            ui.status_err(
-                _("added %d pull request(s) to native stack #%d\n")
-                % (len(to_add), stack.number)
-            )
-            return
-        # Only reconcile stacks we fully own: if the GitHub stack contains
-        # open pull requests that are not part of the local stack (e.g., a
-        # collaborator linked extra PRs with `gh stack link`), dissolving it
-        # would destroy their intentional state.
-        foreign = [n for n in open_members if n not in desired]
-        if foreign:
-            ui.status_err(
-                _(
-                    "warning: not modifying native stack #%d because it contains "
-                    "pull requests not in your local stack: %s\n"
-                )
-                % (stack.number, ", ".join(f"#{n}" for n in foreign))
-            )
-            return
-        # Membership or order changed in a way that cannot be expressed as an
-        # append: dissolve and re-link.
-        unstack_result = await gh_submit.unstack_pull_requests(
-            hostname, owner, name, stack.number, open_members
-        )
-        if unstack_result.is_err():
-            warn(unstack_result.unwrap_err())
-            return
-
-    create_result = await gh_submit.create_pull_request_stack(
-        hostname, owner, name, desired
-    )
-    if create_result.is_err():
-        warn(create_result.unwrap_err())
-        return
-    ui.status_err(
-        _("created native stack #%d with %d pull requests\n")
-        % (create_result.unwrap().number, len(desired))
-    )
 
 
 async def rewrite_pull_request_body(
@@ -654,6 +443,13 @@ async def rewrite_pull_request_body(
     else:
         commit_msg_or_title_body = head_commit_data.get_msg()
 
+    review_url_template = (
+        ui.config("github", "pull-request-review-url-template")
+        or DEFAULT_REVIEW_URL_TEMPLATE
+    )
+    review_tool_name = (
+        ui.config("github", "pull-request-review-tool-name") or DEFAULT_REVIEW_TOOL_NAME
+    )
     title, body = create_pull_request_title_and_body(
         commit_msg_or_title_body,
         pr_numbers_and_num_commits,
@@ -663,6 +459,8 @@ async def rewrite_pull_request_body(
         # GitHub renders its own stack map for native stacks, so the footer
         # would be redundant there.
         stack_footer=not workflow.use_native_stacks(),
+        review_url_template=review_url_template,
+        review_tool_name=review_tool_name,
     )
 
     if pr.state != PullRequestState.OPEN:

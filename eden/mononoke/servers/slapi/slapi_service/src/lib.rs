@@ -27,7 +27,6 @@ use fbinit::FacebookInit;
 use gotham::router::Router;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ArtilleryMiddleware;
-use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
 use gotham_ext::middleware::LogMiddleware;
 use gotham_ext::middleware::MetadataMiddleware;
@@ -40,7 +39,6 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use http::HeaderValue;
 use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
-use mononoke_configs::MononokeConfigs;
 use rate_limiting::RateLimitEnvironment;
 use scuba_ext::MononokeScubaSampleBuilder;
 #[cfg(fbcode_build)]
@@ -63,7 +61,6 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     test_friendly_logging: bool,
     tls_session_data_log_path: Option<&Path>,
     rate_limiter: Option<RateLimitEnvironment>,
-    configs: Arc<MononokeConfigs>,
     common_config: &CommonConfig,
     readonly: bool,
     mtls_disabled: bool,
@@ -75,7 +72,7 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     #[cfg(fbcode_build)]
     let rim_backend = rim_backend
         .map(RimBackend)
-        .inspect(|rim_backend| crate::utils::rim_shadow::init(*rim_backend));
+        .inspect(|rim_backend| crate::utils::rim_rate_limiter::init(*rim_backend));
 
     #[cfg(not(fbcode_build))]
     let _ = rim_backend;
@@ -96,7 +93,6 @@ pub fn build<R: Send + Sync + Clone + 'static>(
 
     let handler = MononokeHttpHandler::builder()
         .add(TlsSessionDataMiddleware::new(tls_session_data_log_path)?)
-        .add(ConfigInfoMiddleware::new(configs))
         .add(MetadataMiddleware::new(
             fb,
             common_config.internal_identity.clone(),
@@ -136,13 +132,13 @@ pub fn build<R: Send + Sync + Clone + 'static>(
             common_config.edenapi_dumper_scuba_table.clone(),
         ))
         .add(<ScubaMiddleware<SaplingRemoteApiScubaHandler>>::new(scuba))
-        .add(OdsMiddleware::new())
         .add(ThrottleMiddleware::new(
             #[cfg(fbcode_build)]
             rim_backend,
         ))
         .add(LoadMiddleware::new())
         .add(log_middleware)
+        .add(OdsMiddleware::new())
         .add(TimerMiddleware::new())
         .build(router);
 

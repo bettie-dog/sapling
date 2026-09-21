@@ -15,6 +15,9 @@ sl_rust_binary(
     features = [
         "fb",
     ],
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",
@@ -56,12 +59,13 @@ sl_rust_library(
     ],
     test_deps = [
         "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:tempfile",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:plist",
         "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:sha2-010",
     ],
 )

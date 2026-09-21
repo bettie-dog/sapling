@@ -213,58 +213,35 @@ class EdenServiceHandler
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::string> repoPath) override;
 
-  folly::SemiFuture<std::unique_ptr<std::vector<SHA1Result>>>
-  semifuture_getSHA1(
+  folly::coro::Task<std::unique_ptr<std::vector<SHA1Result>>> co_getSHA1(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
-  // DEPRECATED: Use co_getSHA1Impl instead.
-  folly::SemiFuture<std::unique_ptr<std::vector<SHA1Result>>>
-  semifuture_getSHA1Impl(
+  folly::coro::now_task<std::unique_ptr<std::vector<SHA1Result>>> getSHA1Impl(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync);
 
-  folly::coro::now_task<std::unique_ptr<std::vector<SHA1Result>>>
-  co_getSHA1Impl(
-      std::unique_ptr<std::string> mountPoint,
-      std::unique_ptr<std::vector<std::string>> paths,
-      std::unique_ptr<SyncBehavior> sync);
-
-  folly::SemiFuture<std::unique_ptr<std::vector<Blake3Result>>>
-  semifuture_getBlake3(
+  folly::coro::Task<std::unique_ptr<std::vector<Blake3Result>>> co_getBlake3(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
-
-  // DEPRECATED. Use co_getBlake3Impl instead.
-  folly::SemiFuture<std::unique_ptr<std::vector<Blake3Result>>>
-  semifuture_getBlake3Impl(
-      std::unique_ptr<std::string> mountPoint,
-      std::unique_ptr<std::vector<std::string>> paths,
-      std::unique_ptr<SyncBehavior> sync);
 
   folly::coro::now_task<std::unique_ptr<std::vector<Blake3Result>>>
-  co_getBlake3Impl(
+  getBlake3Impl(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync);
 
-  folly::SemiFuture<std::unique_ptr<std::vector<DigestHashResult>>>
-  semifuture_getDigestHash(
+  folly::coro::Task<std::unique_ptr<std::vector<DigestHashResult>>>
+  co_getDigestHash(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
-  folly::SemiFuture<std::unique_ptr<std::vector<DigestHashResult>>>
-  semifuture_getDigestHashImpl(
-      std::unique_ptr<std::string> mountPoint,
-      std::unique_ptr<std::vector<std::string>> paths,
-      std::unique_ptr<SyncBehavior> sync);
-
   folly::coro::now_task<std::unique_ptr<std::vector<DigestHashResult>>>
-  co_getDigestHashImpl(
+  getDigestHashImpl(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync);

@@ -7,12 +7,14 @@
 
 #pragma once
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <utility>
 
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/DirType.h"
 #include "eden/common/utils/PathMap.h"
+#include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/InodePtr.h"
 #include "eden/fs/model/ObjectId.h"
@@ -90,6 +92,16 @@ class DirEntry {
   DirEntry& operator=(DirEntry&& e) = default;
   DirEntry(const DirEntry& e) = delete;
   DirEntry& operator=(const DirEntry& e) = delete;
+
+  /**
+   * Whether `m` fits in the bits DirEntry keeps for the initial mode. Modes
+   * read from disk must be checked with this before constructing a DirEntry.
+   * Takes the on-disk width rather than mode_t, which is narrower on macOS
+   * and would drop the offending bits in the conversion.
+   */
+  static constexpr bool isValidInitialMode(uint32_t m) {
+    return (m & ~kInitialModeMask) == 0;
+  }
 
   bool isMaterialized() const {
     // TODO: In the future we should probably only allow callers to invoke
@@ -334,9 +346,109 @@ struct DirContents : PathMap<DirEntry> {
       folly::fbvector<std::pair<PathComponent, DirEntry>>&& entries,
       CaseSensitivity caseSensitive)
       : PathMap(std::move(entries), caseSensitive) {}
+};
 
-  // Allow construction from a PathMap (e.g., from PathMapMutator::finalize).
-  explicit DirContents(PathMap<DirEntry>&& map) : PathMap(std::move(map)) {}
+/**
+ * Forward walk over the entries of a DirContents or Tree that skips
+ * restricted ACL roots when asked to. A hand-written walk rather than
+ * std::views::filter: libstdc++'s filter iterator increments through an
+ * out-of-line find_if that copies the 48-byte PathMap iterator through
+ * memory on every step, which costs several times the walk itself.
+ */
+template <typename Iter>
+class VisibleEntriesIterator {
+ public:
+  VisibleEntriesIterator(Iter it, Iter end, bool omitRestricted)
+      : it_{std::move(it)},
+        end_{std::move(end)},
+        omitRestricted_{omitRestricted} {
+    skipHidden();
+  }
+
+  decltype(auto) operator*() const {
+    return *it_;
+  }
+
+  VisibleEntriesIterator& operator++() {
+    ++it_;
+    skipHidden();
+    return *this;
+  }
+
+  bool operator==(std::default_sentinel_t) const {
+    return it_ == end_;
+  }
+
+ private:
+  void skipHidden() {
+    while (omitRestricted_ && it_ != end_ && (*it_).second.isRestricted()) {
+      ++it_;
+    }
+  }
+
+  Iter it_;
+  Iter end_;
+  bool omitRestricted_;
+};
+
+template <typename Dir>
+class VisibleEntries {
+ public:
+  VisibleEntries(Dir& dir, bool omitRestricted)
+      : dir_{&dir}, omitRestricted_{omitRestricted} {}
+
+  auto begin() const {
+    return VisibleEntriesIterator{dir_->begin(), dir_->end(), omitRestricted_};
+  }
+  std::default_sentinel_t end() const {
+    return {};
+  }
+
+ private:
+  Dir* dir_;
+  bool omitRestricted_;
+};
+
+/**
+ * Entries of `dir` (a DirContents or Tree) as users see them: restricted ACL
+ * roots drop out in omitted mode. Explicit lookup by name is unaffected.
+ */
+template <typename Dir>
+auto visibleEntries(Dir& dir, RestrictedContentMode mode) {
+  return VisibleEntries<Dir>{dir, mode == RestrictedContentMode::Omitted};
+}
+
+/**
+ * Entries of a loaded directory. Direct iteration does not compile: walk it
+ * through all() (checkout, diff, GC, prefetch, persistence) or visible(mode)
+ * (readdir, getChildren). Lookups and mutation stay unfiltered so explicit
+ * lookup of a hidden entry still resolves.
+ */
+class DirEntries : public DirContents {
+ public:
+  explicit DirEntries(DirContents&& map) : DirContents(std::move(map)) {}
+  DirEntries& operator=(DirContents&& map) {
+    DirContents::operator=(std::move(map));
+    return *this;
+  }
+
+  DirContents& all() {
+    return *this;
+  }
+  const DirContents& all() const {
+    return *this;
+  }
+  auto visible(RestrictedContentMode mode) {
+    return visibleEntries(all(), mode);
+  }
+  auto visible(RestrictedContentMode mode) const {
+    return visibleEntries(all(), mode);
+  }
+
+ private:
+  // Direct iteration is a compile error: pick all() or visible(mode).
+  using DirContents::begin;
+  using DirContents::cbegin;
 };
 
 } // namespace facebook::eden

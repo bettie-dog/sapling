@@ -10,14 +10,14 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 async-stream = "0.3"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 blobstore = { version = "0.1.0", path = "../blobstore" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bounded_traversal = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
-either = "1.16.0"
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+either = "1.18.0"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_watchdog = { version = "0.1.0", path = "../common/futures_watchdog" }
 itertools = "0.15.0"
 justknobs_ext = { version = "0.1.0", path = "../common/rust/justknobs_ext" }
@@ -27,9 +27,9 @@ mononoke_types = { version = "0.1.0", path = "../mononoke_types" }
 nonzero_ext = "0.2"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_derive = "1.0.229"
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

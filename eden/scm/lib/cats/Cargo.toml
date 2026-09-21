@@ -14,11 +14,11 @@ name = "cats"
 
 [dependencies]
 anyhow = "1.0.104"
-indexmap = { version = "2.14.0", features = ["arbitrary", "rayon", "serde"] }
+indexmap = { version = "2.14.2", features = ["arbitrary", "rayon", "serde"] }
 sapling-cats-constants = { version = "0.1.0", path = "constants" }
 sapling-configmodel = { version = "0.1.0", path = "../config/model" }
 sapling-util = { version = "0.1.0", path = "../util" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

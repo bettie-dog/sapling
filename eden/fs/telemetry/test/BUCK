@@ -6,10 +6,11 @@ load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_
 oncall("scm_client_infra")
 
 cpp_library(
-    name = "capturing_scribe_logger",
-    headers = ["CapturingScribeLogger.h"],
+    name = "capturing_xplat_logger",
+    headers = ["CapturingXplatLogger.h"],
     exported_deps = [
-        "//eden/common/telemetry:scribe_logger",
+        "//eden/common/telemetry:log_info",
+        "//eden/fs/telemetry:xplat_logger",
     ],
 )
 
@@ -141,7 +142,7 @@ cpp_unittest(
     srcs = [
         "EdenErrorInfoBuilderTest.cpp",
     ],
-    network_access = network_access_utils.all(),
+    network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/fmt:fmt",
@@ -153,12 +154,9 @@ cpp_unittest(
         "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:throw_trace_capture",  # @manual needed for --wrap __cxa_throw linker flag
         "//eden/fs/telemetry:xplat_keys",
-        "//eden/fs/telemetry/facebook:xplat_logger",
-        "//eden/fs/telemetry/test:capturing_scribe_logger",
+        "//eden/fs/telemetry/test:capturing_xplat_logger",
         "//fb303:service_data",
         "//folly:c_portability",
-        "//scribe/api/producer/thrift/experimental:structured_producer-cpp2-services",
-        "//thrift/lib/cpp2/util:util",
     ],
 )
 
@@ -189,12 +187,8 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gtest",
         "//eden/common/telemetry:log_info",
-        "//eden/common/telemetry:structured_logger",
-        "//eden/fs/config:config",
-        "//eden/fs/telemetry:stats",
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/telemetry:xplat_keys",
-        "//eden/fs/telemetry/facebook:eden_telemetry_identity",
-        "//eden/fs/telemetry/facebook:xplat_logger",
+        "//eden/fs/telemetry:xplat_logger",
     ],
 )

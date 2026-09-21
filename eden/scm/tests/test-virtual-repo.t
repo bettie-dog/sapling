@@ -23,7 +23,7 @@ Smartlog works:
      date:        Sat Oct 25 09:35:59 2025 +0000
      summary:     synthetic commit 121869
 
-Total file count and size is reasonable (~80MB):
+Total file count and size is reasonable (~290MB):
 
   $ sl go 'roots(all())' -q
   $ FILES=$TESTTMP/files
@@ -45,15 +45,12 @@ Total file count and size is reasonable (~80MB):
   ...     return len(paths), total_size
 
   >>> check_count_file_size()
-  (6084, 83157475)
+  (6084, 287575513)
 
-Checkout virtual/main with more files (~800MB):
+virtual/main has more files:
 
-  $ sl go 'virtual/main' -q
-  $ sl files > $FILES
-
-  >>> check_count_file_size()
-  (57364, 732721742)
+  $ sl files -r 'virtual/main' | wc -l
+  57364
 
 Virtual repo with size-factor=0 works too:
 
@@ -69,17 +66,25 @@ Virtual repo with size-factor=0 works too:
   M V/red-b/e/VIII/lemon-IV/VI
   M V/red-b/e/VIII/pear-II
 
+Checkout virtual/main (~1.3GB):
+
+  $ sl go 'virtual/main' -q
+  $ sl files > $FILES
+
+  >>> check_count_file_size()
+  (14341, 1280317613)
+
 Sample check a file content:
 
-  $ sl cat -r virtual/main V/red-b/e/IV-IV/j/III-II
+  $ sl cat -r virtual/main V/red-b/e/IV-IV/j/III-II | wc -c
+  847256
+
+  $ sl cat -r virtual/main V/red-b/e/IV-IV/j/III-II | head -5
   Rabbit, and had just begun to dream that she was walking by the pope, was
   soon submitted to by all three to settle the question, and they drew all
   manner of things-everything that begins with an M, such as mouse-traps, and
   the blades of grass, but she could not remember the simple rules their
   friends had taught them: such as, Sure, I don't see how he can thoroughly
-  enjoy The pepper when he finds out who I _was_ when I breathe'!
-  
-  Don't let me hear the name (no-eol)
 
 Maximum factor_size:
 

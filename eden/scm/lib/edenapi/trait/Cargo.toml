@@ -14,9 +14,9 @@ name = "edenapi_trait"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "1.4.2"
+async-trait = "0.1.92"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+http = "1.5.0"
 sapling-auth = { version = "0.1.0", path = "../../auth" }
 sapling-configmodel = { version = "0.1.0", path = "../../config/model" }
 sapling-edenapi_types = { version = "0.1.0", path = "../types" }
@@ -24,5 +24,5 @@ sapling-http-client = { version = "0.1.0", path = "../../http-client" }
 sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
 sapling-types = { version = "0.1.0", path = "../../types" }
 serde_cbor = "0.11.2"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 url = "2.5.8"

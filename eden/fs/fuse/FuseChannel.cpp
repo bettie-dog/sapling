@@ -10,6 +10,7 @@
 #include "eden/fs/fuse/FuseChannel.h"
 #include <boost/cast.hpp>
 #include <fmt/core.h>
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
 #include <folly/system/ThreadName.h>
@@ -49,6 +50,8 @@ using std::string;
 namespace facebook::eden {
 
 namespace {
+
+constexpr size_t kMaxInvalidationThreads = 64;
 
 /**
  * For most FUSE requests, the protocol is simple: an optional request
@@ -151,6 +154,20 @@ std::string rename(FuseArg arg) {
   return fmt::format("old={}, newdir={}, new={}", oldName, in.newdir, newName);
 }
 
+#ifdef __linux__
+std::string rename2(FuseArg arg) {
+  auto& in = arg.read<fuse_rename2_in>();
+  auto oldName = arg.readz();
+  auto newName = arg.readz();
+  return fmt::format(
+      "old={}, newdir={}, new={}, flags={:#x}",
+      oldName,
+      in.newdir,
+      newName,
+      in.flags);
+}
+#endif
+
 std::string link(FuseArg arg) {
   auto& in = arg.read<fuse_link_in>();
   auto newName = arg.readz();
@@ -240,6 +257,12 @@ static_assert(CheckSize<FuseTraceEvent, 72>());
 
 // This is the minimum size used by libfuse so we use it too!
 constexpr size_t MIN_BUFSIZE = 0x21000;
+
+// The buffer a worker reads into must hold the largest request the kernel can
+// send, which is a write of max_write bytes plus its headers.
+size_t requestBufferSize(size_t maxWrite) {
+  return std::max(MIN_BUFSIZE, maxWrite + 0x1000);
+}
 
 using Handler = ImmediateFuture<folly::Unit> (FuseChannel::*)(
     FuseRequestContext& request,
@@ -603,7 +626,15 @@ constexpr auto kFuseHandlers = [] {
       Write};
 #ifdef __linux__
   handlers[FUSE_READDIRPLUS] = {"FUSE_READDIRPLUS", Read};
-  handlers[FUSE_RENAME2] = {"FUSE_RENAME2", Write};
+  handlers[FUSE_RENAME2] = {
+      "FUSE_RENAME2",
+      &FuseChannel::fuseRename2,
+      &argrender::rename2,
+      &FuseStats::rename2,
+      &FuseStats::rename2Successful,
+      &FuseStats::rename2Failure,
+      Write,
+      SamplingGroup::One};
   handlers[FUSE_LSEEK] = {"FUSE_LSEEK"};
   handlers[FUSE_COPY_FILE_RANGE] = {"FUSE_COPY_FILE_RANGE", Write};
   handlers[FUSE_SETUPMAPPING] = {"FUSE_SETUPMAPPING", Read};
@@ -646,6 +677,9 @@ constexpr std::pair<uint64_t, const char*> kCapsLabels[] = {
     {FUSE_WRITEBACK_CACHE, "WRITEBACK_CACHE"},
     {FUSE_PARALLEL_DIROPS, "PARALLEL_DIROPS"},
     {FUSE_HANDLE_KILLPRIV, "HANDLE_KILLPRIV"},
+#ifdef FUSE_HANDLE_KILLPRIV_V2
+    {FUSE_HANDLE_KILLPRIV_V2, "HANDLE_KILLPRIV_V2"},
+#endif
     {FUSE_POSIX_ACL, "POSIX_ACL"},
     {FUSE_ABORT_ERROR, "ABORT_ERROR"},
     {FUSE_MAX_PAGES, "MAX_PAGES"},
@@ -855,11 +889,6 @@ FuseChannel::InvalidationEntry::InvalidationEntry(
     int64_t length)
     : type(InvalidationType::INODE), inode(num), range(offset, length) {}
 
-FuseChannel::InvalidationEntry::InvalidationEntry(Promise<Unit> p)
-    : type(InvalidationType::FLUSH),
-      inode(kRootNodeId),
-      promise(std::move(p)) {}
-
 FuseChannel::InvalidationEntry::~InvalidationEntry() {
   switch (type) {
     case InvalidationType::INODE:
@@ -867,9 +896,6 @@ FuseChannel::InvalidationEntry::~InvalidationEntry() {
       return;
     case InvalidationType::DIR_ENTRY:
       name.~PathComponent();
-      return;
-    case InvalidationType::FLUSH:
-      promise.~Promise();
       return;
   }
   XLOGF(
@@ -879,7 +905,6 @@ FuseChannel::InvalidationEntry::~InvalidationEntry() {
 FuseChannel::InvalidationEntry::
     InvalidationEntry(InvalidationEntry&& other) noexcept(
         std::is_nothrow_move_constructible_v<PathComponent> &&
-        std::is_nothrow_move_constructible_v<folly::Promise<folly::Unit>> &&
         std::is_nothrow_move_constructible_v<DataRange>)
     : type(other.type), inode(other.inode) {
   switch (type) {
@@ -889,17 +914,18 @@ FuseChannel::InvalidationEntry::
     case InvalidationType::DIR_ENTRY:
       new (&name) PathComponent(std::move(other.name));
       return;
-    case InvalidationType::FLUSH:
-      new (&promise) Promise<Unit>(std::move(other.promise));
-      return;
   }
 }
 
-void FuseChannel::replyError(const fuse_in_header& request, int errorCode) {
-  transport_->replyError(*this, request, errorCode);
+void FuseChannel::replyError(
+    const FuseTransport& source,
+    const fuse_in_header& request,
+    int errorCode) {
+  source.replyError(*this, request, errorCode);
 }
 
 void FuseChannel::sendReply(
+    const FuseTransport& source,
     const fuse_in_header& request,
     folly::fbvector<iovec>&& vec) const {
   fuse_out_header out;
@@ -908,10 +934,11 @@ void FuseChannel::sendReply(
 
   vec.insert(vec.begin(), make_iovec(out));
 
-  sendRawReply(vec.data(), vec.size());
+  sendRawReply(source, vec.data(), vec.size());
 }
 
 void FuseChannel::sendReply(
+    const FuseTransport& source,
     const fuse_in_header& request,
     const folly::IOBuf& buf) const {
   fuse_out_header out;
@@ -923,10 +950,11 @@ void FuseChannel::sendReply(
   vec.push_back(make_iovec(out));
   buf.appendToIov(&vec);
 
-  sendRawReply(vec.data(), vec.size());
+  sendRawReply(source, vec.data(), vec.size());
 }
 
 void FuseChannel::sendReply(
+    const FuseTransport& source,
     const fuse_in_header& request,
     folly::ByteRange bytes) const {
   fuse_out_header out;
@@ -939,11 +967,14 @@ void FuseChannel::sendReply(
   iov[1].iov_base = const_cast<uint8_t*>(bytes.data());
   iov[1].iov_len = bytes.size();
 
-  sendRawReply(iov.data(), iov.size());
+  sendRawReply(source, iov.data(), iov.size());
 }
 
-void FuseChannel::sendRawReply(const iovec iov[], size_t count) const {
-  transport_->sendRawReply(const_cast<FuseChannel&>(*this), iov, count);
+void FuseChannel::sendRawReply(
+    const FuseTransport& source,
+    const iovec iov[],
+    size_t count) const {
+  source.sendRawReply(const_cast<FuseChannel&>(*this), iov, count);
 }
 
 void FuseChannel::sendRawReplyDevFuse(const iovec iov[], size_t count) const {
@@ -1000,23 +1031,27 @@ FuseChannel::FuseChannel(
     size_t fuseTraceBusCapacity,
     std::optional<uint32_t> fuseBdiReadAheadKb,
     uint32_t fuseMaxPages,
+    bool handleKillPrivV2,
     bool useIoUring,
     std::string ioUringKernelReleaseRegex,
     uint32_t ioUringQueueDepth,
-    bool ioUringDisableIoWait)
+    bool ioUringDisableIoWait,
+    bool ioUringSkipSelfWakeup,
+    bool ioUringPreCreateQueues,
+    size_t numInvalidationThreads)
     : privHelper_{privHelper},
       // Pre-allocate based on configured max_pages so the buffer can handle
       // the larger requests we'll negotiate during FUSE_INIT. This is
       // optimistic: if the kernel doesn't support FUSE_MAX_PAGES, the buffer
       // will be larger than necessary but still correct.
       bufferSize_(
-          std::max(
-              MIN_BUFSIZE,
-              fuseMaxPages > 0
-                  ? size_t(fuseMaxPages) * size_t(getpagesize()) + 0x1000
-                  : size_t(getpagesize()) + 0x1000)),
+          requestBufferSize(size_t(fuseMaxPages) * size_t(getpagesize()))),
       threadPool_{std::move(threadPool)},
       configuredWorkerThreadCount_(numThreads),
+      numInvalidationThreads_{std::clamp<size_t>(
+          numInvalidationThreads,
+          1,
+          kMaxInvalidationThreads)},
       dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
       edenFsEventsLogger_(edenFsEventsLogger),
@@ -1032,18 +1067,38 @@ FuseChannel::FuseChannel(
       useWriteBackCache_{useWriteBackCache},
       fuseBdiReadAheadKb_{fuseBdiReadAheadKb},
       fuseMaxPages_{fuseMaxPages},
+      handleKillPrivV2_{handleKillPrivV2},
       useIoUring_{useIoUring},
       ioUringKernelReleaseRegex_{std::move(ioUringKernelReleaseRegex)},
       ioUringQueueDepth_{ioUringQueueDepth},
       ioUringDisableIoWait_{ioUringDisableIoWait},
+      ioUringSkipSelfWakeup_{ioUringSkipSelfWakeup},
+      ioUringPreCreateQueues_{ioUringPreCreateQueues},
       fuseDevice_(std::move(fuseDevice)),
       transport_(std::make_unique<DevFuseTransport>()),
+      invalidationQueue_{
+          numInvalidationThreads_,
+          [this](InvalidationEntry& entry) { sendInvalidation(entry); },
+          fmt::format("inval{}", mountPath.basename())},
       processAccessLog_(std::move(processInfoCache)),
       traceDetailedArguments_(std::make_shared<std::atomic<size_t>>(0)),
       traceBus_(
           TraceBus<FuseTraceEvent>::create(
               "FuseTrace" + mountPath.asString(),
               fuseTraceBusCapacity)) {
+  if (numInvalidationThreads == 0) {
+    XLOGF(
+        WARN,
+        "fuse:num-invalidation-threads is 0 for {}; using 1 instead",
+        mountPath_);
+  } else if (numInvalidationThreads > kMaxInvalidationThreads) {
+    XLOGF(
+        WARN,
+        "fuse:num-invalidation-threads is {} for {}; using {} instead",
+        numInvalidationThreads,
+        mountPath_,
+        kMaxInvalidationThreads);
+  }
   XLOGF(
       INFO,
       "Creating FuseChannel: mountPath={}, numThreads={}, requireUtf8={}, maximumBackgroundRequests={}, maximumInFlightRequests={}, useWriteBackCache={}, fuseMaxPages={}",
@@ -1055,6 +1110,7 @@ FuseChannel::FuseChannel(
       useWriteBackCache,
       fuseMaxPages_);
   XCHECK_GE(configuredWorkerThreadCount_, 1ul);
+  XCHECK_GE(numInvalidationThreads_, 1ul);
   updateEffectiveWorkerThreadCount();
   installSignalHandler();
 
@@ -1140,10 +1196,11 @@ void FuseChannel::logTakeoverTransportMismatch(
 }
 
 void FuseChannel::dispatchRequestFromTransport(
+    const FuseTransport& source,
     const fuse_in_header& header,
     folly::ByteRange arg,
     pid_t myPid) {
-  dispatchRequest(header, arg, myPid);
+  dispatchRequest(source, header, arg, myPid);
 }
 
 void FuseChannel::requestSessionExitFromTransport(StopReason reason) {
@@ -1217,9 +1274,21 @@ FuseChannel::StopFuture FuseChannel::initializeFromTakeover(
     fuse_init_out connInfo) {
   takeoverReadinessStarted_.store(true, std::memory_order_release);
   connInfo_ = connInfo;
+  // The kernel may send requests as large as the max_write it negotiated with
+  // the process we took over from. fuse:max-pages has no say over an
+  // established connection, so a buffer sized from it would be too small to
+  // read those requests whenever the two disagree.
+  bufferSize_ = requestBufferSize(connInfo.max_write);
   if (negotiatedIoUringTransport(connInfo)) {
+    // TODO: fuse:io-uring-pre-create-queues is deliberately not honored here.
+    // io_uring was already negotiated by the process we took over from, so
+    // there is no INIT reply left to withhold and nothing to fall back to: if
+    // the queues do not fit, this mount is stuck either way. Recovering that
+    // case needs its own mechanism (fail the takeover and let the old process
+    // keep the mount), which is worth building only once the pre-create path
+    // has proven itself on fresh mounts.
     transport_ = std::make_unique<IoUringFuseTransport>(
-        ioUringQueueDepth_, ioUringDisableIoWait_);
+        ioUringQueueDepth_, ioUringDisableIoWait_, ioUringSkipSelfWakeup_);
   }
   updateEffectiveWorkerThreadCount();
   dispatcher_->initConnection(connInfo);
@@ -1273,7 +1342,7 @@ void FuseChannel::startWorkerThreads() {
       state->workerThreads.emplace_back([this] { fuseWorkerThread(); });
     }
 
-    invalidationThread_ = std::thread([this] { invalidationThread(); });
+    invalidationQueue_.start();
   } catch (const std::exception& ex) {
     XLOGF(ERR, "Error starting FUSE worker threads: {}", exceptionStr(ex));
     // Request any threads we did start to stop now.
@@ -1330,65 +1399,40 @@ void FuseChannel::destroy() {
 }
 
 void FuseChannel::invalidateInode(InodeNumber ino, off_t off, off_t len) {
-  // Add the entry to invalidationQueue_ and wake up the invalidation thread to
-  // send it.
-  invalidationQueue_.lock()->queue.emplace_back(ino, off, len);
-  invalidationCV_.notify_one();
+  invalidationQueue_.add(InvalidationEntry(ino, off, len));
 }
 
 void FuseChannel::invalidateEntry(InodeNumber parent, PathComponentPiece name) {
-  // Add the entry to invalidationQueue_ and wake up the invalidation thread to
-  // send it.
-  invalidationQueue_.lock()->queue.emplace_back(parent, name);
-  invalidationCV_.notify_one();
+  invalidationQueue_.add(InvalidationEntry(parent, name));
+}
+
+bool FuseChannel::invalidateEntryWithQueueLimit(
+    InodeNumber parent,
+    PathComponentPiece name,
+    size_t maxQueueSize,
+    const folly::CancellationToken& cancellationToken) {
+  bool waited = false;
+  const bool added = invalidationQueue_.addWithLimit(
+      InvalidationEntry(parent, name),
+      maxQueueSize,
+      cancellationToken,
+      &waited);
+  if (waited) {
+    getStats()->increment(&FuseStats::invalidationQueueThrottleWait);
+  }
+  return added;
 }
 
 void FuseChannel::invalidateInodes(folly::Range<InodeNumber*> range) {
-  {
-    auto queue = invalidationQueue_.lock();
-    std::transform(
-        range.begin(),
-        range.end(),
-        std::back_insert_iterator(queue->queue),
-        [](const auto& inodeNum) { return InvalidationEntry(inodeNum, 0, 0); });
-  }
-  if (range.begin() != range.end()) {
-    invalidationCV_.notify_one();
-  }
+  invalidationQueue_.addAll(range.begin(), range.end());
 }
 
 ImmediateFuture<folly::Unit> FuseChannel::completeInvalidations() {
-  // Add a promise to the invalidation queue, which the invalidation thread
-  // will fulfill once it reaches that element in the queue.
-  Promise<Unit> promise;
-  auto result = promise.getFuture();
-  {
-    auto state = invalidationQueue_.lock();
-    if (state->stop) {
-      // In the case of a concurrent unmount with a checkout, the unmount could
-      // win the race and thus have shutdown the invalidation thread. This is
-      // not an issue as the mount is gone at this point, let's thus return
-      // immediately.
-      return folly::unit;
-    }
-    state->queue.emplace_back(std::move(promise));
-  }
-  invalidationCV_.notify_one();
-  return result;
+  return invalidationQueue_.flush();
 }
 
 folly::coro::now_task<folly::Unit> FuseChannel::co_completeInvalidations() {
-  Promise<Unit> promise;
-  auto result = promise.getSemiFuture();
-  {
-    auto state = invalidationQueue_.lock();
-    if (state->stop) {
-      co_return folly::unit;
-    }
-    state->queue.emplace_back(std::move(promise));
-  }
-  invalidationCV_.notify_one();
-  co_await std::move(result);
+  co_await invalidationQueue_.flush().semi();
   co_return folly::unit;
 }
 
@@ -1409,11 +1453,6 @@ void FuseChannel::sendInvalidation(InvalidationEntry& entry) {
         return;
       case InvalidationType::DIR_ENTRY:
         sendInvalidateEntry(entry.inode, entry.name);
-        return;
-      case InvalidationType::FLUSH:
-        // Fulfill the promise to indicate that all previous entries in the
-        // invalidation queue have been completed.
-        entry.promise.setValue();
         return;
     }
     EDEN_BUG() << "unknown invalidation entry type "
@@ -1668,10 +1707,11 @@ void FuseChannel::initWorkerThread() noexcept {
     setThreadName(fmt::format("fuse{}", mountPath_.basename()));
     XLOGF(
         DBG6,
-        "Fuse init worker starting for mount={} transport={} useIoUringConfig={}",
+        "Fuse init worker starting for mount={} transport={} useIoUringConfig={} ioUringPreCreateQueuesConfig={}",
         mountPath_,
         transport_->getName(),
-        useIoUring_);
+        useIoUring_,
+        ioUringPreCreateQueues_);
 
     // Read the INIT packet
     readInitPacket();
@@ -1712,8 +1752,7 @@ void FuseChannel::fuseWorkerThread() noexcept {
   disablePthreadCancellation();
   setThreadName(fmt::format("fuse{}", mountPath_.basename()));
   setThreadSigmask();
-  *(liveRequestWatches_.get()) =
-      std::make_shared<RequestMetricsScope::LockedRequestWatchList>();
+  (void)liveRequestWatches_.get();
 
   try {
     processSession();
@@ -1748,57 +1787,8 @@ void FuseChannel::fuseWorkerThread() noexcept {
   }
 }
 
-void FuseChannel::invalidationThread() noexcept {
-  setThreadName(fmt::format("inval{}", mountPath_.basename()));
-
-  // We send all FUSE_NOTIFY_INVAL_ENTRY and FUSE_NOTIFY_INVAL_INODE requests
-  // in a dedicated thread.  These requests will block in the kernel until it
-  // can obtain the inode lock on the inode in question.
-  //
-  // It is possible that the kernel-level inode lock is already held by another
-  // thread that is waiting on one of our own user-space locks.  To avoid
-  // deadlock, we therefore need to make sure that we are never holding any
-  // Eden locks when sending these invalidation requests.
-  //
-  // For example, a process calling unlink(parent_dir, "foo") will acquire the
-  // inode lock for parent_dir in the kernel, and the kernel will then send an
-  // unlink request to Eden.  This unlink request will require the mount
-  // point's rename lock to proceed.  If a checkout is currently in progress it
-  // currently owns the rename lock, and will generate invalidation requests.
-  // We need to make sure the checkout operation does not block waiting on the
-  // invalidation requests to complete, since otherwise this would deadlock.
-  while (true) {
-    // Wait for entries to process
-    std::vector<InvalidationEntry> entries;
-    {
-      auto lockedQueue = invalidationQueue_.lock();
-      while (lockedQueue->queue.empty()) {
-        if (lockedQueue->stop) {
-          return;
-        }
-        invalidationCV_.wait(lockedQueue.as_lock());
-      }
-      lockedQueue->queue.swap(entries);
-    }
-
-    // Process all of the entries we found
-    for (auto& entry : entries) {
-      sendInvalidation(entry);
-    }
-    entries.clear();
-  }
-}
-
 void FuseChannel::stopInvalidationThread() {
-  // Check that the thread is joinable just in case we were destroyed
-  // before the invalidation thread was started.
-  if (!invalidationThread_.joinable()) {
-    return;
-  }
-
-  invalidationQueue_.lock()->stop = true;
-  invalidationCV_.notify_one();
-  invalidationThread_.join();
+  invalidationQueue_.stop();
 }
 
 void FuseChannel::readInitPacket() {
@@ -1869,7 +1859,7 @@ void FuseChannel::readInitPacket() {
   }
 
   if (init.header.opcode != FUSE_INIT) {
-    replyError(init.header, EPROTO);
+    replyError(*transport_, init.header, EPROTO);
     throw_<std::runtime_error>(
         "expected to receive FUSE_INIT for \"",
         mountPath_,
@@ -1927,6 +1917,17 @@ void FuseChannel::readInitPacket() {
 #ifdef __linux__
   // We don't support setuid and setgid mode bits anyway.
   want |= FUSE_HANDLE_KILLPRIV;
+#ifdef FUSE_HANDLE_KILLPRIV_V2
+  if (handleKillPrivV2_) {
+    // Files never carry setuid, setgid or sticky bits here (setattr rejects
+    // them and create/mknod strip them), so the kill requests this flag makes
+    // the kernel send on write, truncate and chown have nothing to do. What
+    // the flag buys is SB_NOSEC on the superblock: after the first write to a
+    // file the kernel marks it S_NOSEC and stops asking for the
+    // security.capability xattr before every later write.
+    want |= FUSE_HANDLE_KILLPRIV_V2;
+  }
+#endif
   // Allow the kernel to cache ACL xattrs, even though we will fail all setxattr
   // calls.
   want |= FUSE_POSIX_ACL;
@@ -1971,10 +1972,43 @@ void FuseChannel::readInitPacket() {
   want |= FUSE_ALLOW_IDMAP;
 #endif
 
+  // Carries a pre-created io_uring transport across the INIT reply. Assigned
+  // just below when the queues are created up front, and consumed at the
+  // transport switch further down (after sendReply()); stays null otherwise.
+  //
+  // The two halves cannot be merged. The queues have to exist *before* the
+  // reply, because that reply is the last point at which io_uring can be
+  // declined: once it advertises FUSE_OVER_IO_URING the kernel blocks request
+  // allocation until a ring is ready, so a failure afterwards hangs the mount
+  // instead of falling back. But transport_ can only be swapped *after* the
+  // reply, both because that is where the negotiated flags are known and
+  // because the reply itself is still sent over devfuse. Hence a local that
+  // spans the two.
+  std::unique_ptr<IoUringFuseTransport> preparedIoUringTransport;
+
   // Only return the capabilities the kernel supports.
 #if EDEN_HAVE_FUSE_IO_URING
-  if (isIoUringTransportAvailable()) {
-    want |= FUSE_OVER_IO_URING;
+  if (isIoUringTransportAvailable() && (capable & FUSE_OVER_IO_URING)) {
+    bool negotiateIoUring = true;
+    if (ioUringPreCreateQueues_) {
+      auto transport = std::make_unique<IoUringFuseTransport>(
+          ioUringQueueDepth_, ioUringDisableIoWait_);
+      if (auto error = transport->prepareAllQueues(*this)) {
+        XLOGF(
+            WARN,
+            "Not negotiating FUSE io_uring on mount \"{}\": {}",
+            mountPath_,
+            *error);
+        getStats()->increment(&FuseStats::ioUringPreCreateQueuesFailure);
+        negotiateIoUring = false;
+      } else {
+        getStats()->increment(&FuseStats::ioUringPreCreateQueuesSuccess);
+        preparedIoUringTransport = std::move(transport);
+      }
+    }
+    if (negotiateIoUring) {
+      want |= FUSE_OVER_IO_URING;
+    }
   }
 #else
   (void)useIoUring_;
@@ -2008,7 +2042,7 @@ void FuseChannel::readInitPacket() {
 #endif
 
   if (init.init.major != FUSE_KERNEL_VERSION) {
-    replyError(init.header, EPROTO);
+    replyError(*transport_, init.header, EPROTO);
     throw_<std::runtime_error>(
         "Unsupported FUSE kernel version ",
         init.init.major,
@@ -2032,12 +2066,13 @@ void FuseChannel::readInitPacket() {
       FUSE_KERNEL_MINOR_VERSION > 22,
       "Your kernel headers are too old to build Eden.");
   if (init.init.minor > 22) {
-    sendReply(init.header, connInfo);
+    sendReply(*transport_, init.header, connInfo);
   } else {
     // If the protocol version predates the expansion of fuse_init_out, only
     // send the start of the packet.
     static_assert(FUSE_COMPAT_22_INIT_OUT_SIZE <= sizeof(connInfo));
     sendReply(
+        *transport_,
         init.header,
         ByteRange{
             reinterpret_cast<const uint8_t*>(&connInfo),
@@ -2051,8 +2086,17 @@ void FuseChannel::readInitPacket() {
         mountPath_,
         transport_->getName(),
         ioUringQueueDepth_);
-    transport_ = std::make_unique<IoUringFuseTransport>(
-        ioUringQueueDepth_, ioUringDisableIoWait_);
+    // Adopt the transport prepared before the INIT reply, if there is one.
+    // Constructing a fresh one here instead would strand the queues it
+    // already created and silently rebuild them per worker, undoing the
+    // pre-creation. It is null whenever the queues were not pre-created, in
+    // which case each worker creates its own queue as it starts, as before.
+    transport_ = preparedIoUringTransport
+        ? std::move(preparedIoUringTransport)
+        : std::make_unique<IoUringFuseTransport>(
+              ioUringQueueDepth_,
+              ioUringDisableIoWait_,
+              ioUringSkipSelfWakeup_);
   }
   updateEffectiveWorkerThreadCount();
 
@@ -2123,6 +2167,7 @@ void FuseChannel::updateEffectiveWorkerThreadCount() {
 }
 
 void FuseChannel::dispatchRequest(
+    const FuseTransport& source,
     const fuse_in_header& header,
     ByteRange arg,
     pid_t myPid) {
@@ -2163,7 +2208,7 @@ void FuseChannel::dispatchRequest(
     bool matched = false;
     for (auto fastTrack : kFastTracks) {
       if (namePiece == fastTrack) {
-        replyError(header, ENODATA);
+        replyError(source, header, ENODATA);
         matched = true;
         break;
       }
@@ -2182,7 +2227,7 @@ void FuseChannel::dispatchRequest(
   // to resolve this deadlock on kernel inode locks without rebooting the
   // system.
   if (UNLIKELY(static_cast<pid_t>(header.pid) == myPid)) {
-    replyError(header, EIO);
+    replyError(source, header, EIO);
     XLOGF(
         CRITICAL,
         "Received FUSE request from our own pid: opcode={} nodeid={} pid={}",
@@ -2199,7 +2244,7 @@ void FuseChannel::dispatchRequest(
 
   switch (header.opcode) {
     case FUSE_INIT:
-      replyError(header, EPROTO);
+      replyError(source, header, EPROTO);
       throw std::runtime_error(
           "received FUSE_INIT after we have been initialized!?");
 
@@ -2209,7 +2254,7 @@ void FuseChannel::dispatchRequest(
       // Deliberately not handling locking; this causes
       // the kernel to do it for us
       XLOG(DBG7, fuseOpcodeName(header.opcode));
-      replyError(header, ENOSYS);
+      replyError(source, header, ENOSYS);
       break;
 
 #ifdef __linux__
@@ -2218,14 +2263,14 @@ void FuseChannel::dispatchRequest(
       // for us.  Returning ENOSYS causes the kernel to implement it for us,
       // and will cause it to stop sending subsequent FUSE_LSEEK requests.
       XLOG(DBG7, "FUSE_LSEEK");
-      replyError(header, ENOSYS);
+      replyError(source, header, ENOSYS);
       break;
 #endif
 
     case FUSE_POLL:
       // We do not currently implement FUSE_POLL.
       XLOG(DBG7, "FUSE_POLL");
-      replyError(header, ENOSYS);
+      replyError(source, header, ENOSYS);
       break;
 
     case FUSE_INTERRUPT:
@@ -2235,14 +2280,7 @@ void FuseChannel::dispatchRequest(
       // that interrupting functions correctly.
       // In addition, the kernel (certainly on macOS) may recycle
       // ids too quickly for us to safely track by `unique` id.
-      if (usesIoUringTransport()) {
-        // Classic /dev/fuse can treat this as a true no-reply request.
-        // io_uring cannot: each decoded kernel request owns a ring entry that
-        // stays outstanding until we submit a commit back through io_uring.
-        // Sending a synthetic success reply is how we drive that commit path
-        // and return the entry to the kernel so it can fetch the next request.
-        replyError(header, 0);
-      }
+      source.replyNone(*this, header);
       break;
 
     case FUSE_DESTROY:
@@ -2253,7 +2291,7 @@ void FuseChannel::dispatchRequest(
       // we have responded, which in turn blocks our attempt to gracefully
       // unmount, so we respond here.  It doesn't hurt Linux to respond
       // so we do it for both platforms.
-      replyError(header, 0);
+      replyError(source, header, 0);
       break;
 
     case FUSE_NOTIFY_REPLY:
@@ -2261,19 +2299,13 @@ void FuseChannel::dispatchRequest(
       // Don't strictly need to do anything here, but may want to
       // turn the kernel notifications in Futures and use this as
       // a way to fulfil the promise
-      if (usesIoUringTransport()) {
-        // Classic /dev/fuse can drop this on the floor, but io_uring must
-        // still commit the outstanding ring entry for this request. A
-        // zero-error reply is the transport-level completion that recycles the
-        // entry and lets the kernel post another fetch on it.
-        replyError(header, 0);
-      }
+      source.replyNone(*this, header);
       break;
 
     case FUSE_IOCTL:
       // Rather than the default ENOSYS, we need to return ENOTTY
       // to indicate that the requested ioctl is not supported
-      replyError(header, ENOTTY);
+      replyError(source, header, ENOTTY);
       break;
 
     default: {
@@ -2297,7 +2329,8 @@ void FuseChannel::dispatchRequest(
         // This is a shared_ptr because, due to timeouts, the internal request
         // lifetime may not match the FUSE request lifetime, so we capture it
         // in both. I'm sure this could be improved with some cleverness.
-        auto request = std::make_shared<FuseRequestContext>(this, header);
+        auto request =
+            std::make_shared<FuseRequestContext>(this, source, header);
 
         auto now = std::chrono::steady_clock::now();
         auto should_log = false;
@@ -2430,7 +2463,7 @@ void FuseChannel::dispatchRequest(
           });
 
       try {
-        replyError(header, ENOSYS);
+        replyError(source, header, ENOSYS);
       } catch (const std::system_error& exc) {
         XLOGF(ERR, "Failed to write error response to fuse: {}", exc.what());
         errorLogger_.log(
@@ -2452,18 +2485,18 @@ void FuseChannel::sessionComplete(folly::Synchronized<State>::LockedPtr state) {
 
   auto data = std::make_unique<StopData>();
   data->reason = state->stopReason;
+  // Unlock the state before the remaining steps
+  state.unlock();
+
+  // Stop the invalidation threads. We do not do this when requestSessionExit()
+  // is called since we want to continue to allow invalidation requests to be
+  // processed until all outstanding requests complete.
+  stopInvalidationThread();
+
   if (isFuseDeviceValid(data->reason) && connInfo_.has_value()) {
     data->fuseDevice = std::move(fuseDevice_);
     data->fuseSettings = connInfo_.value();
   }
-
-  // Unlock the state before the remaining steps
-  state.unlock();
-
-  // Stop the invalidation thread.  We do not do this when requestSessionExit()
-  // is called since we want to continue to allow invalidation requests to be
-  // processed until all outstanding requests complete.
-  stopInvalidationThread();
 
   // Fulfill sessionCompletePromise
   sessionCompletePromise_.setValue(std::move(data));
@@ -2553,15 +2586,7 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseForget(
   XLOGF(
       DBG7, "FUSE_FORGET inode={} nlookup={}", header.nodeid, forget->nlookup);
   dispatcher_->forget(InodeNumber{header.nodeid}, forget->nlookup);
-  if (usesIoUringTransport()) {
-    // FORGET has no semantic FUSE reply, but the io_uring transport still has
-    // to commit the ring entry that delivered the request. replyError(0)
-    // produces the minimal success completion needed to hand that entry back
-    // to the kernel so it can be reused for future fetches.
-    request.replyError(0);
-  } else {
-    request.replyNone();
-  }
+  request.replyNone();
   return folly::unit;
 }
 
@@ -2726,6 +2751,36 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseRename(
           request.getObjectFetchContext())
       .thenValue([&request](auto&&) { request.replyError(0); });
 }
+
+#ifdef __linux__
+ImmediateFuture<folly::Unit> FuseChannel::fuseRename2(
+    FuseRequestContext& request,
+    const fuse_in_header& header,
+    ByteRange arg) {
+  const auto rename = reinterpret_cast<const fuse_rename2_in*>(arg.data());
+  auto oldNameStr = reinterpret_cast<const char*>(rename + 1);
+  StringPiece oldName{oldNameStr};
+  StringPiece newName{oldNameStr + oldName.size() + 1};
+
+  InodeNumber parent{header.nodeid};
+  InodeNumber newParent{rename->newdir};
+  XLOGF(
+      DBG7,
+      "FUSE_RENAME2 {} -> {}, flags={:#x}",
+      oldName,
+      newName,
+      rename->flags);
+  return dispatcher_
+      ->rename2(
+          parent,
+          extractPathComponent(oldName, requireUtf8Path_),
+          newParent,
+          extractPathComponent(newName, requireUtf8Path_),
+          rename->flags,
+          request.getObjectFetchContext())
+      .thenValue([&request](auto&&) { request.replyError(0); });
+}
+#endif
 
 ImmediateFuture<folly::Unit> FuseChannel::fuseLink(
     FuseRequestContext& request,
@@ -3056,15 +3111,7 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseBatchForget(
     dispatcher_->forget(InodeNumber{item->nodeid}, item->nlookup);
     ++item;
   }
-  if (usesIoUringTransport()) {
-    // BATCH_FORGET is the same transport issue as FORGET above: there is no
-    // logical reply payload, but io_uring still requires a success completion
-    // so the outstanding ring entry can commit and return to the kernel's
-    // fetch pool.
-    request.replyError(0);
-  } else {
-    request.replyNone();
-  }
+  request.replyNone();
   return folly::unit;
 }
 

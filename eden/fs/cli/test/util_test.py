@@ -6,23 +6,38 @@
 
 # pyre-strict
 
-import json
 import os
 import stat
-import tempfile
 import unittest
 from pathlib import Path
-from typing import Optional
+from unittest.mock import MagicMock
 
 from eden.fs.service.eden.thrift_types import (
     TreeInodeDebugInfo,
     TreeInodeEntryDebugInfo,
 )
 
-from .. import rage, util
+from .. import util
 
 
 class UtilTest(unittest.TestCase):
+    def test_missing_backing_repo_does_not_block_edensparse_migration(self) -> None:
+        backing_repo = MagicMock()
+        backing_repo._run_hg.side_effect = FileNotFoundError("backing repo deleted")
+
+        checkout = MagicMock()
+        checkout.path = Path("/deleted/backing/repo")
+        checkout.get_backing_repo.return_value = backing_repo
+
+        instance = MagicMock()
+        instance.get_checkouts.return_value = [checkout]
+
+        util.maybe_edensparse_migration(
+            instance, util.EdensparseMigrationStep.PRE_EDEN_START
+        )
+
+        instance.log_sample.assert_not_called()
+
     def test_is_valid_sha1(self) -> None:
         def is_valid(sha1: str) -> bool:
             return util.is_valid_sha1(sha1)
@@ -196,83 +211,3 @@ class UtilTest(unittest.TestCase):
         )
         self.assertListEqual(read_files, [])
         self.assertListEqual(written_files, [])
-
-
-class CheckArcrcAuthTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp_dir.cleanup)
-        self.arcrc = Path(self._tmp_dir.name) / ".arcrc"
-
-    def check(self) -> Optional[str]:
-        return util.check_arcrc_auth(self.arcrc)
-
-    def test_valid(self) -> None:
-        self.arcrc.write_text(
-            json.dumps(
-                {"hosts": {"https://phabricator.internmc.facebook.com/api/": {}}}
-            )
-        )
-        self.assertIsNone(self.check())
-
-    def test_missing_file(self) -> None:
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("does not exist", problem)
-
-    def test_empty_file(self) -> None:
-        self.arcrc.write_text("")
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("is empty", problem)
-
-    def test_whitespace_only_file(self) -> None:
-        self.arcrc.write_text("\n  \n")
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("is empty", problem)
-
-    def test_invalid_json(self) -> None:
-        self.arcrc.write_text('{"hosts": ')
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("does not contain valid JSON", problem)
-
-    def test_json_not_an_object(self) -> None:
-        self.arcrc.write_text("[]")
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("does not contain a JSON object", problem)
-
-    def test_missing_hosts(self) -> None:
-        self.arcrc.write_text(json.dumps({"config": {}}))
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("no `hosts` credentials", problem)
-
-    def test_empty_hosts(self) -> None:
-        self.arcrc.write_text(json.dumps({"hosts": {}}))
-        problem = self.check()
-        assert problem is not None
-        self.assertIn("no `hosts` credentials", problem)
-
-
-class ReporterNeedsArcAuthTest(unittest.TestCase):
-    def test_arc_authed_reporters(self) -> None:
-        for processor in (
-            'pastry --title "eden rage from host"',
-            "/usr/local/bin/pastry",
-            "jf paste",
-            "arc paste",
-            "pastry.exe --title foo",
-        ):
-            with self.subTest(processor=processor):
-                self.assertTrue(rage.reporter_needs_arc_auth(processor))
-
-    def test_other_reporters(self) -> None:
-        for processor in ("", "   ", "cat", "/bin/tee /tmp/rage.txt"):
-            with self.subTest(processor=processor):
-                self.assertFalse(rage.reporter_needs_arc_auth(processor))
-
-    def test_check_skipped_for_non_arc_reporter(self) -> None:
-        self.assertIsNone(rage.check_rage_reporter_auth("cat"))

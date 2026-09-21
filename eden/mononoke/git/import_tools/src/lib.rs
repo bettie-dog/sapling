@@ -12,6 +12,7 @@ pub mod git_reader;
 pub mod git_uploader;
 mod gitimport_objects;
 mod gitlfs;
+mod internal_refs;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -81,8 +82,11 @@ pub use crate::gitimport_objects::GitimportPreferences;
 pub use crate::gitimport_objects::GitimportTarget;
 pub use crate::gitimport_objects::TagMetadata;
 pub use crate::gitimport_objects::oid_to_sha1;
+pub use crate::gitlfs::CONSUMER_RETRY_ATTEMPTS as LFS_CONSUMER_RETRY_ATTEMPTS;
 pub use crate::gitlfs::GitImportLfs;
 pub use crate::gitlfs::LfsServerUrlFormat;
+pub use crate::internal_refs::COMMIT_CLOUD_REF_PREFIX;
+pub use crate::internal_refs::is_internal_only_ref;
 
 pub const HGGIT_MARKER_EXTRA: &str = "hg-git-rename-source";
 pub const HGGIT_MARKER_VALUE: &[u8] = b"git";

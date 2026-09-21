@@ -11,14 +11,12 @@
 //! Internal organization:
 //! - [`ConfigUpdateReceiver`][receiver::ConfigUpdateReceiver] trait is in
 //!   [`receiver`]
-//! - The unified watcher task (single tokio task that owns the blob, manifest,
-//!   per-repo control channel, and per-repo wait fan-in) is in [`watcher`]
-//! - The deterministic content-hash + last-updated-at helper used to expose
-//!   stable config identity is in [`config_info`]
+//! - The unified watcher task (single tokio task that owns the config source —
+//!   tier manifest or legacy blob — plus the per-repo control channel and
+//!   per-repo wait fan-in) is in [`watcher`]
 //!
 //! `MononokeConfigs` itself owns the `ArcSwap` state and the task handles.
 
-mod config_info;
 mod receiver;
 mod watcher;
 
@@ -40,8 +38,8 @@ use metaconfig_parser::StorageConfigs;
 use metaconfig_parser::config::configerator_config_handle;
 use metaconfig_parser::configerator_manifest_handle;
 use metaconfig_parser::configerator_repo_spec_handle;
+use metaconfig_parser::parse_manifest_common_and_storage;
 use metaconfig_parser::parse_repo_spec;
-use metaconfig_types::ConfigInfo;
 use metaconfig_types::RepoConfig;
 use repos::RepoSpec;
 use repos::TierManifest;
@@ -49,13 +47,12 @@ use stats::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-use crate::config_info::build_config_info;
 pub use crate::receiver::ConfigUpdateReceiver;
+use crate::watcher::ConfigSource;
 use crate::watcher::RepoHandleEvent;
 use crate::watcher::liveness_updater;
 use crate::watcher::unified_config_watcher;
@@ -77,6 +74,9 @@ define_stats! {
     per_repo_refresh_failure_count: timeseries(Average, Sum, Count),
     ensure_repo_handle_success_count: timeseries(Average, Sum, Count),
     ensure_repo_handle_failure_count: timeseries(Average, Sum, Count),
+    manifest_common_parse_failure: timeseries(Average, Sum, Count),
+    // Presence-keyed: emitted once per task on the manifest-backed path.
+    tier_blob_skipped: timeseries(Average, Sum, Count),
 }
 
 /// Outcome of a batch config load. Separates the configs that loaded/parsed
@@ -96,7 +96,6 @@ pub struct MononokeConfigs {
     repo_configs: Swappable<RepoConfigs>,
     storage_configs: Swappable<StorageConfigs>,
     update_receivers: Swappable<Vec<Arc<dyn ConfigUpdateReceiver>>>,
-    config_info: Swappable<Option<ConfigInfo>>,
     maybe_config_updater: Option<JoinHandle<()>>,
     maybe_liveness_updater: Option<JoinHandle<()>>,
     // Per-repo split-loading fields
@@ -124,11 +123,6 @@ impl MononokeConfigs {
         manifest_path: Option<&str>,
         runtime_handle: Handle,
     ) -> Result<Self> {
-        let storage_configs = metaconfig_parser::load_storage_configs(&config_path, config_store)?;
-        let storage_configs = Arc::new(ArcSwap::from_pointee(storage_configs));
-        let repo_configs = metaconfig_parser::load_repo_configs(&config_path, config_store)?;
-        let repo_configs = Arc::new(ArcSwap::from_pointee(repo_configs));
-
         // Derive tier name from the configerator config path.
         // Configerator paths follow the pattern:
         //   configerator://scm/mononoke/repos/tiers/{tier_name}
@@ -139,41 +133,9 @@ impl MononokeConfigs {
             .filter(|t| !t.is_empty())
             .map(|t| t.to_owned());
         let update_receivers = Arc::new(ArcSwap::from_pointee(vec![]));
-        let maybe_config_handle = configerator_config_handle(config_path.as_ref(), config_store)?;
-        let config_info = if let Some(config_handle) = maybe_config_handle.as_ref() {
-            match build_config_info(config_handle.get()) {
-                Ok(new_config_info) => Some(new_config_info),
-                Err(e) => {
-                    warn!("Could not compute new config_info: {e:?}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let config_info = Arc::new(ArcSwap::from_pointee(config_info));
         let maybe_manifest_handle = manifest_path
             .map(|path| configerator_manifest_handle(path, config_store))
             .transpose()?;
-
-        // Only log split-loading status for configerator-backed configs (where
-        // tier_name is set). File-backed configs used in tests always have
-        // tier_name=None and manifest_path=None, so logging would be noise.
-        if tier_name.is_some() {
-            if let Some(manifest_path) = manifest_path {
-                debug!(
-                    "Split-loading enabled: config_path={}, manifest_path={manifest_path}, tier_name={:?}",
-                    config_path.as_ref().to_string_lossy(),
-                    tier_name.as_deref().unwrap_or("<none>"),
-                );
-            } else {
-                debug!(
-                    "Split-loading disabled: config_path={}, tier_name={:?}",
-                    config_path.as_ref().to_string_lossy(),
-                    tier_name.as_deref().unwrap_or("<none>"),
-                );
-            }
-        }
 
         // Validate: split-loading (manifest) requires a tier name for resolving
         // tier_overrides in RepoSpec configs.
@@ -183,16 +145,36 @@ impl MononokeConfigs {
             );
         }
 
+        // Manifest-backed processes never touch the legacy blob; blob-backed is unchanged.
+        let (maybe_config_handle, resolved_repo_configs, storage) = if let Some(manifest_handle) =
+            maybe_manifest_handle.as_ref()
+        {
+            // The manifest is the sole source of common/storage; fail closed at startup.
+            let manifest = manifest_handle.get();
+            let (common, storage) = parse_manifest_common_and_storage(&manifest).context(
+                "common/storage could not be parsed from the tier manifest; \
+                         refusing to start",
+            )?;
+            STATS::tier_blob_skipped.add_value(1);
+            // Repos load on demand.
+            (None, RepoConfigs::new(HashMap::new(), common), storage)
+        } else {
+            let blob_storage = metaconfig_parser::load_storage_configs(&config_path, config_store)?;
+            let blob_repo_configs =
+                metaconfig_parser::load_repo_configs(&config_path, config_store)?;
+            let maybe_config_handle =
+                configerator_config_handle(config_path.as_ref(), config_store)?;
+            (maybe_config_handle, blob_repo_configs, blob_storage)
+        };
+        let storage_configs = Arc::new(ArcSwap::from_pointee(storage));
+        let repo_configs = Arc::new(ArcSwap::from_pointee(resolved_repo_configs));
+
         let repo_handles = Arc::new(RwLock::new(HashMap::new()));
 
         // Control channel for the per-repo arm of unified_config_watcher.
         // Only created when split-loading is active (manifest is set), since
-        // that's the only case where per-repo handles exist. Created BEFORE
-        // the pre-load so we can enqueue `Added` events for pre-loaded handles
-        // — the watcher will process those queued events on its first iteration
-        // via the control arm, which avoids running a separate seed loop that
-        // could race with a concurrent `load_repo_config_handle` call from
-        // ShardManager and double-register a handle.
+        // that's the only case where per-repo handles exist. Single registration
+        // channel: avoids the duplicate-registration race a seed loop would have.
         let (repo_handle_event_tx, repo_handle_event_rx) = if maybe_manifest_handle.is_some() {
             let (tx, rx) = mpsc::unbounded_channel();
             (Some(tx), Some(rx))
@@ -200,100 +182,48 @@ impl MononokeConfigs {
             (None, None)
         };
 
-        // If manifest is available, pre-load handles for non-deep-sharded repos.
-        // Collect all handles first, then insert in bulk under a single write lock.
-        if let Some(ref manifest_handle) = maybe_manifest_handle {
-            let manifest = manifest_handle.get();
-            let handles_to_add: Vec<_> = manifest
-                .repos
-                .iter()
-                .filter(|e| !e.is_deep_sharded)
-                .map(|entry| {
-                    let handle = configerator_repo_spec_handle(&entry.config_path, config_store)?;
-                    Ok((entry.repo_name.clone(), handle))
-                })
-                .collect::<Result<Vec<_>>>()?;
+        // Manifest ⇒ manifest-sourced watcher; else follow the blob handle (static configs: none).
+        let maybe_config_source = match maybe_manifest_handle.clone() {
+            Some(handle) => Some(ConfigSource::Manifest {
+                handle,
+                tier: tier_name
+                    .clone()
+                    .expect("validated above: manifest_path requires tier_name"),
+            }),
+            None => maybe_config_handle.map(ConfigSource::Blob),
+        };
 
-            info!(
-                "Split-loading: pre-loaded {} repo handles from manifest ({} total repos, {} deep-sharded skipped)",
-                handles_to_add.len(),
-                manifest.repos.len(),
-                manifest.repos.iter().filter(|e| e.is_deep_sharded).count(),
+        let maybe_liveness_updater = if maybe_config_source.is_some() {
+            Some(runtime_handle.spawn(liveness_updater()))
+        } else {
+            None
+        };
+
+        let maybe_config_updater = if let Some(config_source) = maybe_config_source {
+            cloned!(
+                repo_handles,
+                repo_configs,
+                storage_configs,
+                update_receivers,
             );
-
-            // Derive watchers BEFORE handing handle ownership to the HashMap,
-            // then enqueue `Added` events for each so the watcher loop will
-            // register them on its first iteration. This is the sole path for
-            // watcher registration — see comment on `repo_handle_event_tx` above.
-            //
-            // A failure here means the repo silently loses hot-reload: the
-            // handle stays in `repo_handles` (so `load_repo_config_handle`
-            // skips it on the fast path) but no `Added` event ever fires.
-            // Logged so this is observable in production.
-            if let Some(tx) = repo_handle_event_tx.as_ref() {
-                for (name, handle) in &handles_to_add {
-                    match handle.watcher() {
-                        Ok(w) => {
-                            // Channel is unbounded and the watcher hasn't
-                            // started yet, so send cannot fail except via an
-                            // `rx` drop — which we control.
-                            let _ = tx.send(RepoHandleEvent::Added(name.clone(), w));
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Pre-load: failed to create watcher for {name}, \
-                                 per-repo hot-reload disabled for this repo until restart: {e:?}",
-                            );
-                        }
-                    }
-                }
-            }
-
-            repo_handles
-                .write()
-                .map_err(|e| anyhow!("repo_handles lock poisoned: {e}"))?
-                .extend(handles_to_add);
-        }
-
-        let maybe_liveness_updater =
-            if maybe_config_handle.is_some() || maybe_manifest_handle.is_some() {
-                Some(runtime_handle.spawn(liveness_updater()))
-            } else {
-                None
-            };
-
-        let maybe_config_updater =
-            if maybe_config_handle.is_some() || maybe_manifest_handle.is_some() {
-                cloned!(
-                    repo_handles,
-                    repo_configs,
-                    storage_configs,
-                    config_info,
-                    update_receivers,
-                );
-                let config_store_clone = config_store.clone();
-                let tier = tier_name.clone();
-                Some(runtime_handle.spawn(unified_config_watcher(
-                    maybe_config_handle.clone(),
-                    maybe_manifest_handle.clone(),
-                    repo_handles,
-                    config_store_clone,
-                    tier,
-                    repo_configs,
-                    storage_configs,
-                    config_info,
-                    update_receivers,
-                    repo_handle_event_rx,
-                )))
-            } else {
-                None
-            };
+            let config_store_clone = config_store.clone();
+            Some(runtime_handle.spawn(unified_config_watcher(
+                config_source,
+                repo_handles,
+                config_store_clone,
+                repo_configs,
+                storage_configs,
+                update_receivers,
+                repo_handle_event_rx,
+            )))
+        } else {
+            None
+        };
 
         Ok(Self {
             repo_configs,
             storage_configs,
             update_receivers,
-            config_info,
             maybe_config_updater,
             maybe_liveness_updater,
             maybe_manifest_handle,
@@ -314,11 +244,6 @@ impl MononokeConfigs {
     pub fn storage_configs(&self) -> Arc<StorageConfigs> {
         // Load full since there could be lots of calls to storage_configs.
         self.storage_configs.load_full()
-    }
-
-    /// The info on the latest config fetched from the underlying configuration store.
-    pub fn config_info(&self) -> Arc<Option<ConfigInfo>> {
-        self.config_info.load_full()
     }
 
     /// Returns the ConfigStore, if available (configerator-backed configs only).
@@ -598,7 +523,7 @@ impl MononokeConfigs {
             .get(repo_name)
             .context("handle not found after load")?
             .clone();
-        let repo_spec = handle.get();
+        let (repo_spec, version_info) = handle.get_with_version();
         let tier = self
             .tier_name
             .as_deref()
@@ -608,7 +533,11 @@ impl MononokeConfigs {
             .as_ref()
             .context("manifest handle required for split-loading")?
             .get();
-        parse_repo_spec(Arc::unwrap_or_clone(repo_spec), tier, &manifest.storage)
+        let mut repo_config =
+            parse_repo_spec(Arc::unwrap_or_clone(repo_spec), tier, &manifest.storage)?;
+        // Provenance comes only from the ConfigHandle accessor, never from thrift RepoSpec fields.
+        repo_config.config_version = version_info.map(|info| info.version);
+        Ok(repo_config)
     }
 
     /// Batch-load repo configs, surfacing per-repo parse failures instead of

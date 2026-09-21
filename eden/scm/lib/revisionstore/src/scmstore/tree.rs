@@ -30,6 +30,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use blob::Blob;
+use cas_client::CasFetchManager;
 use edenapi_types::CheckManifestPermissionRequest;
 use edenapi_types::CheckPathPermissionRequest;
 use edenapi_types::FileAuxData;
@@ -48,6 +49,7 @@ use storemodel::InsertOpts;
 use storemodel::KeyStore;
 use storemodel::PathAclEntry;
 use storemodel::PathAclInfo;
+use storemodel::PermissionDenial;
 use storemodel::SerializationFormat;
 use storemodel::TreeEntry;
 use storemodel::TreeFetch;
@@ -115,7 +117,7 @@ pub(crate) type AclCheckCache = Cache<HgId, AclCheckResult>;
 #[derive(Clone)]
 pub(crate) enum AclCheckResult {
     Allowed,
-    Denied(String),
+    Denied(PermissionDenial),
 }
 
 pub(crate) fn new_acl_check_cache() -> AclCheckCache {
@@ -194,6 +196,8 @@ pub struct TreeStore {
     /// An SaplingRemoteApi Client, SaplingRemoteApiTreeStore provides the tree-specific subset of SaplingRemoteApi functionality
     /// used by TreeStore.
     pub edenapi: Option<Arc<SaplingRemoteApiTreeStore>>,
+
+    pub(crate) cas_manager: Option<Arc<CasFetchManager>>,
 
     /// A FileStore, which can be used for fetching and caching file aux data for a tree.
     pub filestore: Option<Arc<FileStore>>,
@@ -333,13 +337,13 @@ impl TreeStore {
         let acl_check_cache = self.acl_check_cache.clone();
         Some(Arc::new(
             move |children_with_acl: Vec<(PathComponentBuf, HgId)>| {
-                let mut denied_map: HashMap<HgId, String> = HashMap::new();
+                let mut denied_map: HashMap<HgId, PermissionDenial> = HashMap::new();
 
                 let manifest_ids = children_with_acl
                     .iter()
                     .filter_map(|(_, hgid)| match acl_check_cache.get(hgid) {
-                        Some(AclCheckResult::Denied(acl)) => {
-                            denied_map.insert(*hgid, acl);
+                        Some(AclCheckResult::Denied(denial)) => {
+                            denied_map.insert(*hgid, denial);
                             None
                         }
                         Some(AclCheckResult::Allowed) => None,
@@ -355,11 +359,14 @@ impl TreeStore {
                         let result = if resp.has_access {
                             AclCheckResult::Allowed
                         } else {
-                            let acl = resp
-                                .request_acl
-                                .unwrap_or_else(|| "unknown-acl".to_string());
-                            denied_map.insert(resp.manifest_id, acl.clone());
-                            AclCheckResult::Denied(acl)
+                            let denial = PermissionDenial {
+                                request_acl: resp
+                                    .request_acl
+                                    .unwrap_or_else(|| "unknown-acl".to_string()),
+                                denial_message: resp.denial_message,
+                            };
+                            denied_map.insert(resp.manifest_id, denial.clone());
+                            AclCheckResult::Denied(denial)
                         };
                         acl_check_cache.insert(resp.manifest_id, result);
                     }
@@ -367,26 +374,28 @@ impl TreeStore {
 
                 if mode == RestrictedTreeMode::Logged {
                     for (path, hgid) in &children_with_acl {
-                        if let Some(acl) = denied_map.get(hgid) {
+                        if let Some(denial) = denied_map.get(hgid) {
                             tracing::info!(
-                                %path, %hgid, %acl,
+                                %path, %hgid, acl = %denial.request_acl,
                                 "restricted tree detected (logged mode, not enforcing)"
                             );
                         }
                     }
                     return Ok(Box::new(std::iter::empty())
-                        as BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>);
+                        as BoxIterator<
+                            anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>,
+                        >);
                 }
                 let iter = children_with_acl
                     .into_iter()
                     .filter_map(move |(path, hgid)| {
                         denied_map
                             .get(&hgid)
-                            .map(|acl| Ok((path, hgid, acl.clone())))
+                            .map(|denial| Ok((path, hgid, denial.clone())))
                     });
                 Ok(Box::new(iter)
                     as BoxIterator<
-                        anyhow::Result<(PathComponentBuf, HgId, String)>,
+                        anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>,
                     >)
             },
         ))
@@ -412,18 +421,21 @@ impl TreeStore {
 
         let indexedlog_local = self.indexedlog_local.clone();
         let edenapi = self.edenapi.clone();
+        let cas_manager = self.cas_manager.clone();
 
         let historystore_cache = self.historystore_cache.clone();
         let historystore_local = self.historystore_local.clone();
 
         let cache_to_local_cache = self.cache_to_local_cache;
 
-        let fetch_children_metadata = match self.tree_metadata_mode {
-            TreeMetadataMode::Always => true,
-            TreeMetadataMode::Never => false,
-            TreeMetadataMode::OptIn => fctx.mode().contains(FetchMode::PREFETCH),
-        };
-        let fetch_tree_aux_data = self.fetch_tree_aux_data || attrs.aux_data;
+        let fetch_children_metadata = cas_manager.is_some()
+            || match self.tree_metadata_mode {
+                TreeMetadataMode::Always => true,
+                TreeMetadataMode::Never => false,
+                TreeMetadataMode::OptIn => fctx.mode().contains(FetchMode::PREFETCH),
+            };
+        let fetch_tree_aux_data =
+            cas_manager.is_some() || self.fetch_tree_aux_data || attrs.aux_data;
         let fetch_parents = attrs.parents || self.prefetch_tree_parents;
 
         let fetch_local = fctx.mode().contains(FetchMode::LOCAL);
@@ -450,7 +462,11 @@ impl TreeStore {
                 results,
                 fctx.clone(),
                 bar.clone(),
-                indexedlog_cache.clone(),
+                if cache_to_local_cache {
+                    indexedlog_cache.clone()
+                } else {
+                    None
+                },
                 aux_cache,
                 tree_aux_store.clone(),
                 max_fetch_count,
@@ -501,38 +517,39 @@ impl TreeStore {
                         }
                     });
 
-                if fetch_local {
-                    if let Some(tree_aux_store) = &tree_aux_store {
-                        let (mut found, mut miss, mut errors) = (0, 0, 0);
-                        state
-                            .common
-                            .iter_pending(TreeAttributes::AUX_DATA, false, |key| {
-                                match tree_aux_store.get(&key.hgid) {
-                                    Ok(Some(entry)) => {
-                                        found += 1;
+                let fetch_from_cas = fetch_remote && cas_manager.is_some();
 
-                                        tracing::trace!(
-                                            ?key,
-                                            ?entry,
-                                            "found tree aux entry in cache"
-                                        );
-                                        Some(StoreTree {
-                                            content: None,
-                                            parents: None,
-                                            aux_data: Some(entry),
-                                        })
-                                    }
-                                    Ok(None) => {
-                                        miss += 1;
-                                        None
-                                    }
-                                    Err(err) => {
-                                        errors += 1;
-                                        state.errors.keyed_error(key.clone(), err);
-                                        None
-                                    }
+                if fetch_local || fetch_from_cas {
+                    if let Some(tree_aux_store) = &tree_aux_store {
+                        let wants_aux = if fetch_from_cas {
+                            TreeAttributes::AUX_DATA | TreeAttributes::CONTENT
+                        } else {
+                            TreeAttributes::AUX_DATA
+                        };
+                        let (mut found, mut miss, mut errors) = (0, 0, 0);
+                        state.common.iter_pending(wants_aux, false, |key| {
+                            match tree_aux_store.get(&key.hgid) {
+                                Ok(Some(entry)) => {
+                                    found += 1;
+
+                                    tracing::trace!(?key, ?entry, "found tree aux entry in cache");
+                                    Some(StoreTree {
+                                        content: None,
+                                        parents: None,
+                                        aux_data: Some(entry),
+                                    })
                                 }
-                            });
+                                Ok(None) => {
+                                    miss += 1;
+                                    None
+                                }
+                                Err(err) => {
+                                    errors += 1;
+                                    state.errors.keyed_error(key.clone(), err);
+                                    None
+                                }
+                            }
+                        });
                         state.metrics.aux.cache.hit(found);
                         state.metrics.aux.cache.miss(miss);
                         state.metrics.aux.cache.err(errors);
@@ -632,6 +649,19 @@ impl TreeStore {
                 }
 
                 if fetch_remote {
+                    if let Some(cas_manager) = &cas_manager {
+                        state.fetch_cas(
+                            cas_manager,
+                            if fetch_parents {
+                                historystore_cache.as_deref()
+                            } else {
+                                None
+                            },
+                            verify_hash,
+                            format,
+                        );
+                    }
+
                     if let Some(edenapi) = &edenapi {
                         let attributes = edenapi_types::TreeAttributes {
                             manifest_blob: true,
@@ -646,11 +676,6 @@ impl TreeStore {
                         state.fetch_edenapi(
                             edenapi,
                             attributes,
-                            if cache_to_local_cache {
-                                indexedlog_cache.as_deref()
-                            } else {
-                                None
-                            },
                             if fetch_parents {
                                 historystore_cache.as_deref()
                             } else {
@@ -695,6 +720,7 @@ impl TreeStore {
             indexedlog_cache: None,
             cache_to_local_cache: true,
             edenapi: None,
+            cas_manager: None,
             historystore_cache: None,
             historystore_local: None,
             filestore: None,
@@ -778,6 +804,7 @@ impl TreeStore {
             historystore_cache: None,
             cache_to_local_cache: false,
             edenapi: None,
+            cas_manager: None,
             filestore: None,
             tree_aux_store: None,
             flush_on_drop: true,
@@ -1101,8 +1128,9 @@ impl storemodel::KeyStore for TreeStore {
 type AclChecker = Arc<
     dyn Fn(
             Vec<(PathComponentBuf, HgId)>,
-        ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>>
-        + Send
+        ) -> anyhow::Result<
+            BoxIterator<anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>>,
+        > + Send
         + Sync,
 >;
 
@@ -1201,7 +1229,8 @@ impl TreeEntry for ScmStoreTreeEntry {
     fn filter_permission_denied(
         &self,
         children_with_acl: Vec<(PathComponentBuf, HgId)>,
-    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>>>
+    {
         let acl_checker = match &self.acl_checker {
             Some(c) => c.clone(),
             None => return Ok(Box::new(std::iter::empty())),
@@ -1350,28 +1379,64 @@ impl storemodel::TreeStore for TreeStore {
             paths.record(err);
         }
     }
+
+    fn cache_disk_usage(&self) -> anyhow::Result<storemodel::CacheUsage> {
+        let cache = match self.indexedlog_cache.as_ref() {
+            Some(cache) => cache,
+            None => return Ok(storemodel::CacheUsage::NotConfigured),
+        };
+        let used = cache.disk_usage()?;
+        let limit = cache.max_bytes()?;
+        Ok(storemodel::CacheUsage::Available {
+            used,
+            limit: Some(limit),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
+    use anyhow::Result;
+    use anyhow::anyhow;
+    use async_runtime::block_on;
+    use blob::Blob;
+    use cas_client::CasBatch;
+    use cas_client::CasClient;
+    use cas_client::CasDigest;
+    use cas_client::CasDigestType;
+    use cas_client::CasFetchManager;
+    use futures::StreamExt;
+    use futures::stream;
+    use futures::stream::BoxStream;
+    use manifest_augmented_tree::AugmentedTree;
     use minibytes::Bytes;
     use storemodel::InsertOpts;
     use storemodel::KeyStore;
     use storemodel::Kind;
     use storemodel::SerializationFormat;
+    use storemodel::TreeAuxData;
+    use storemodel::TreeStore as _;
     use tempfile::TempDir;
+    use types::FetchContext;
     use types::HgId;
+    use types::Key;
     use types::RepoPathBuf;
+    use types::fetch_mode::FetchMode;
 
     use crate::Metadata;
+    use crate::SaplingRemoteApiTreeStore;
     use crate::StoreType;
     use crate::ToKeys;
     use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
     use crate::indexedlogdatastore::IndexedLogHgIdDataStoreConfig;
+    use crate::indexedlogtreeauxstore::TreeAuxStore;
     use crate::scmstore::tree::TreeStore;
+    use crate::scmstore::tree::types::TreeAttributes;
 
     fn make_data_store(tempdir: &TempDir) -> Arc<IndexedLogHgIdDataStore> {
         let config = IndexedLogHgIdDataStoreConfig {
@@ -1390,6 +1455,41 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    struct FakeCasClient {
+        content: Bytes,
+        fetch_count: AtomicUsize,
+        failed_digest: Option<CasDigest>,
+    }
+
+    impl CasClient for FakeCasClient {
+        fn fetch<'a>(
+            &'a self,
+            digests: &'a [CasDigest],
+            digest_type: CasDigestType,
+        ) -> BoxStream<'a, Result<CasBatch>> {
+            assert!(matches!(digest_type, CasDigestType::Tree));
+            self.fetch_count.fetch_add(1, Ordering::Relaxed);
+            let content = Blob::Bytes(self.content.clone());
+            let results = digests
+                .iter()
+                .copied()
+                .map(|digest| {
+                    let result = if self.failed_digest == Some(digest) {
+                        Err(anyhow!("injected CAS tree failure"))
+                    } else {
+                        Ok(Some(content.clone()))
+                    };
+                    (digest, result)
+                })
+                .collect();
+            let batch = CasBatch {
+                backend_stats: Default::default(),
+                results,
+            };
+            stream::once(async move { Ok(batch) }).boxed()
+        }
     }
 
     #[test]
@@ -1437,6 +1537,287 @@ mod tests {
     }
 
     #[test]
+    fn test_cas_tree_prefetch_fans_out_and_caches_once() -> Result<()> {
+        let child_id = HgId::from_hex(b"2222222222222222222222222222222222222222")?;
+        let child_digest = "3333333333333333333333333333333333333333333333333333333333333333";
+        let sapling_tree = Bytes::from(format!("child\0{child_id}t\n"));
+        let root_id = crate::trait_impls::sha1_digest(
+            &InsertOpts {
+                kind: Kind::Tree,
+                ..Default::default()
+            },
+            &sapling_tree,
+            SerializationFormat::Hg,
+        );
+        let serialized_tree = format!("v1 {root_id} - - -\nchild\0{child_id}t {child_digest} 10\n");
+        let content = Bytes::from(serialized_tree);
+        let augmented_tree = AugmentedTree::try_deserialize(content.as_ref())?;
+        let digest = augmented_tree.compute_content_addressed_digest()?;
+        let key = Key::new(RepoPathBuf::from_string("root".to_string())?, root_id);
+        let alias_key = Key::new(RepoPathBuf::from_string("alias".to_string())?, root_id);
+
+        let cache_dir = TempDir::new()?;
+        let tree_cache = make_data_store(&cache_dir);
+        let aux_dir = TempDir::new()?;
+        let tree_aux_store = Arc::new(TreeAuxStore::new(
+            &BTreeMap::<&str, &str>::new(),
+            aux_dir.path(),
+            StoreType::Rotated,
+        )?);
+        tree_aux_store.put(
+            root_id,
+            &TreeAuxData {
+                augmented_manifest_id: digest.hash,
+                augmented_manifest_size: digest.size,
+            },
+        )?;
+
+        let cas_client = Arc::new(FakeCasClient {
+            content,
+            fetch_count: AtomicUsize::new(0),
+            failed_digest: None,
+        });
+        let mut store = TreeStore::empty();
+        store.indexedlog_cache = Some(tree_cache.clone());
+        store.tree_aux_store = Some(tree_aux_store.clone());
+        store.cas_manager = Some(Arc::new(
+            CasFetchManager::builder(cas_client.clone()).build(),
+        ));
+
+        let first_context = FetchContext::new(FetchMode::AllowRemote | FetchMode::IGNORE_RESULT);
+        let first: Vec<_> = store
+            .fetch_batch(
+                first_context.clone(),
+                [key.clone(), alias_key.clone()].into_iter(),
+                TreeAttributes::CONTENT,
+            )
+            .into_iter()
+            .collect();
+        assert!(first.is_empty(), "prefetch should not return tree content");
+        assert!(first_context.fetch_from_cas_attempted());
+        assert_eq!(cas_client.fetch_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            tree_cache.to_keys().len(),
+            1,
+            "paths sharing an Hg ID should share one cached tree"
+        );
+        assert_eq!(
+            tree_aux_store.get(&child_id)?,
+            Some(TreeAuxData {
+                augmented_manifest_id: child_digest.parse()?,
+                augmented_manifest_size: 10,
+            })
+        );
+
+        let second_context = FetchContext::new(FetchMode::AllowRemote);
+        let second = store
+            .fetch_batch(
+                second_context.clone(),
+                [key, alias_key].into_iter(),
+                TreeAttributes::CONTENT,
+            )
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(second.len(), 2);
+        for (_, tree) in second {
+            assert_eq!(
+                tree.content
+                    .expect("tree content should be present")
+                    .hg_content()?,
+                sapling_tree
+            );
+        }
+        assert!(!second_context.fetch_from_cas_attempted());
+        assert_eq!(cas_client.fetch_count.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partial_cas_tree_failure_falls_back_to_edenapi() -> Result<()> {
+        let child_id = HgId::from_hex(b"2222222222222222222222222222222222222222")?;
+        let child_digest = "3333333333333333333333333333333333333333333333333333333333333333";
+        let cas_content = Bytes::from(format!("child\0{child_id}t\n"));
+        let cas_hgid = crate::trait_impls::sha1_digest(
+            &InsertOpts {
+                kind: Kind::Tree,
+                ..Default::default()
+            },
+            &cas_content,
+            SerializationFormat::Hg,
+        );
+        let cas_serialized_tree = Bytes::from(format!(
+            "v1 {cas_hgid} - - -\nchild\0{child_id}t {child_digest} 10\n"
+        ));
+        let cas_augmented_tree = AugmentedTree::try_deserialize(cas_serialized_tree.as_ref())?;
+        let cas_digest = cas_augmented_tree.compute_content_addressed_digest()?;
+        let cas_key = Key::new(RepoPathBuf::from_string("cas".to_string())?, cas_hgid);
+
+        let remote_dir = TempDir::new()?;
+        let remote_repo = eagerepo::EagerRepo::open(remote_dir.path())?;
+        let fallback_content = Bytes::new();
+        let fallback_hg_blob = vec![0u8; HgId::len() * 2];
+        let fallback_hgid = remote_repo.add_sha1_blob(&fallback_hg_blob)?;
+        block_on(remote_repo.flush())?;
+        let fallback_key = Key::new(
+            RepoPathBuf::from_string("fallback".to_string())?,
+            fallback_hgid,
+        );
+        let fallback_serialized_tree = Bytes::from(format!("v1 {fallback_hgid} - - -\n"));
+        let fallback_augmented_tree =
+            AugmentedTree::try_deserialize(fallback_serialized_tree.as_ref())?;
+        let fallback_digest = fallback_augmented_tree.compute_content_addressed_digest()?;
+
+        let aux_dir = TempDir::new()?;
+        let tree_aux_store = Arc::new(TreeAuxStore::new(
+            &BTreeMap::<&str, &str>::new(),
+            aux_dir.path(),
+            StoreType::Rotated,
+        )?);
+        tree_aux_store.put(
+            cas_hgid,
+            &TreeAuxData {
+                augmented_manifest_id: cas_digest.hash,
+                augmented_manifest_size: cas_digest.size,
+            },
+        )?;
+        tree_aux_store.put(
+            fallback_hgid,
+            &TreeAuxData {
+                augmented_manifest_id: fallback_digest.hash,
+                augmented_manifest_size: fallback_digest.size,
+            },
+        )?;
+
+        let cas_client = Arc::new(FakeCasClient {
+            content: cas_serialized_tree,
+            fetch_count: AtomicUsize::new(0),
+            failed_digest: Some(fallback_digest),
+        });
+        let mut store = TreeStore::empty();
+        store.tree_aux_store = Some(tree_aux_store);
+        store.edenapi = Some(SaplingRemoteApiTreeStore::new(Arc::new(remote_repo)));
+        store.cas_manager = Some(Arc::new(
+            CasFetchManager::builder(cas_client.clone()).build(),
+        ));
+
+        let context = FetchContext::new(FetchMode::AllowRemote);
+        let fetched = store
+            .fetch_batch(
+                context.clone(),
+                [cas_key.clone(), fallback_key.clone()].into_iter(),
+                TreeAttributes::CONTENT,
+            )
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(fetched.len(), 2, "both trees should be fetched");
+        let cas_tree = fetched
+            .iter()
+            .find(|(key, _)| key == &cas_key)
+            .expect("CAS result should be present");
+        assert_eq!(
+            cas_tree
+                .1
+                .content
+                .as_ref()
+                .expect("CAS tree content should be present")
+                .hg_content()?,
+            cas_content
+        );
+        let fallback_tree = fetched
+            .iter()
+            .find(|(key, _)| key == &fallback_key)
+            .expect("EdenAPI fallback result should be present");
+        assert_eq!(
+            fallback_tree
+                .1
+                .content
+                .as_ref()
+                .expect("EdenAPI tree content should be present")
+                .hg_content()?,
+            fallback_content
+        );
+        assert!(context.fetch_from_cas_attempted());
+        assert_eq!(cas_client.fetch_count.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cas_tree_hash_mismatch_is_not_cached() -> Result<()> {
+        let content = Bytes::new();
+        let actual_id = crate::trait_impls::sha1_digest(
+            &InsertOpts {
+                kind: Kind::Tree,
+                ..Default::default()
+            },
+            &content,
+            SerializationFormat::Hg,
+        );
+        let claimed_id = HgId::from_hex(b"1111111111111111111111111111111111111111")?;
+        assert_ne!(
+            claimed_id, actual_id,
+            "test tree content must not match its claimed Hg ID"
+        );
+
+        let serialized_tree = Bytes::from(format!("v1 {claimed_id} - - -\n"));
+        let augmented_tree = AugmentedTree::try_deserialize(serialized_tree.as_ref())?;
+        let digest = augmented_tree.compute_content_addressed_digest()?;
+        let key = Key::new(RepoPathBuf::from_string("dir".to_string())?, claimed_id);
+
+        let cache_dir = TempDir::new()?;
+        let tree_cache = make_data_store(&cache_dir);
+        let aux_dir = TempDir::new()?;
+        let tree_aux_store = Arc::new(TreeAuxStore::new(
+            &BTreeMap::<&str, &str>::new(),
+            aux_dir.path(),
+            StoreType::Rotated,
+        )?);
+        tree_aux_store.put(
+            claimed_id,
+            &TreeAuxData {
+                augmented_manifest_id: digest.hash,
+                augmented_manifest_size: digest.size,
+            },
+        )?;
+
+        let cas_client = Arc::new(FakeCasClient {
+            content: serialized_tree,
+            fetch_count: AtomicUsize::new(0),
+            failed_digest: None,
+        });
+        let mut store = TreeStore::empty();
+        store.indexedlog_cache = Some(tree_cache.clone());
+        store.tree_aux_store = Some(tree_aux_store);
+        store.cas_manager = Some(Arc::new(CasFetchManager::builder(cas_client).build()));
+
+        let results: Vec<_> = store
+            .fetch_batch(
+                FetchContext::new(FetchMode::AllowRemote),
+                std::iter::once(key),
+                TreeAttributes::CONTENT,
+            )
+            .into_iter()
+            .collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "the requested key should produce a result"
+        );
+        assert!(
+            results[0].is_err(),
+            "the CAS tree with mismatched content should be rejected"
+        );
+        assert!(
+            tree_cache.to_keys().is_empty(),
+            "the invalid CAS tree should not be cached"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_insert_data_permanent_routing() {
         let local_dir = TempDir::new().unwrap();
         let cache_dir = TempDir::new().unwrap();
@@ -1468,6 +1849,57 @@ mod tests {
         store.insert_data(opts, &path, b"data2"[..].into()).unwrap();
         assert_eq!(cache.to_keys().len(), 1);
         assert_eq!(local.to_keys().len(), 1);
+    }
+
+    #[test]
+    fn test_cache_disk_usage_not_configured() {
+        // No indexedlog cache configured - NotConfigured so callers can
+        // distinguish "no cache" from "cache genuinely empty".
+        let store = TreeStore::empty();
+        assert_eq!(
+            store.cache_disk_usage().unwrap(),
+            storemodel::CacheUsage::NotConfigured
+        );
+    }
+
+    #[test]
+    fn test_cache_disk_usage_reflects_freshly_written_data() {
+        let cache_dir = TempDir::new().unwrap();
+        let cache = make_data_store(&cache_dir);
+        let mut store = TreeStore::empty();
+        store.indexedlog_cache = Some(cache.clone());
+
+        // Baseline before any inserts: a freshly created log already has a
+        // small nonzero header, so this must be compared against the
+        // post-insert reading rather than asserting `used > 0` in isolation
+        // (a check that would trivially pass on the header alone and never
+        // catch a regression where new writes aren't reflected).
+        let (used_before, limit) = match store.cache_disk_usage().unwrap() {
+            storemodel::CacheUsage::Available { used, limit } => (used, limit),
+            other => panic!("expected Available, got {other:?}"),
+        };
+
+        let path = RepoPathBuf::from_string("foo".to_string()).unwrap();
+        let opts = InsertOpts {
+            kind: Kind::Tree,
+            permanent: false,
+            ..Default::default()
+        };
+        store.insert_data(opts, &path, b"data"[..].into()).unwrap();
+
+        // disk_usage() flushes before reading, so the just-inserted entry
+        // (still only in the in-memory buffer at this point) must already be
+        // reflected here rather than requiring a separate explicit flush.
+        let (used_after, limit_after) = match store.cache_disk_usage().unwrap() {
+            storemodel::CacheUsage::Available { used, limit } => (used, limit),
+            other => panic!("expected Available, got {other:?}"),
+        };
+        assert!(
+            used_after > used_before,
+            "disk usage should grow after inserting data: {used_before} -> {used_after}"
+        );
+        assert_eq!(limit, limit_after);
+        assert_eq!(limit, Some(cache.max_bytes().unwrap()));
     }
 
     #[test]

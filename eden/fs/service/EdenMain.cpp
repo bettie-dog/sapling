@@ -8,7 +8,9 @@
 #include "eden/fs/service/EdenMain.h"
 #include "eden/common/telemetry/SessionId.h"
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -282,9 +284,7 @@ void EdenMain::registerStandardBackingStores() {
         return std::make_shared<FilteredBackingStore>(
             std::move(saplingBackingStore),
             std::move(hgSparseFilter),
-            reloadableConfig,
-            reloadableConfig->getEdenConfig()
-                ->filteredfsOptimizeUnfiltered.getValue());
+            reloadableConfig);
       });
 
   registerBackingStore(
@@ -418,6 +418,19 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
 
   folly::stop_watch<> daemonStart;
 
+  // A non-zero restart count in the environment is how a daemon learns that it
+  // was relaunched by the privhelper rather than started by the user. It is
+  // clamped to the uint32_t range the privhelper keeps its restart budget in.
+  std::optional<uint64_t> numRestarts;
+#ifdef __APPLE__
+  if (const auto restartCount = std::min<uint64_t>(
+          readEdenFsRestartCounterEnv(kEdenFsRestartCountEnv),
+          std::numeric_limits<uint32_t>::max());
+      restartCount > 0) {
+    numRestarts = restartCount;
+  }
+#endif
+
 #ifdef __linux__
   auto cgroupInfo = readCgroup();
 
@@ -508,8 +521,58 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
 
   auto startupStatusChannel = std::make_shared<StartupStatusChannel>();
   auto logPath = getLogPath(edenConfig->edenDir.getValue());
+  bool disclaimTcc = edenConfig->disclaimTccResponsibility.getValue();
+#ifdef __APPLE__
+  const std::string signingTeam = selfCodeSigningTeamId();
+  disclaimTcc =
+      disclaimTcc && signingTeam == edenConfig->disclaimTccTeamId.getValue();
+#endif
   auto startupLogger = daemonizeIfRequested(
-      logPath, privHelper.get(), originalCommandLine, startupStatusChannel);
+      logPath,
+      privHelper.get(),
+      originalCommandLine,
+      startupStatusChannel,
+      disclaimTcc);
+#ifdef __APPLE__
+  // Logged after daemonizing rather than before: the daemonizing parent never
+  // returns from daemonizeIfRequested(), and the daemon's stderr is redirected
+  // into edenfs.log inside it, which is where this needs to be visible. A
+  // user-run --foreground daemon has an empty logPath and spawned nothing, so
+  // there is no skipped disclaim to report.
+  const bool daemonDisclaimSkipped = !disclaimTcc &&
+      edenConfig->disclaimTccResponsibility.getValue() && !logPath.empty();
+  if (daemonDisclaimSkipped) {
+    // A real certificate whose team differs (development cert, or a rotated
+    // release team) silently loses the disclaim, so that is a WARN; "none" is
+    // an ad-hoc buck build, which is expected.
+    const auto message = fmt::format(
+        "not disclaiming TCC responsibility for the daemon: code signature "
+        "team {}, not the fleet team {}",
+        signingTeam,
+        edenConfig->disclaimTccTeamId.getValue());
+    if (signingTeam == "none") {
+      XLOG(INFO) << message;
+    } else {
+      XLOG(WARN) << message;
+    }
+  }
+  // Scuba events for skips caused by a real but mismatched team, logged once
+  // the server exists. The process that spawned the privhelper (process #1
+  // when daemonizing) has no event logger, so the daemon reports that skip
+  // too: it runs the same binary, so csops(2) gives the same team. Ad-hoc
+  // builds ("none") are expected and not reported.
+  std::vector<TccDisclaimSkipped> tccDisclaimSkips;
+  if (signingTeam != "none") {
+    if (daemonDisclaimSkipped) {
+      tccDisclaimSkips.emplace_back(
+          "daemon", signingTeam, edenConfig->disclaimTccTeamId.getValue());
+    }
+    if (!tccDisclaimKillswitchPresent() && signingTeam != kTccDisclaimTeamId) {
+      tccDisclaimSkips.emplace_back(
+          "privhelper", signingTeam, std::string{kTccDisclaimTeamId});
+    }
+  }
+#endif
   std::optional<EdenServer> server;
   auto prepareFuture = folly::Future<folly::Unit>::makeEmpty();
   try {
@@ -543,6 +606,23 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
         ", session_id ",
         getSessionId());
 
+#ifdef __APPLE__
+    // Exported even when zero, so that a normal start is distinguishable from
+    // a daemon too old to export the key. Platforms without privhelper-driven
+    // restarts never reach here and leave the key absent.
+    fb303::fbData->setCounter(
+        "privhelper_restart_count",
+        static_cast<int64_t>(numRestarts.value_or(0)));
+    if (numRestarts.has_value()) {
+      // States the evidence rather than the conclusion: edenfsctl forwards
+      // every EDEN-prefixed variable, so a manual start can inherit this one.
+      XLOGF(
+          INFO,
+          "started with a restart budget of {} already spent, which the privhelper sets when it relaunches edenfs",
+          *numRestarts);
+    }
+#endif
+
     auto sessionInfo = makeSessionInfo(
         identity, main.getLocalHostname(), main.getEdenfsVersion());
 
@@ -556,6 +636,29 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
     if (daemonMemoryPriority.has_value()) {
       privHelper->setMemoryPriorityForProcessBlocking(
           daemonPid, daemonMemoryPriority.value());
+    }
+
+    // Also protect the privhelper process when explicitly configured.
+    const auto privhelperMemoryPriority =
+        edenConfig->privHelperTargetMemoryPriority.getValue();
+    if (privhelperMemoryPriority.has_value()) {
+      auto privhelperPid = privHelper->getPid();
+      if (privhelperPid > 0) {
+        try {
+          privHelper->setMemoryPriorityForProcessBlocking(
+              privhelperPid, privhelperMemoryPriority.value());
+        } catch (const std::exception& ex) {
+          XLOGF(
+              WARN,
+              "Cannot set privhelper memory priority to {}: {}",
+              privhelperMemoryPriority.value(),
+              ex.what());
+        }
+      } else {
+        XLOG(
+            WARN,
+            "Cannot set privhelper memory priority: privhelper pid unknown");
+      }
     }
 
 #ifdef __linux__
@@ -609,6 +712,12 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
         std::move(startupStatusChannel),
         main.getEdenfsVersion());
 
+#ifdef __APPLE__
+    for (const auto& skip : tccDisclaimSkips) {
+      server->getServerState()->getEdenFsEventsLogger()->logEvent(skip);
+    }
+#endif
+
 #ifdef EDEN_HAVE_SYSTEMD
     if (systemdStartupTimeoutExtension > std::chrono::nanoseconds::zero()) {
       auto startupTimeoutExtender =
@@ -639,14 +748,16 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
               privhelperPidNamespace,
               isDaemonInRootMountNamespace,
               isPrivhelperInRootMountNamespace,
-              cgroupInfo});
+              cgroupInfo,
+              numRestarts});
     }
     startupLogger->exitUnsuccessfully(
         kExitCodeError, "error starting EdenFS: ", folly::exceptionStr(ex));
   }
 
   std::move(prepareFuture)
-      .thenTry([startupLogger, daemonStart](folly::Try<folly::Unit>&& result) {
+      .thenTry([startupLogger, daemonStart, &server](
+                   folly::Try<folly::Unit>&& result) {
         // If an error occurred this means that we failed to mount all of
         // the mount points.
         //
@@ -675,6 +786,11 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
         }
 #endif
         startupLogger->success(startTimeInSeconds);
+
+        // Deliberately after startup has succeeded. A daemon that dies before
+        // this point leaves the privhelper with no restart information at all,
+        // which is what makes a boot-crash loop structurally impossible.
+        server->armPrivHelperRestart();
       })
       .ensure([daemonStart,
                edenFsEventsLogger =
@@ -687,6 +803,7 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
                isDaemonInRootMountNamespace,
                isPrivhelperInRootMountNamespace,
                cgroupInfo,
+               numRestarts,
                &server] {
         // This value is slightly different from `startTimeInSeconds`
         // we pass into `startupLogger->success()`, but should be
@@ -708,7 +825,8 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
                 privhelperPidNamespace,
                 isDaemonInRootMountNamespace,
                 isPrivhelperInRootMountNamespace,
-                cgroupInfo});
+                cgroupInfo,
+                numRestarts});
 
 #ifndef _WIN32
         // Check for previous heartbeat files and handle crash detection

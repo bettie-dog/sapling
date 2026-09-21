@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <folly/Portability.h>
 #include <folly/Range.h>
 
@@ -26,10 +28,15 @@ namespace facebook::eden {
 
 #ifndef _WIN32
 
-#define FUSELL_NOT_IMPL()                                                 \
-  do {                                                                    \
-    LOG_FIRST_N(WARNING, 1) << __PRETTY_FUNCTION__ << " not implemented"; \
-    folly::throwSystemErrorExplicit(ENOSYS, __PRETTY_FUNCTION__);         \
+#define FUSELL_NOT_IMPL()                                         \
+  do {                                                            \
+    static std::atomic<bool> logged{false};                       \
+    bool expected = false;                                        \
+    if (logged.compare_exchange_strong(                           \
+            expected, true, std::memory_order_relaxed)) {         \
+      LOG(WARNING) << __PRETTY_FUNCTION__ << " not implemented";  \
+    }                                                             \
+    folly::throwSystemErrorExplicit(ENOSYS, __PRETTY_FUNCTION__); \
   } while (0)
 
 class FuseDirList;
@@ -240,6 +247,14 @@ class FuseDispatcher {
       PathComponentPiece name,
       InodeNumber newparent,
       PathComponentPiece newname,
+      const ObjectFetchContextPtr& context);
+
+  [[nodiscard]] virtual ImmediateFuture<folly::Unit> rename2(
+      InodeNumber parent,
+      PathComponentPiece name,
+      InodeNumber newparent,
+      PathComponentPiece newname,
+      uint32_t flags,
       const ObjectFetchContextPtr& context);
 
   /**

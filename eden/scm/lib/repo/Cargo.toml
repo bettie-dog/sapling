@@ -19,6 +19,7 @@ fs-err = { version = "3.3.1", features = ["tokio"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-agentdetect = { version = "0.1.0", path = "../agentdetect" }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
+sapling-cas-client = { version = "0.1.0", path = "../cas-client" }
 sapling-commits = { version = "0.1.0", path = "../commits" }
 sapling-commits-trait = { version = "0.1.0", path = "../commits/trait" }
 sapling-configloader = { version = "0.1.0", path = "../config/loader" }
@@ -35,6 +36,7 @@ sapling-hgplain = { version = "0.1.0", path = "../util/hgplain" }
 sapling-identity = { version = "0.1.0", path = "../identity" }
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
 sapling-metalog = { version = "0.1.0", path = "../metalog" }
+sapling-mutationstore = { version = "0.1.0", path = "../mutationstore" }
 sapling-pathmatcher = { version = "0.1.0", path = "../pathmatcher" }
 sapling-repo-minimal-info = { version = "0.1.0", path = "repo-minimal-info" }
 sapling-repolock = { version = "0.1.0", path = "../repolock" }
@@ -49,7 +51,7 @@ sapling-types = { version = "0.1.0", path = "../types" }
 sapling-util = { version = "0.1.0", path = "../util" }
 sapling-win32-8dot3 = { version = "0.1.0", path = "../util/win32-8dot3" }
 sapling-workingcopy = { version = "0.1.0", path = "../workingcopy", optional = true }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

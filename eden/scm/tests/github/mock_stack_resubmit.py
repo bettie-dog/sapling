@@ -7,10 +7,18 @@ import os
 
 from sapling import extensions
 from sapling.ext.github import github_gh_cli, submit
+from sapling.ext.github.consts import GITHUB_HOSTNAME
 from sapling.ext.github.mock_utils import (
     mock_run_git_command,
     MockGitHubServer,
+    OWNER,
+    REPO_NAME,
     stack_json,
+)
+from sapling.ext.github.pull_request_body import (
+    _format_review_url,
+    DEFAULT_REVIEW_TOOL_NAME,
+    DEFAULT_REVIEW_URL_TEMPLATE,
 )
 
 # Mock for re-submitting an already-linked stack after amending the top
@@ -36,8 +44,21 @@ def setup_mock_github_server(ui) -> MockGitHubServer:
         github_server.expect_get_pr_details_request(num).and_respond(
             pr_id, head_ref_oid=head_oid, base_ref_name=base
         )
+        # No stack footer is rendered for the stack workflow, but the review
+        # link arguments are required by expect_update_pr_request.
         github_server.expect_update_pr_request(
-            pr_id, num, msg, base=None
+            pr_id,
+            num,
+            msg,
+            base=None,
+            review_url=_format_review_url(
+                DEFAULT_REVIEW_URL_TEMPLATE,
+                owner=OWNER,
+                repo=REPO_NAME,
+                number=num,
+                hostname=GITHUB_HOSTNAME,
+            ),
+            review_tool=DEFAULT_REVIEW_TOOL_NAME,
         ).and_respond()
 
     github_server.expect_get_username_request().and_respond()

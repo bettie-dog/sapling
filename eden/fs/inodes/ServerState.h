@@ -20,10 +20,10 @@
 #include "eden/fs/config/CachedParsedFileMonitor.h"
 #include "eden/fs/inodes/PreloadOperation.h"
 #include "eden/fs/model/git/GitIgnoreFileParser.h"
+#include "eden/fs/utils/GlobMatcher.h"
 
 namespace folly {
 class EventBase;
-class Executor;
 class IOThreadPoolExecutor;
 } // namespace folly
 
@@ -74,7 +74,7 @@ class ServerState {
       SessionInfo sessionInfo, // NOLINT(performance-unnecessary-value-param)
       std::shared_ptr<PrivHelper> privHelper,
       std::shared_ptr<UnboundedQueueExecutor> threadPool,
-      std::shared_ptr<folly::Executor> fsChannelThreadPool,
+      std::shared_ptr<UnboundedQueueExecutor> fsChannelThreadPool,
       std::shared_ptr<Clock> clock,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<StructuredLogger> structuredLogger,
@@ -89,6 +89,8 @@ class ServerState {
       std::shared_ptr<InodeAccessLogger> inodeAccessLogger = nullptr,
       std::shared_ptr<IXplatLogger> xplatLogger = nullptr);
   ~ServerState();
+
+  void shutdown();
 
   /**
    * Set the path to the server's thrift socket.
@@ -125,6 +127,9 @@ class ServerState {
    */
   folly::ReadMostlySharedPtr<const EdenConfig> getEdenConfig();
 
+  /** Snapshot the glob matcher limits and ODS accounting callback. */
+  GlobMatchOptions getGlobMatchOptions();
+
   /**
    * Get the TopLevelIgnores. It is based on the system and user git ignore
    * files.
@@ -160,7 +165,8 @@ class ServerState {
    *
    * FS channel requests are intended to run on this thread pool.
    */
-  const std::shared_ptr<folly::Executor>& getFsChannelThreadPool() const {
+  const std::shared_ptr<UnboundedQueueExecutor>& getFsChannelThreadPool()
+      const {
     return fsChannelThreadPool_;
   }
 
@@ -272,12 +278,14 @@ class ServerState {
   void cleanupStalePreloadProgress(std::chrono::seconds maxAge);
 
  private:
+  void shutdownPreloadCleanup();
+
   AbsolutePath socketPath_;
   UserInfo userInfo_;
   EdenStatsPtr edenStats_;
   std::shared_ptr<PrivHelper> privHelper_;
   std::shared_ptr<UnboundedQueueExecutor> threadPool_;
-  std::shared_ptr<folly::Executor> fsChannelThreadPool_;
+  std::shared_ptr<UnboundedQueueExecutor> fsChannelThreadPool_;
   std::shared_ptr<Clock> clock_;
   std::shared_ptr<ProcessInfoCache> processInfoCache_;
   std::shared_ptr<StructuredLogger> structuredLogger_;
@@ -312,5 +320,7 @@ class ServerState {
   // operations whose clients never polled. Started in the constructor,
   // shut down in the destructor.
   folly::FunctionScheduler preloadCleanupScheduler_;
+  folly::once_flag preloadCleanupShutdownOnceFlag_;
+  folly::once_flag executorShutdownOnceFlag_;
 };
 } // namespace facebook::eden

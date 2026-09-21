@@ -1,0 +1,45 @@
+load("//eden/scm:targets.bzl", "sl_rust_binary", "sl_rust_library")
+
+oncall("sapling")
+
+sl_rust_library(
+    name = "cas-client",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "cas_client"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-cas-client",
+                "repository": "https://github.com/facebook/sapling",
+            },
+        },
+    },
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:parking_lot",
+        "fbsource//third-party/rust:tracing",
+        "//eden/scm/lib/async-runtime:async-runtime",
+        "//eden/scm/lib/blob:blob",
+        "//eden/scm/lib/config/model:configmodel",
+        "//eden/scm/lib/metrics:metrics",
+        "//eden/scm/lib/slex:slex",
+        "//eden/scm/lib/types:types",
+        "//eden/scm/lib/util/factory:factory",
+    ],
+)
+
+sl_rust_binary(
+    name = "find_cas_digests",
+    srcs = ["benchmark/find_cas_digests/main.rs"],
+    autocargo = {"ignore_rule": True},
+    crate_root = "benchmark/find_cas_digests/main.rs",
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:clap",
+        "//eden/scm/lib/blob:blob",
+    ],
+)

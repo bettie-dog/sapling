@@ -19,6 +19,7 @@ cpp_library(
     srcs = CONTEXT_SRCS,
     headers = CONTEXT_HEADERS,
     deps = [
+        "//eden/fs/utils:source_location",
         "//folly:cpp_attributes",
         "//folly/logging:logging",
     ],
@@ -60,6 +61,7 @@ cpp_library(
         "//eden/fs/model:model",
         "//eden/fs/model:model-fwd",
         "//folly:range",
+        "//folly/coro:invoke",
         "//folly/coro:task",
         "//folly/coro/safe:now_task",
         "//folly/futures:core",
@@ -86,7 +88,7 @@ cpp_library(
         "//folly/coro:invoke",
     ],
     exported_deps = [
-        "fbsource//third-party/googletest:gtest",
+        "fbsource//third-party/googletest:gtest_prod_headers",
         ":backing_store_interface",
         "//eden/common/utils:ref_ptr",
         "//eden/common/utils:utils",
@@ -123,7 +125,7 @@ cpp_library(
         "//folly/io:iobuf",
     ],
     exported_deps = [
-        "fbsource//third-party/googletest:gtest",
+        "fbsource//third-party/googletest:gtest_prod_headers",
         ":backing_store_interface",
         ":context",
         "//eden/common/utils:case_sensitivity",
@@ -137,6 +139,7 @@ cpp_library(
         "//eden/fs/model:model-fwd",
         "//eden/fs/service:thrift-cpp2-types",
         "//eden/fs/telemetry:stats",
+        "//eden/fs/utils:matcher",
         "//eden/fs/utils:mini_tracer",
         "//eden/fs/utils:sharded_lru_cache",
         "//folly:cancellation_token",

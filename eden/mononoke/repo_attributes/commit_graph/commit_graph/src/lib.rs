@@ -9,6 +9,7 @@
 //!
 //! The graph of all commits in the repository.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -543,9 +544,9 @@ impl<E: EdgeType> CommitGraphOps<E> {
 
     /// Given a descendant commit and a list of candidate ancestor commits,
     /// returns only those candidates that are actual ancestors of the
-    /// descendant. Uses progressive frontier lowering to share traversal
-    /// work across all candidates — more efficient than N individual
-    /// `is_ancestor` calls.
+    /// descendant, ordered by generation from highest to lowest. Uses
+    /// progressive frontier lowering to share traversal work across all
+    /// candidates — more efficient than N individual `is_ancestor` calls.
     ///
     /// Ancestry is inclusive: a commit is its own ancestor.
     pub async fn filter_ancestors(
@@ -581,7 +582,7 @@ impl<E: EdgeType> CommitGraphOps<E> {
                 Some((cs_id, generation))
             })
             .collect();
-        candidates_with_gen.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates_with_gen.sort_by_key(|candidate| Reverse(candidate.1));
 
         // Build frontier from descendant
         let mut frontier = self.single_frontier(ctx, descendant).await?;

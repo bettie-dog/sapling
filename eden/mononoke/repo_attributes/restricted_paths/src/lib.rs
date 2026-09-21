@@ -56,25 +56,42 @@ pub enum RestrictedPathAccess {
 }
 
 #[derive(Clone, Debug, Error)]
-#[error("Access denied: unauthorized access to restricted path: {access}")]
 pub struct RestrictedPathsAuthorizationError {
     access: RestrictedPathAccess,
+    // Boxed because `PermissionRequestGroup` is a `MononokeIdentity`, i.e. a whole
+    // `AuthenticatedIdentity` thrift struct, which would otherwise make every
+    // `Result<_, MononokeError>` in the codebase 248 bytes wide.
+    details: Box<RestrictedPathsDenialDetails>,
+}
+
+#[derive(Clone, Debug)]
+struct RestrictedPathsDenialDetails {
     permission_request_group: PermissionRequestGroup,
+    denial_message: Option<String>,
 }
 
 impl RestrictedPathsAuthorizationError {
     pub fn new(
         access: RestrictedPathAccess,
         permission_request_group: PermissionRequestGroup,
+        denial_message: Option<String>,
     ) -> Self {
         Self {
             access,
-            permission_request_group,
+            details: Box::new(RestrictedPathsDenialDetails {
+                permission_request_group,
+                denial_message,
+            }),
         }
     }
 
     pub fn permission_request_group(&self) -> &PermissionRequestGroup {
-        &self.permission_request_group
+        &self.details.permission_request_group
+    }
+
+    /// Repo-configured text appended to the error message, if any.
+    pub fn denial_message(&self) -> Option<&str> {
+        self.details.denial_message.as_deref()
     }
 
     pub fn access(&self) -> &RestrictedPathAccess {
@@ -93,6 +110,20 @@ pub enum RestrictedPathsError {
     AuthorizationError(RestrictedPathsAuthorizationError),
     #[error("Internal error: {0}")]
     InternalError(#[from] anyhow::Error),
+}
+
+impl std::fmt::Display for RestrictedPathsAuthorizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Access denied: unauthorized access to restricted path: {}",
+            self.access
+        )?;
+        if let Some(denial_message) = self.denial_message() {
+            write!(f, "\n{denial_message}")?;
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for RestrictedPathAccess {
@@ -400,18 +431,17 @@ impl RestrictedPaths {
         // from the restricted paths store, not with changesets, so we always use
         // the config to determine which paths are restricted.
         // TODO(T248660053): support manifest-based access using AclManifests.
-        let acls = restriction_info::get_config_acls_for_paths(self, &paths);
+        let restrictions = restriction_info::get_config_restrictions_for_paths(self, &paths);
 
         log_access_to_restricted_path(
             ctx,
             self.config_based.manifest_id_store().repo_id(),
             paths,
-            acls,
+            restrictions,
             crate::access_log::RestrictedPathAccessData::Manifest(manifest_id, manifest_type),
             self.config().acl_manifest_mode,
             self.acl_provider.clone(),
             self.config().tooling_allowlist_group.as_deref(),
-            self.config().rollout_allowlist_group.as_deref(),
             self.config().admin_bypass_group.as_ref(),
             self.scuba.clone(),
             vec!["manifest_db".to_string()],
@@ -454,13 +484,22 @@ impl RestrictedPaths {
             });
         }
 
-        // Find which restricted path roots match this path
-        let (restricted_path_roots, matched_acls): (Vec<_>, Vec<_>) = self
+        // Find which restricted path roots match this path, pairing each with
+        // its ACL and its own rollout allowlist group.
+        let (restricted_path_roots, matched_restrictions): (Vec<_>, Vec<_>) = self
             .config()
             .path_restriction_metadata
             .iter()
             .filter(|(restricted_path_prefix, _)| restricted_path_prefix.is_prefix_of(&path))
-            .map(|(prefix, metadata)| (prefix.clone(), &metadata.repo_region_acl))
+            .map(|(prefix, metadata)| {
+                (
+                    prefix.clone(),
+                    (
+                        &metadata.repo_region_acl,
+                        metadata.rollout_allowlist_group.as_ref(),
+                    ),
+                )
+            })
             .unzip();
 
         // If no restricted paths match, no need to log
@@ -475,12 +514,11 @@ impl RestrictedPaths {
             ctx,
             self.config_based.manifest_id_store().repo_id(),
             restricted_path_roots,
-            matched_acls,
+            matched_restrictions,
             crate::access_log::RestrictedPathAccessData::FullPath { full_path: path },
             self.config().acl_manifest_mode,
             self.acl_provider.clone(),
             self.config().tooling_allowlist_group.as_deref(),
-            self.config().rollout_allowlist_group.as_deref(),
             self.config().admin_bypass_group.as_ref(),
             self.scuba.clone(),
             vec!["manifest_db".to_string()],
@@ -564,10 +602,11 @@ pub async fn spawn_enforce_restricted_path_access<'a, 'b>(
                 })
                 .flatten(),
         },
-        move |permission_request_group| {
+        move |permission_request_group, denial_message| {
             RestrictedPathsError::AuthorizationError(RestrictedPathsAuthorizationError::new(
                 RestrictedPathAccess::Path((*path).clone()),
                 permission_request_group,
+                denial_message,
             ))
         },
     )
@@ -650,10 +689,11 @@ pub async fn spawn_enforce_restricted_manifest_access<'a>(
                 })
                 .flatten(),
         },
-        move |permission_request_group| {
+        move |permission_request_group, denial_message| {
             RestrictedPathsError::AuthorizationError(RestrictedPathsAuthorizationError::new(
                 RestrictedPathAccess::Manifest(manifest_id),
                 permission_request_group,
+                denial_message,
             ))
         },
     )
@@ -708,7 +748,7 @@ async fn spawn_enforce_restricted_access<T>(
     access_type: &'static str,
     access_data: access_log::RestrictedPathAccessData,
     build_handles: impl FnOnce(SourceFetches) -> SourceHandles<T>,
-    authorization_error: impl FnOnce(PermissionRequestGroup) -> RestrictedPathsError,
+    authorization_error: impl FnOnce(PermissionRequestGroup, Option<String>) -> RestrictedPathsError,
 ) -> Result<(), RestrictedPathsError>
 where
     T: SourceRestrictionCheck + Send + Sync + 'static,
@@ -790,7 +830,10 @@ where
     let enforcement_outcome = enforcement_outcome?;
 
     if let Some(permission_request_group) = enforcement_outcome.denial_permission_request_group {
-        Err(authorization_error(permission_request_group))
+        Err(authorization_error(
+            permission_request_group,
+            config.denial_message.clone(),
+        ))
     } else {
         Ok(())
     }
@@ -1006,6 +1049,29 @@ mod tests {
     use crate::test_utils::RestrictedPathsConfigBuilder;
     use crate::test_utils::build_test_restricted_paths_with_dummy_acl_provider as build_test_restricted_paths;
     use crate::test_utils::build_test_restricted_paths_with_options;
+
+    // What it tests: `denial_message` is appended to the error text on its own line.
+    // Expected: no message keeps the base text unchanged.
+    #[mononoke::test]
+    fn test_authorization_error_display_appends_denial_message() -> Result<()> {
+        let access = RestrictedPathAccess::Path(MPath::new("restricted/file")?);
+        let group: PermissionRequestGroup = "REPO_REGION:test_acl".parse()?;
+        let base = "Access denied: unauthorized access to restricted path: restricted/file";
+
+        let without = RestrictedPathsAuthorizationError::new(access.clone(), group.clone(), None);
+        assert_eq!(without.to_string(), base);
+
+        let with = RestrictedPathsAuthorizationError::new(
+            access,
+            group,
+            Some("see https://fburl.com/example".to_string()),
+        );
+        assert_eq!(
+            with.to_string(),
+            format!("{base}\nsee https://fburl.com/example")
+        );
+        Ok(())
+    }
 
     #[mononoke::fbinit_test]
     async fn test_empty_config(fb: FacebookInit) -> Result<()> {

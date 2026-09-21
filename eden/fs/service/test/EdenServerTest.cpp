@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/nfs/MountdRpc.h"
 #include "eden/fs/nfs/NfsServer.h"
@@ -43,6 +45,7 @@
 #include "eden/fs/testharness/TestMount.h"
 #endif
 #include "eden/fs/testharness/TestServer.h"
+#include "eden/fs/testharness/TestServerState.h"
 
 using namespace std::chrono_literals;
 #ifdef __linux__
@@ -334,13 +337,61 @@ TEST_F(EdenServerTest, StopIsIdempotent) {
   EXPECT_TRUE(true);
 }
 
+TEST(EdenServer, serverStateShutdownWaitsForFsChannelExecutor) {
+  const auto fsChannelExecutor =
+      std::make_shared<UnboundedQueueExecutor>(1, "TestFsChannel");
+  auto serverState = createTestServerState(fsChannelExecutor);
+  ASSERT_NE(serverState->getThreadPool().get(), fsChannelExecutor.get());
+
+  std::promise<void> taskStartedPromise;
+  auto taskStarted = taskStartedPromise.get_future();
+
+  std::promise<void> releaseTaskPromise;
+  auto releaseTask = releaseTaskPromise.get_future().share();
+
+  fsChannelExecutor->add([taskStartedPromise = std::move(taskStartedPromise),
+                          releaseTask]() mutable {
+    taskStartedPromise.set_value();
+    releaseTask.wait();
+  });
+  ASSERT_EQ(taskStarted.wait_for(5s), std::future_status::ready);
+
+  std::promise<void> shutdownFinishedPromise;
+  auto shutdownFinished = shutdownFinishedPromise.get_future();
+  std::thread shutdownThread([&] {
+    serverState->shutdown();
+    shutdownFinishedPromise.set_value();
+  });
+  bool taskReleased = false;
+  auto cleanup = folly::makeGuard([&] {
+    if (!taskReleased) {
+      releaseTaskPromise.set_value();
+      taskReleased = true;
+    }
+    if (shutdownThread.joinable()) {
+      shutdownThread.join();
+    }
+  });
+
+  EXPECT_EQ(shutdownFinished.wait_for(250ms), std::future_status::timeout);
+
+  releaseTaskPromise.set_value();
+  taskReleased = true;
+
+  EXPECT_EQ(shutdownFinished.wait_for(5s), std::future_status::ready);
+}
+
 #ifndef _WIN32
 TEST_F(EdenServerTest, TakeoverSendFailureRecoversDuringCleanup) {
   auto& server = testServer().getServer();
   auto originalHandler = server.getHandler();
   ASSERT_NO_FATAL_FAILURE(
       driveTakeoverSendFailureToCleanup(testServer(), server));
-  EXPECT_FALSE(server.performCleanup());
+  ASSERT_FALSE(server.performCleanup());
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
   EXPECT_NE(originalHandler, server.getHandler());
 }
 
@@ -353,6 +404,11 @@ TEST_F(EdenServerTest, TakeoverSendFailureRecoveryReinitializesMountd) {
   ASSERT_NO_FATAL_FAILURE(
       driveTakeoverSendFailureToCleanup(nfsTestServer, server));
   ASSERT_FALSE(server.performCleanup());
+
+  ScopedServerThread serverThread{server};
+  ASSERT_TRUE(driveMainEventBaseUntil(server, [&] {
+    return server.getStatus() == EdenServer::RunState::RUNNING;
+  }));
 
   std::thread recoveryEventBaseThread(
       [&server] { server.getMainEventBase()->loop(); });
@@ -453,13 +509,36 @@ TEST_F(EdenServerTest, RepeatedTakeoverFailuresDoNotBreakShutdownFuture) {
 }
 #endif
 
+#ifdef __linux__
+TEST_F(EdenServerTest, GarbageCollectionReportsBusyWhileInhibited) {
+  auto& server = testServer().getServer();
+  TestMount mount{FakeTreeBuilder{}};
+  auto inhibitor = mount.getEdenMount()->stealInodeGCLease();
+
+  auto gc = server.garbageCollectInodes(
+      *mount.getEdenMount(),
+      mount.getRootInode(),
+      std::chrono::system_clock::now(),
+      ObjectFetchContext::getNullContext(),
+      /*pressureBased=*/false);
+  try {
+    std::move(gc).get(10s);
+    FAIL() << "expected inode GC admission to fail";
+  } catch (const EdenError& error) {
+    EXPECT_EQ(EBUSY, *error.errorCode());
+  }
+}
+#endif
+
 TEST_F(EdenServerTest, StopAllGarbageCollectionsDoesNotPoisonFutureGC) {
   auto& server = testServer().getServer();
 #ifdef __linux__
   FakeTreeBuilder builder;
   builder.setFile("hello", "world");
   TestMount mount{builder};
-  mount.updateEdenConfig({{"experimental:enable-pressure-based-gc", "true"}});
+  // The function argument is the snapshot for this GC run, even if reloadable
+  // config has changed since the run was scheduled.
+  mount.updateEdenConfig({{"experimental:enable-pressure-based-gc", "false"}});
 
   auto fuse = std::make_shared<FakeFuse>();
   mount.startFuseAndWait(fuse);
@@ -475,7 +554,7 @@ TEST_F(EdenServerTest, StopAllGarbageCollectionsDoesNotPoisonFutureGC) {
       /*maxRetries=*/0, /*retryInterval=*/std::chrono::seconds{0}));
 
   auto numInvalidated = server
-                            .garbageCollectWorkingCopy(
+                            .garbageCollectInodes(
                                 *mount.getEdenMount(),
                                 mount.getRootInode(),
                                 std::chrono::system_clock::now() + 1h,
@@ -492,6 +571,55 @@ TEST_F(EdenServerTest, StopAllGarbageCollectionsDoesNotPoisonFutureGC) {
   EXPECT_TRUE(server.stopAllGarbageCollections(
       /*maxRetries=*/0, /*retryInterval=*/std::chrono::seconds{0}));
 #endif
+}
+
+TEST_F(EdenServerTest, StopAllGarbageCollectionsWithStoppedEventBase) {
+  auto& server = testServer().getServer();
+  server.stop();
+
+  ASSERT_EQ(EdenServer::RunState::SHUTTING_DOWN, server.getStatus());
+  ASSERT_FALSE(server.getMainEventBase()->isRunning());
+  EXPECT_TRUE(server.stopAllGarbageCollections(
+      /*maxRetries=*/0, /*retryInterval=*/std::chrono::seconds{0}));
+}
+
+TEST_F(
+    EdenServerTest,
+    StopAllGarbageCollectionsFromWorkerWaitsForStoppedEventBase) {
+  auto& server = testServer().getServer();
+  server.stop();
+
+  ASSERT_FALSE(server.getMainEventBase()->isRunning());
+  auto stopResult = std::async(std::launch::async, [&server] {
+    return server.stopAllGarbageCollections(
+        /*maxRetries=*/0, /*retryInterval=*/std::chrono::seconds{0});
+  });
+
+  ASSERT_EQ(std::future_status::timeout, stopResult.wait_for(1s));
+  server.getMainEventBase()->loopOnce();
+  ASSERT_EQ(std::future_status::ready, stopResult.wait_for(5s));
+  EXPECT_TRUE(stopResult.get());
+}
+
+TEST(EdenServerMountHealthTest, OnlyRunningMountsAreProbed) {
+  EXPECT_TRUE(EdenServer::shouldProbeMountHealth(MountState::RUNNING));
+
+  // Probing any other state asks whether the kernel agrees about a mount it
+  // was never told about, or has already forgotten, which reports a
+  // DaemonRunningKernelMountMissing that is guaranteed to be false.
+  for (auto state :
+       {MountState::UNINITIALIZED,
+        MountState::INITIALIZING,
+        MountState::INITIALIZED,
+        MountState::STARTING,
+        MountState::FUSE_ERROR,
+        MountState::INIT_ERROR,
+        MountState::SHUTTING_DOWN,
+        MountState::SHUT_DOWN,
+        MountState::DESTROYING}) {
+    EXPECT_FALSE(EdenServer::shouldProbeMountHealth(state))
+        << "MountState " << static_cast<int>(state) << " must not be probed";
+  }
 }
 
 } // namespace facebook::eden

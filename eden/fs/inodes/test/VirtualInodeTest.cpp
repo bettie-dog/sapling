@@ -129,6 +129,7 @@ struct TestFileInfo {
 
   Hash20 getSHA1() const {
     auto content = getContents();
+    // patternlint-disable-next-line poor-choice-of-hash-function
     return Hash20::sha1(folly::ByteRange{content});
   }
 
@@ -515,13 +516,16 @@ void verifyTreeState(
             })
                 .semi()
                 .via(mount.getServerExecutor().get())
-            : virtualInode
-                  .getSHA1(
-                      expected.path,
-                      mount.getEdenMount()->getObjectStore(),
-                      ObjectFetchContext::getNullContext())
-                  .semi()
-                  .via(mount.getServerExecutor().get());
+            : // @lint-ignore CLANGTIDY
+              // facebook-folly-coro-return-captures-local-var
+            folly::coro::co_invoke([&]() -> folly::coro::Task<Hash20> {
+              co_return co_await virtualInode.co_getSHA1(
+                  expected.path,
+                  mount.getEdenMount()->getObjectStore(),
+                  ObjectFetchContext::getNullContext());
+            })
+                .semi()
+                .via(mount.getServerExecutor().get());
         mount.drainServerExecutor();
         auto sha1 = std::move(sha1Fut).get(0ms);
         EXPECT_EQ(sha1, expected.getSHA1()) << dbgMsg << " expected.contents=\""
@@ -545,13 +549,16 @@ void verifyTreeState(
             })
                 .semi()
                 .via(mount.getServerExecutor().get())
-            : virtualInode
-                  .getBlake3(
-                      expected.path,
-                      mount.getEdenMount()->getObjectStore(),
-                      ObjectFetchContext::getNullContext())
-                  .semi()
-                  .via(mount.getServerExecutor().get());
+            : // @lint-ignore CLANGTIDY
+              // facebook-folly-coro-return-captures-local-var
+            folly::coro::co_invoke([&]() -> folly::coro::Task<Hash32> {
+              co_return co_await virtualInode.co_getBlake3(
+                  expected.path,
+                  mount.getEdenMount()->getObjectStore(),
+                  ObjectFetchContext::getNullContext());
+            })
+                .semi()
+                .via(mount.getServerExecutor().get());
         mount.drainServerExecutor();
         auto blake3 = std::move(blake3Fut).get(0ms);
         EXPECT_EQ(blake3, expected.getBlake3(blake3Key))
@@ -697,7 +704,7 @@ folly::coro::Task<void> testRootDirAChildren(TestMount& mount) {
   auto virtualInode = mount.getVirtualInode(RelativePathPiece{"root_dirA"});
   EXPECT_TRUE(virtualInode.isDirectory());
 
-  auto children = co_await virtualInode.co_getChildren(
+  auto children = co_await virtualInode.getChildren(
       RelativePathPiece{"root_dirA"},
       mount.getEdenMount()->getObjectStore(),
       ObjectFetchContext::getNullContext());
@@ -782,7 +789,7 @@ CO_TEST_P(VirtualInodeTestBase, getChildrenDoesNotChangeState) {
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
     if (virtualInode.isDirectory()) {
-      (void)co_await virtualInode.co_getChildren(
+      (void)co_await virtualInode.getChildren(
           info->path,
           mount.getEdenMount()->getObjectStore(),
           ObjectFetchContext::getNullContext());
@@ -859,7 +866,7 @@ TEST_P(VirtualInodeTestBase, statDoesNotChangeState) {
   VERIFY_TREE(flags);
 }
 
-TEST_P(VirtualInodeTestBase, fileOpsOnCorrectObjectsOnly) {
+CO_TEST_P(VirtualInodeTestBase, fileOpsOnCorrectObjectsOnly) {
   TestFileDatabase files;
   auto mount = TestMount{MakeTestTreeBuilder(files)};
   maybeEnableCoroutines(mount);
@@ -868,12 +875,10 @@ TEST_P(VirtualInodeTestBase, fileOpsOnCorrectObjectsOnly) {
   for (const auto& info_ : files.getOriginalItems()) {
     auto& info = *info_;
     auto virtualInode = mount.getVirtualInode(info.path);
-    auto hashTry = virtualInode
-                       .getSHA1(
-                           info.path,
-                           mount.getEdenMount()->getObjectStore(),
-                           ObjectFetchContext::getNullContext())
-                       .getTry();
+    auto hashTry = co_await folly::coro::co_awaitTry(virtualInode.co_getSHA1(
+        info.path,
+        mount.getEdenMount()->getObjectStore(),
+        ObjectFetchContext::getNullContext()));
     if (info.isRegularFile()) {
       EXPECT_EQ(true, hashTry.hasValue()) << " on path " << info.getLogPath();
       EXPECT_EQ(hashTry.value(), info.getSHA1())
@@ -1248,7 +1253,7 @@ TEST_P(VirtualInodeTestBase, getEntryAttributesAttributeError) {
   EXPECT_FALSE(attributes.type.value().hasException());
 }
 
-TEST_P(VirtualInodeTestBase, sha1DoesNotChangeState) {
+CO_TEST_P(VirtualInodeTestBase, sha1DoesNotChangeState) {
   TestFileDatabase files;
   auto mount = TestMount{MakeTestTreeBuilder(files)};
   maybeEnableCoroutines(mount);
@@ -1264,22 +1269,17 @@ TEST_P(VirtualInodeTestBase, sha1DoesNotChangeState) {
       auto virtualInode = mount.getVirtualInode(info.path);
       EXPECT_INODE_OR(virtualInode, info);
 
+      auto sha1Try = co_await folly::coro::co_awaitTry(virtualInode.co_getSHA1(
+          info.path,
+          mount.getEdenMount()->getObjectStore(),
+          ObjectFetchContext::getNullContext()));
       if (info.isRegularFile()) {
-        virtualInode
-            .getSHA1(
-                info.path,
-                mount.getEdenMount()->getObjectStore(),
-                ObjectFetchContext::getNullContext())
-            .get();
+        EXPECT_TRUE(sha1Try.hasValue());
       } else {
-        EXPECT_THROW_ERRNO(
-            virtualInode
-                .getSHA1(
-                    info.path,
-                    mount.getEdenMount()->getObjectStore(),
-                    ObjectFetchContext::getNullContext())
-                .get(),
-            EISDIR);
+        CO_ASSERT_TRUE(sha1Try.hasException());
+        auto* error = sha1Try.tryGetExceptionObject<std::system_error>();
+        CO_ASSERT_NE(error, nullptr);
+        EXPECT_EQ(EISDIR, error->code().value());
       }
 
       VERIFY_TREE(verify_flags);
@@ -1411,7 +1411,7 @@ TEST_P(VirtualInodeTestBase, loadPropagation) {
   VERIFY_TREE(VERIFY_INITIAL);
 }
 
-TEST_P(VirtualInodeTestBase, getBlob) {
+CO_TEST_P(VirtualInodeTestBase, getBlob) {
   auto flags = VERIFY_DEFAULT ^ VERIFY_SHA1 ^ VERIFY_BLAKE3;
 
   TestFileDatabase files;
@@ -1428,16 +1428,18 @@ TEST_P(VirtualInodeTestBase, getBlob) {
     EXPECT_INODE_OR(virtualInode, *info.get());
     auto objectStore = edenMount->getObjectStore();
     auto fetchContext = ObjectFetchContext::getNullContext();
+    auto blobTry = co_await folly::coro::co_awaitTry(
+        virtualInode.co_getBlob(objectStore, fetchContext));
     if (virtualInode.isDirectory()) {
       // Fetch blob and expect an error as it's a directory.
-      EXPECT_THROW_ERRNO(
-          std::move(virtualInode).getBlob(objectStore, fetchContext).get(),
-          EISDIR);
+      CO_ASSERT_TRUE(blobTry.hasException());
+      auto* error = blobTry.tryGetExceptionObject<std::system_error>();
+      CO_ASSERT_NE(error, nullptr);
+      EXPECT_EQ(EISDIR, error->code().value());
     } else {
       // Fetch blob and check the contents.
-      auto contents =
-          std::move(virtualInode).getBlob(objectStore, fetchContext).get();
-      EXPECT_EQ(contents, info.get()->getContents());
+      CO_ASSERT_TRUE(blobTry.hasValue());
+      EXPECT_EQ(std::move(blobTry).value(), info.get()->getContents());
     }
   }
   VERIFY_TREE(flags);
@@ -1455,8 +1457,7 @@ TEST_P(VirtualInodeTestBase, getBlob) {
     auto objectStore = edenMount->getObjectStore();
     auto fetchContext = ObjectFetchContext::getNullContext();
     auto virtualInode = mount.getVirtualInode(info->path);
-    auto contents =
-        std::move(virtualInode).getBlob(objectStore, fetchContext).get();
+    auto contents = co_await virtualInode.co_getBlob(objectStore, fetchContext);
     EXPECT_EQ(contents, newContents);
   }
   VERIFY_TREE(flags);

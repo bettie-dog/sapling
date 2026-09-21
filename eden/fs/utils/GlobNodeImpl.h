@@ -12,6 +12,8 @@
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
+#include <memory>
+#include <utility>
 
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/DirType.h"
@@ -45,12 +47,14 @@ class GlobNodeImpl {
   explicit GlobNodeImpl(
       bool includeDotfiles,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      int32_t recursiveAsyncDepth = 3)
+      int32_t recursiveAsyncDepth = 3,
+      GlobMatchOptions matchOptions = {})
       : caseSensitive_(caseSensitive),
         includeDotfiles_(includeDotfiles),
-        prefetchOptimizations_(prefetchOptimizations),
-        recursiveAsyncDepth_(recursiveAsyncDepth) {}
+        recursiveAsyncDepth_(recursiveAsyncDepth),
+        matchOptions_{
+            std::make_shared<const GlobMatchOptions>(std::move(matchOptions))} {
+  }
 
   virtual ~GlobNodeImpl() = default;
 
@@ -61,8 +65,8 @@ class GlobNodeImpl {
       bool includeDotfiles,
       bool hasSpecials,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      uint32_t recursiveAsyncDepth = 3);
+      uint32_t recursiveAsyncDepth,
+      std::shared_ptr<const GlobMatchOptions> matchOptions);
 
   // Compile and add a new glob pattern to the tree.
   // Compilation splits the pattern into nodes, with one node for each
@@ -179,19 +183,13 @@ class GlobNodeImpl {
 
         for (auto& node : recursiveChildren_) {
           if (node->alwaysMatch_ ||
-              node->matcher_.match(candidateName.view())) {
+              node->matcher_.match(
+                  candidateName.view(), *node->matchOptions_)) {
             if (globResult) {
-              if (prefetchOptimizations_) {
-                localGlobResults.emplace_back(
-                    pathBuilder.makePath(resultDir, entry.first),
-                    entry.second.getDtype(),
-                    originRootId);
-              } else {
-                globResult->wlock()->emplace_back(
-                    pathBuilder.makePath(resultDir, entry.first),
-                    entry.second.getDtype(),
-                    originRootId);
-              }
+              localGlobResults.emplace_back(
+                  pathBuilder.makePath(resultDir, entry.first),
+                  entry.second.getDtype(),
+                  originRootId);
             }
             if (fileBlobsToPrefetch &&
                 root.entryShouldPrefetch(&entry.second)) {
@@ -200,13 +198,8 @@ class GlobNodeImpl {
                   context->addPrefetchedBlobSize(*size);
                 }
               }
-              if (prefetchOptimizations_) {
-                localFileBlobsToPrefetch.emplace_back(
-                    store->stripObjectId(entry.second.getObjectId()));
-              } else {
-                fileBlobsToPrefetch->wlock()->emplace_back(
-                    entry.second.getObjectId());
-              }
+              localFileBlobsToPrefetch.emplace_back(
+                  store->stripObjectId(entry.second.getObjectId()));
             }
             // No sense running multiple matches for this same file.
             break;
@@ -222,8 +215,7 @@ class GlobNodeImpl {
           if (root.entryShouldLoadChildTree(&entry.second)) {
             subDirNames.emplace_back(std::move(candidateName));
           } else {
-            bool shouldReschedule =
-                prefetchOptimizations_ && (currentDepth < recursiveAsyncDepth_);
+            bool shouldReschedule = currentDepth < recursiveAsyncDepth_;
             tasks.emplace_back(
                 folly::coro::co_invoke(
                     [store,
@@ -424,17 +416,10 @@ class GlobNodeImpl {
 
             if (node->isLeaf_) {
               if (globResult) {
-                if (prefetchOptimizations_) {
-                  localGlobResults.emplace_back(
-                      pathBuilder.makePath(resultDir, name),
-                      entry->second.getDtype(),
-                      originRootId);
-                } else {
-                  globResult->wlock()->emplace_back(
-                      pathBuilder.makePath(resultDir, name),
-                      entry->second.getDtype(),
-                      originRootId);
-                }
+                localGlobResults.emplace_back(
+                    pathBuilder.makePath(resultDir, name),
+                    entry->second.getDtype(),
+                    originRootId);
               }
 
               if (fileBlobsToPrefetch &&
@@ -444,13 +429,8 @@ class GlobNodeImpl {
                     context->addPrefetchedBlobSize(*size);
                   }
                 }
-                if (prefetchOptimizations_) {
-                  localFileBlobsToPrefetch.emplace_back(
-                      store->stripObjectId(entry->second.getObjectId()));
-                } else {
-                  fileBlobsToPrefetch->wlock()->emplace_back(
-                      entry->second.getObjectId());
-                }
+                localFileBlobsToPrefetch.emplace_back(
+                    store->stripObjectId(entry->second.getObjectId()));
               }
             }
 
@@ -461,20 +441,14 @@ class GlobNodeImpl {
           // We need to match it out of the entries in this inode
           for (auto& entry : root.iterate(contents)) {
             PathComponentPiece name = entry.first;
-            if (node->alwaysMatch_ || node->matcher_.match(name.view())) {
+            if (node->alwaysMatch_ ||
+                node->matcher_.match(name.view(), *node->matchOptions_)) {
               if (node->isLeaf_) {
                 if (globResult) {
-                  if (prefetchOptimizations_) {
-                    localGlobResults.emplace_back(
-                        pathBuilder.makePath(resultDir, name),
-                        entry.second.getDtype(),
-                        originRootId);
-                  } else {
-                    globResult->wlock()->emplace_back(
-                        pathBuilder.makePath(resultDir, name),
-                        entry.second.getDtype(),
-                        originRootId);
-                  }
+                  localGlobResults.emplace_back(
+                      pathBuilder.makePath(resultDir, name),
+                      entry.second.getDtype(),
+                      originRootId);
                 }
                 if (fileBlobsToPrefetch &&
                     root.entryShouldPrefetch(&entry.second)) {
@@ -483,13 +457,8 @@ class GlobNodeImpl {
                       context->addPrefetchedBlobSize(*size);
                     }
                   }
-                  if (prefetchOptimizations_) {
-                    localFileBlobsToPrefetch.emplace_back(
-                        store->stripObjectId(entry.second.getObjectId()));
-                  } else {
-                    fileBlobsToPrefetch->wlock()->emplace_back(
-                        entry.second.getObjectId());
-                  }
+                  localFileBlobsToPrefetch.emplace_back(
+                      store->stripObjectId(entry.second.getObjectId()));
                 }
               }
               // Not the leaf of a pattern; if this is a dir, we need to
@@ -608,11 +577,11 @@ class GlobNodeImpl {
   // - this node is "**" or "*"
   // - it was created with includeDotfiles=true.
   bool alwaysMatch_{false};
-  // Unified flag to control all the prefetch optimizations
-  bool prefetchOptimizations_{false};
   // The number of recursive glob levels that should always use async execution
   // through the folly executor.
   uint32_t recursiveAsyncDepth_{3};
+
+  std::shared_ptr<const GlobMatchOptions> matchOptions_;
 };
 
 } // namespace facebook::eden

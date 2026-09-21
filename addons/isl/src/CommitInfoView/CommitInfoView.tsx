@@ -81,7 +81,7 @@ import {showToast} from '../toast';
 import {GeneratedStatus, succeedableRevset} from '../types';
 import {UncommittedChanges} from '../UncommittedChanges';
 import {confirmUnsavedFiles} from '../UnsavedFiles';
-import {useModal} from '../useModal';
+import {showConfirmation, useModal} from '../useModal';
 import {firstOfIterable} from '../utils';
 import {CommitInfoField} from './CommitInfoField';
 import {
@@ -196,6 +196,7 @@ function useFetchActiveDiffDetails(diffId?: string) {
       serverAPI.postMessage({
         type: 'fetchDiffSummaries',
         diffIds: [diffId],
+        partial: true,
       });
       tracker.track('DiffFetchSource', {extras: {source: 'active_diff_details'}});
     }
@@ -471,7 +472,11 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             <div className="changed-file-list">
               <div className="button-row">
                 <OpenComparisonViewButton
-                  comparison={{type: ComparisonType.Committed, hash: commit.hash}}
+                  comparison={
+                    commit.isDot && !isOptimistic && uncommittedChanges.length === 0
+                      ? {type: ComparisonType.HeadChanges}
+                      : {type: ComparisonType.Committed, hash: commit.hash}
+                  }
                 />
                 <OpenAllFilesButton commit={commit} />
                 <SplitButton trackerEventName="SplitOpenFromSplitSuggestion" commit={commit} />
@@ -755,10 +760,11 @@ function ActionsBar({
           hasUnsavedEditedCommitMessage(isCommitMode ? 'head' : commit.hash),
         );
         if (hasUnsavedEdits) {
-          const confirmed = await platform.confirm(
-            t('Are you sure you want to discard your edited message?'),
-          );
-          if (confirmed === false) {
+          const confirmed = await showConfirmation({
+            title: t('Are you sure you want to discard your edited message?'),
+            confirmLabel: t('Discard'),
+          });
+          if (!confirmed) {
             return;
           }
         }
@@ -938,6 +944,24 @@ function ActionsBar({
       </div>
     </div>
   );
+}
+
+function SubmitButtonLabel({
+  showCommitOrAmend,
+  isCommitMode,
+  shouldSubmitAsDraft,
+}: {
+  showCommitOrAmend: boolean;
+  isCommitMode: boolean;
+  shouldSubmitAsDraft: boolean;
+}) {
+  if (showCommitOrAmend) {
+    if (isCommitMode) {
+      return shouldSubmitAsDraft ? <T>Commit and Submit Draft</T> : <T>Commit and Submit</T>;
+    }
+    return shouldSubmitAsDraft ? <T>Amend and Submit Draft</T> : <T>Amend and Submit</T>;
+  }
+  return shouldSubmitAsDraft ? <T>Submit Draft</T> : <T>Submit</T>;
 }
 
 function SubmitButton({
@@ -1163,15 +1187,11 @@ function SubmitButton({
           contextKey={`submit-${commit.isDot ? 'head' : commit.hash}`}
           disabled={disabledReason != null}
           runOperation={getApplicableOperations}>
-          {commit.isDot && anythingToCommit ? (
-            isCommitMode ? (
-              <T>Commit and Submit</T>
-            ) : (
-              <T>Amend and Submit</T>
-            )
-          ) : (
-            <T>Submit</T>
-          )}
+          <SubmitButtonLabel
+            showCommitOrAmend={commit.isDot && anythingToCommit}
+            isCommitMode={isCommitMode}
+            shouldSubmitAsDraft={shouldSubmitAsDraft}
+          />
         </OperationDisabledButton>
       )}
     </Tooltip>

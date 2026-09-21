@@ -8,6 +8,7 @@
 #ifndef _WIN32
 
 #include "eden/fs/privhelper/PrivHelperServer.h"
+#include "eden/fs/privhelper/PinScan.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperRollback.h"
 
@@ -23,6 +24,7 @@
 #include <folly/init/Init.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
+#include <folly/io/async/AsyncSignalHandler.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/logging/LogConfigParser.h>
 #include <folly/logging/LoggerDB.h>
@@ -39,11 +41,13 @@
 #include <sys/syscall.h>
 #endif
 #include <sys/types.h>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/privhelper/NfsMountRpc.h"
+#include "eden/fs/privhelper/RestartSentinel.h"
 #include "eden/fs/privhelper/priority/ProcessPriority.h"
 #include "eden/fs/utils/MountInfoTable.h"
 
@@ -333,9 +337,81 @@ folly::File PrivHelperServer::openBindMountTarget(
 #endif
 }
 
+#ifdef __APPLE__
+namespace {
+uint64_t currentEpochSeconds() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+/** Set key in env, replacing every entry already there for it. */
+void setEnv(
+    std::vector<std::pair<std::string, std::string>>& env,
+    folly::StringPiece key,
+    std::string value) {
+  // Every match goes, not just the first: spawnEdenFs() applies the pairs in
+  // order, so a duplicate left behind would overwrite what this sets.
+  const auto removed =
+      std::remove_if(env.begin(), env.end(), [key](const auto& entry) {
+        return entry.first == key;
+      });
+  env.erase(removed, env.end());
+  env.emplace_back(key.str(), std::move(value));
+}
+
+bool spawnEdenFs(
+    const AbsolutePath& binary,
+    const std::vector<std::string>& argv,
+    const std::vector<std::pair<std::string, std::string>>& env) {
+  SpawnedProcess::Options opts;
+  opts.executablePath(binary);
+  opts.nullStdin();
+  opts.resetIds();
+
+  auto& environment = opts.environment();
+  environment.clear();
+  for (const auto& [key, value] : env) {
+    environment.set(key, value);
+  }
+
+  try {
+    SpawnedProcess proc(argv, std::move(opts));
+    XLOGF(
+        INFO,
+        "relaunched edenfs as pid {}; waiting for startup to finish",
+        proc.pid());
+    const auto status = proc.waitOrTerminateOrKill(
+        kSupervisorStartupTimeout, kRestartTerminationTimeout);
+    if (status.state() != ProcessStatus::Exited || status.exitStatus() != 0) {
+      throw std::runtime_error(
+          folly::to<std::string>("relaunched edenfs process ", status.str()));
+    }
+    return true;
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "failed to relaunch edenfs: {}", folly::exceptionStr(ex));
+    return false;
+  }
+}
+} // namespace
+
+PrivHelperServer::PrivHelperServer()
+    : spawnEdenFs_{spawnEdenFs}, now_{currentEpochSeconds} {}
+#else
 PrivHelperServer::PrivHelperServer() = default;
+#endif // __APPLE__
 
 PrivHelperServer::~PrivHelperServer() = default;
+
+void detachFromParentProcessGroup() {
+  if (setsid() == static_cast<pid_t>(-1)) {
+    XLOGF(
+        WARN,
+        "privhelper failed to detach into a new session: {}",
+        folly::errnoStr(errno));
+  }
+}
 
 void PrivHelperServer::init(folly::File socket, uid_t uid, gid_t gid) {
   initPartial(std::move(socket), uid, gid);
@@ -363,6 +439,9 @@ void PrivHelperServer::initPartial(folly::File socket, uid_t uid, gid_t gid) {
   conn_ = UnixSocket::makeUnique(eventBase_.get(), std::move(socket));
   uid_ = uid;
   gid_ = gid;
+#ifdef __APPLE__
+  sentinel_.emplace(uid);
+#endif
 
   folly::checkPosixError(chdir("/"), "privhelper failed to chdir(/)");
 }
@@ -537,9 +616,8 @@ folly::File PrivHelperServer::fuseMount(
   if (readOnly) {
     mountFlags |= MS_RDONLY;
   }
-  // The colon indicates to coreutils/gnulib that this is a remote
-  // mount so it will not be displayed by `df --local`.
-  int rc = mount("edenfs:", mountPath, vfsType, mountFlags, mountOpts.c_str());
+  int rc = mount(
+      kEdenFsMountSource, mountPath, vfsType, mountFlags, mountOpts.c_str());
   checkUnixError(rc, "failed to mount");
   return fuseDev;
 #endif
@@ -568,9 +646,20 @@ PrivHelperServer::FuseMountResult PrivHelperServer::fuseMountByFd(
       gid_,
       fuseDev.fd());
 
-  auto fsFd = fsOpen(vfsType);
-  // The colon preserves the old "remote" source name used by mount(2).
-  fsConfigString(fsFd.fd(), "source", "edenfs:");
+  // fsopen(2) resolves only the base filesystem type. Unlike mount(2), it does
+  // not turn a dotted type such as "fuse.edenfs" into a FUSE subtype, so pass
+  // the suffix explicitly to keep the advertised type identical on both paths.
+  folly::StringPiece fsType{vfsType};
+  folly::StringPiece subtype;
+  if (const auto dot = fsType.find('.'); dot != folly::StringPiece::npos) {
+    subtype = fsType.subpiece(dot + 1);
+    fsType = fsType.subpiece(0, dot);
+  }
+  auto fsFd = fsOpen(fsType);
+  fsConfigString(fsFd.fd(), "source", kEdenFsMountSource);
+  if (!subtype.empty()) {
+    fsConfigString(fsFd.fd(), "subtype", subtype);
+  }
   fsConfigCommaSeparatedOptions(fsFd.fd(), mountOpts);
   fsConfigSet(fsFd.fd(), FSCONFIG_CMD_CREATE, nullptr, nullptr);
 
@@ -646,8 +735,9 @@ void PrivHelperServer::nfsMount(
    * Enables or disables rdirplus (readdirplus) based on EdenConfig value
    * Sets the mount type to soft/hard (but make it interruptible) based on an
    *   EdenConfig value. While in theory we would always want the mount to be
-   *   soft, macOS force a maximum timeout of 60s, which in some case is too
-   *   short for files to be fetched, thus make it configurable.
+   *   soft, the macOS kernel gives up on a soft-mount request at most 30s
+   *   (NFS_MAXTIMEO / 2) after EdenFS stops answering promptly, which in some
+   *   cases is too short for files to be fetched, thus make it configurable.
    * Possibly specifies dumbtimer behavior, iff an EdenConfig value is
    *   explicitly set.
    * Suppresses macOS kernel JUKEBOX retry logging (NFS_MFLAG_MUTEJUKEBOX),
@@ -1041,11 +1131,12 @@ UnixSocket::Message PrivHelperServer::processTakeoverStartupMsg(
   // Skip stale bind mount cleanup on takeover: the kernel preserves live
   // redirections (e.g. buck-out) across a graceful restart, so unmounting
   // them here would destroy legitimate user state.
-  auto sanityResult = sanityCheckMountPoint(
-      mountPath,
-      /*isNFS=*/false,
-      /*isHardMount=*/false,
-      /*performBindMountCleanup=*/false);
+  //
+  // Skip the stale mount check too: the daemon is already serving this mount
+  // when it sends the takeover startup request, so there is nothing stale to
+  // detect.
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forTakeover());
 
   registerMountPoint(mountPath);
   auto response = makeResponse();
@@ -1064,7 +1155,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
 
 #ifndef __APPLE__
   if (useModernMountApi()) {
-    auto checkedMount = openAndSanityCheckMountPoint(mountPath);
+    auto checkedMount = openAndSanityCheckMountPoint(
+        mountPath, SanityCheckOptions::forFuseMount());
     auto mountResult = fuseMountByFd(
         std::move(checkedMount.targetFd),
         mountPath.c_str(),
@@ -1088,7 +1180,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult = sanityCheckMountPoint(mountPath);
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forFuseMount());
   auto fuseDev = fuseMount(mountPath.c_str(), readOnly, vfsType.c_str());
   registerMountPoint(mountPath);
 
@@ -1108,7 +1201,8 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
 #ifndef __APPLE__
   if (useModernMountApi()) {
     auto checkedMount = openAndSanityCheckMountPoint(
-        mountPath, /*isNFS=*/true, !options.useSoftMount);
+        mountPath,
+        SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
     registerMountPoint(
         mountPath,
         nfsMountByFd(std::move(checkedMount.targetFd), mountPath, options));
@@ -1129,8 +1223,9 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult =
-      sanityCheckMountPoint(mountPath, /*isNFS=*/true, !options.useSoftMount);
+  auto sanityResult = sanityCheckMountPoint(
+      mountPath,
+      SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
   nfsMount(mountPath, std::move(options));
   registerMountPoint(mountPath);
 
@@ -1591,25 +1686,187 @@ void PrivHelperServer::bindUnmount(
   insecureBindUnmount(mountPath);
 }
 
-void PrivHelperServer::run() {
-  // Ignore SIGINT and SIGTERM.
-  // We should only exit when our parent process does.
-  // (Normally if someone hits Ctrl-C in their terminal this will send SIGINT
-  // to both our parent process and to us.  The parent process should exit due
-  // to this signal.  We don't want to exit immediately--we want to wait until
-  // the parent exits and then umount all outstanding mount points before we
-  // exit.)
-  if (signal(SIGINT, SIG_IGN) == SIG_ERR) {
-    XLOGF(
-        FATAL,
-        "error setting SIGINT handler in privhelper process: {}",
-        folly::errnoStr(errno));
+#ifdef __APPLE__
+UnixSocket::Message PrivHelperServer::processSetRestartArgsMsg(Cursor& cursor) {
+  EdenFsRestartArgs args;
+  PrivHelperConn::parseSetRestartArgsRequest(cursor, args);
+  XLOGF(
+      INFO,
+      "received edenfs restart configuration: enabled={}, sentinel={}, restartCount={}, maxRestarts={}, windowSeconds={}",
+      args.enabled,
+      args.sentinelPath,
+      args.restartCount,
+      args.maxRestarts,
+      args.windowSeconds);
+  sentinel_->setConfig(std::move(args));
+  return makeResponse();
+}
+
+UnixSocket::Message PrivHelperServer::processNotifyCleanShutdownMsg(
+    Cursor& cursor) {
+  std::string reason;
+  PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+  XLOGF(INFO, "edenfs reported a deliberate shutdown: {}", reason);
+  sentinel_->noteCleanShutdown();
+  // One-way request: processAndSendResponse() discards this.
+  return makeResponse();
+}
+
+std::optional<AbsolutePath> PrivHelperServer::findSiblingEdenFs(
+    AbsolutePathPiece dir) {
+  const auto sibling = dir + "edenfs"_relpath;
+
+  struct stat st{};
+  if (lstat(sibling.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+    return std::nullopt;
   }
-  if (signal(SIGTERM, SIG_IGN) == SIG_ERR) {
+  // A searchable directory passes X_OK, so the regular-file check above cannot
+  // be dropped in favour of this one.
+  if (::access(sibling.c_str(), X_OK) != 0) {
+    return std::nullopt;
+  }
+  return sibling;
+}
+
+AbsolutePath PrivHelperServer::resolveEdenFsBinary(
+    const RestartSentinel::RelaunchCommand& command) const {
+  const auto executable = executablePath();
+  const auto dir = executable.dirname();
+  if (const auto sibling = findSiblingEdenFs(dir)) {
+    return *sibling;
+  }
+
+  // Dev and test installs have no sibling to find, so fall back to the command
+  // edenfsctl recorded.
+  if (!command.argv.empty()) {
     XLOGF(
-        FATAL,
-        "error setting SIGTERM handler in privhelper process: {}",
-        folly::errnoStr(errno));
+        WARN,
+        "no edenfs binary next to the privhelper in {}; falling back to {} from the recorded start command",
+        dir,
+        command.argv[0]);
+    return canonicalPath(command.argv[0]);
+  }
+
+  throwf<std::runtime_error>(
+      "no edenfs binary in {}, and no recorded start command to fall back to",
+      dir);
+}
+
+void PrivHelperServer::validateRestartOwner() const {
+  const auto realUid = getuid();
+  const auto realGid = getgid();
+  if (realUid == 0) {
+    throw std::runtime_error("real uid is root");
+  }
+  if (realUid != uid_ || realGid != gid_) {
+    throwf<std::runtime_error>(
+        "real uid/gid {}/{} do not match the privhelper owner {}/{}",
+        realUid,
+        realGid,
+        uid_,
+        gid_);
+  }
+}
+
+std::optional<PrivHelperServer::RestartPlan>
+PrivHelperServer::prepareRestart() {
+  if (!sentinel_.has_value() || !sentinel_->enabled()) {
+    return std::nullopt;
+  }
+  const auto state = sentinel_->disarmState();
+  // Defensive: the guard above already rules out the one case that is nullopt.
+  if (!state.has_value()) {
+    return std::nullopt;
+  }
+  switch (*state) {
+    case RestartSentinel::DisarmState::Armed:
+      break;
+    case RestartSentinel::DisarmState::ShutdownAnnounced:
+      XLOG(INFO, "edenfs shut down on purpose; not restarting");
+      return std::nullopt;
+    case RestartSentinel::DisarmState::Unknown:
+      XLOG(
+          WARN,
+          "cannot tell whether edenfs meant to shut down; not restarting");
+      return std::nullopt;
+  }
+
+  // Obtained before producing a plan so launchRestart() is unreachable without
+  // a command.
+  auto command = sentinel_->relaunchCommand();
+  if (!command.has_value()) {
+    return std::nullopt;
+  }
+
+  AbsolutePath binary;
+  try {
+    binary = resolveEdenFsBinary(*command);
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "refusing to restart edenfs: {}", folly::exceptionStr(ex));
+    return std::nullopt;
+  }
+
+  if (!sentinel_->admitRestartAttempt(now_())) {
+    return std::nullopt;
+  }
+  return RestartPlan{
+      std::move(binary),
+      std::move(*command),
+      sentinel_->restartCount(),
+      sentinel_->firstRestartEpochSec()};
+}
+
+bool PrivHelperServer::launchRestart(const RestartPlan& plan) const {
+  // The recorded environment can already carry these keys: edenfsctl preserves
+  // every EDEN-prefixed variable it was started with.
+  auto env = plan.command.env;
+  setEnv(
+      env, kEdenFsRestartCountEnv, folly::to<std::string>(plan.restartCount));
+  setEnv(
+      env,
+      kEdenFsFirstRestartAtEnv,
+      folly::to<std::string>(plan.firstRestartEpochSec));
+
+  try {
+    validateRestartOwner();
+  } catch (const std::exception& ex) {
+    XLOGF(
+        ERR,
+        "refusing to restart edenfs, resetting IDs would not select its owner: {}",
+        folly::exceptionStr(ex));
+    return false;
+  }
+
+  if (!spawnEdenFs_(plan.binary, plan.command.argv, env)) {
+    return false;
+  }
+  return true;
+}
+#endif // __APPLE__
+
+void PrivHelperServer::run() {
+  // Log and ignore signals that would otherwise terminate the process.
+  // We should only exit when the daemon's connection closes, so that we
+  // can umount all outstanding mount points before we exit. The privhelper
+  // binary detaches into its own session at startup, which keeps terminal
+  // signals (e.g. Ctrl-C) and process-group-wide kills away from us, but
+  // anything signaling this process directly must not terminate it either.
+  class LogAndIgnoreSignalHandler : public folly::AsyncSignalHandler {
+   public:
+    using AsyncSignalHandler::AsyncSignalHandler;
+
+    void signalReceived(int sig) noexcept override {
+      XLOGF(
+          WARN,
+          "privhelper received signal {} ({}); ignoring; the privhelper "
+          "exits only when the EdenFS daemon connection closes",
+          sig,
+          strsignal(sig));
+    }
+  };
+  LogAndIgnoreSignalHandler signalHandler{eventBase_.get()};
+  for (int sig : {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2}) {
+    signalHandler.registerSignalHandler(sig);
   }
 
   conn_->setReceiveCallback(this);
@@ -1619,6 +1876,16 @@ void PrivHelperServer::run() {
   // This normally means the parent process exited, so we can clean up and exit
   // too.
   XLOG(DBG5, "privhelper process exiting");
+
+#ifdef __APPLE__
+  if (peerExited_) {
+    if (const auto plan = prepareRestart()) {
+      if (launchRestart(*plan)) {
+        return;
+      }
+    }
+  }
+#endif
 
   // Unmount all active mount points
   cleanupMountPoints();
@@ -1638,6 +1905,7 @@ void PrivHelperServer::messageReceived(UnixSocket::Message&& message) noexcept {
 void PrivHelperServer::processAndSendResponse(UnixSocket::Message&& message) {
   Cursor cursor{&message.data};
   PrivHelperConn::PrivHelperPacket packet = PrivHelperConn::parsePacket(cursor);
+  const PrivHelperConn::MsgType requestType{packet.metadata.msg_type};
 
   UnixSocket::Message response;
   try {
@@ -1651,6 +1919,13 @@ void PrivHelperServer::processAndSendResponse(UnixSocket::Message&& message) {
     response = makeResponse();
     Appender appender(&response.data, 1024);
     PrivHelperConn::serializeErrorResponse(appender, ex);
+  }
+
+  // The client sends a one-way request without registering a transaction ID,
+  // so any reply -- including an error reply -- would be unmatched and raise an
+  // EDEN_BUG on the client.
+  if (PrivHelperConn::isOneWayRequest(requestType)) {
+    return;
   }
 
   // Put the version, transaction ID, and message type in the response.
@@ -1746,6 +2021,20 @@ UnixSocket::Message PrivHelperServer::processMessage(
       return processSetMemoryPriorityForProcess(cursor);
     case PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
       return processSetFuseReadAhead(cursor);
+    case PrivHelperConn::REQ_SET_RESTART_ARGS:
+#ifdef __APPLE__
+      return processSetRestartArgsMsg(cursor);
+#else
+      // Only macOS restarts edenfs; on Linux systemd owns the lifecycle, so
+      // accept and ignore.
+      return makeResponse();
+#endif
+    case PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:
+#ifdef __APPLE__
+      return processNotifyCleanShutdownMsg(cursor);
+#else
+      return makeResponse();
+#endif
     case PrivHelperConn::MSG_TYPE_NONE:
     case PrivHelperConn::RESP_ERROR:
       break;
@@ -1756,6 +2045,7 @@ UnixSocket::Message PrivHelperServer::processMessage(
 }
 
 void PrivHelperServer::eofReceived() noexcept {
+  peerExited_ = true;
   eventBase_->terminateLoopSoon();
 }
 

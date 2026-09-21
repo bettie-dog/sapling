@@ -26,23 +26,12 @@ EDENFS_TARGETS = {
     "//eden/fs/service:edenfs_privhelper": "/usr/local/libexec/eden/edenfs_privhelper",
 }
 
-MAC_PYTHON_PAR_SHIM = "//eden/fs:mac_python_par_shim_universal"
-
-# Mac replacements for targets that are also installed in Linux RPMs. Values
-# are (mac_src, mac_mode). If mac_mode is None, the normal TARGET_MODES entry
-# for the original target still applies.
-MAC_TARGET_OVERRIDES = {
-    "//eden/fs/cli/trace:trace_stream": ("//eden/fs:trace_stream_universal", None),
-    "//eden/fs/cli:edenfsctl": (MAC_PYTHON_PAR_SHIM, 0o0755),
-    "//eden/fs/cli_rs/edenfsctl:edenfsctl": ("//eden/fs:edenfsctl_universal", None),
-    "//eden/fs/config/facebook/config_manager_rs:edenfs_config_manager_rust": ("//eden/fs:edenfs_config_manager_rust_universal", None),
-    "//eden/fs/config/facebook:edenfs_config_manager": (MAC_PYTHON_PAR_SHIM, 0o0755),
-    "//eden/fs/facebook:eden-fb303-collector": ("//eden/fs:eden-fb303-collector_universal", None),
-    "//eden/fs/facebook:edenfs_restarter": (MAC_PYTHON_PAR_SHIM, 0o0755),
-    "//eden/fs/inodes/fscatalog:eden_fsck": ("//eden/fs:eden_fsck_universal", None),
-    "//eden/fs/monitor:edenfs_monitor": ("//eden/fs:edenfs_monitor_universal", None),
-    "//eden/fs/service:edenfs": ("//eden/fs:edenfs_universal", None),
-    "//eden/fs/service:edenfs_privhelper": ("//eden/fs:edenfs_privhelper_universal", None),
+# These background PAR entrypoints need signed, policy-visible native
+# executables on macOS. Their PAR payloads live beside them under architecture-
+# neutral names.
+MAC_PAR_LAUNCHERS = {
+    "//eden/fs/config/facebook:edenfs_config_manager": "//eden/fs:edenfs_config_manager",
+    "//eden/fs/facebook:edenfs_restarter": "//eden/fs:edenfs_restarter",
 }
 
 SYMLINKS = {
@@ -65,10 +54,15 @@ CONFIG_D_TARGETS = {
     "facebook/packaging/config.d/doctor.toml": "/etc/eden/config.d/doctor.toml",
 }
 
+DAEMON_ENVIRONMENT_CONFIG_PATH = "/etc/eden/config.d/10-daemon-environment.toml"
+LINUX_DAEMON_ENVIRONMENT_CONFIG = "facebook/packaging/config.d/10-daemon-environment.toml"
+MACOS_DAEMON_ENVIRONMENT_CONFIG = "facebook/packaging/daemon-environment-macos.toml"
+
 EDENFS_WINDOWS_DEPS = [
     "fbcode//eden/fs/cli:edenfsctl",
     "fbcode//eden/fs/cli/trace:trace_stream",
     "fbcode//eden/fs/cli_rs/edenfsctl:edenfsctl",
+    "fbcode//eden/fs/cli_rs/edenfsctl:edenfsctl[pdb]",
     "fbcode//eden/fs/config/facebook:edenfs_config_manager",
     "fbcode//eden/fs/config/facebook/config_manager_rs:edenfs_config_manager_rust",
     "fbcode//eden/fs/facebook:eden-fb303-collector",
@@ -92,22 +86,28 @@ DIRS = [
     "/etc/eden/config.d",
 ]
 
+# macOS has no "root" group (its gid 0 group is "wheel"), so rpm prints
+# "warning: group root does not exist - using wheel" for every file at install
+# time. Bake "wheel" into the mac RPM header instead; ownership is unchanged
+# since both groups map to gid 0 on macOS.
+RPM_GROUP = select({
+    "DEFAULT": None,
+    "ovr_config//os:macos": rpm.group.wheel,
+})
+
 SYSTEMD_STATIC_TARGETS = {
     "facebook/packaging/systemd/edenfs.slice": "/usr/lib/systemd/user/edenfs.slice",
     "facebook/packaging/systemd/edenfs@.service": "/usr/lib/systemd/user/edenfs@.service",
 }
 
 MAC_ONLY_TARGETS = {
-    "//eden/fs:eden_apfs_mount_helper_universal": ("/usr/local/libexec/eden/eden_apfs_mount_helper", 0o04755),
-    "//eden/fs:edenfs_config_manager_macos_arm64": ("/usr/local/libexec/eden/edenfs_config_manager.arm64", None),
-    "//eden/fs:edenfs_restarter_macos_arm64": ("/usr/local/libexec/eden/edenfs_restarter.arm64", None),
-    "//eden/fs:edenfsctl_real_macos_arm64": ("/usr/local/bin/edenfsctl.real.arm64", None),
+    "//eden/scm/exec/eden_apfs_mount_helper:eden_apfs_mount_helper": ("/usr/local/libexec/eden/eden_apfs_mount_helper", 0o04755),
 }
 
 def _rpm_install(src, dst, mode = None):
     if mode != None:
-        return rpm.install(src = src, dst = dst, mode = mode)
-    return rpm.install(src = src, dst = dst)
+        return rpm.install(src = src, dst = dst, group = RPM_GROUP, mode = mode)
+    return rpm.install(src = src, dst = dst, group = RPM_GROUP)
 
 def make_rpm_features():
     features = []
@@ -117,18 +117,27 @@ def make_rpm_features():
             dst = install_path,
             mode = TARGET_MODES.get(target),
         )
-        mac_override = MAC_TARGET_OVERRIDES.get(target)
-        if mac_override:
-            mac_src, mac_mode = mac_override
+        mac_launcher = MAC_PAR_LAUNCHERS.get(target)
+        if mac_launcher:
             features.append(
                 select({
                     "DEFAULT": default_feature,
                     "ovr_config//os:macos": _rpm_install(
-                        src = "fbcode" + mac_src,
+                        src = "fbcode" + mac_launcher,
                         dst = install_path,
-                        mode = mac_mode or TARGET_MODES.get(target),
+                        mode = 0o0755,
                     ),
-                })
+                }),
+            )
+            features.append(
+                select({
+                    "DEFAULT": None,
+                    "ovr_config//os:macos": _rpm_install(
+                        src = "fbcode" + target,
+                        dst = install_path + ".par",
+                        mode = 0o0755,
+                    ),
+                }),
             )
         else:
             features.append(default_feature)
@@ -137,10 +146,7 @@ def make_rpm_features():
     for dir in DIRS:
         features.append(rpm.ensure_dirs_exist(dir))
     for target, install_path in STATIC_TARGETS.items():
-        if target in TARGET_MODES:
-            features.append(rpm.install(src = target, dst = install_path, mode = TARGET_MODES.get(target)))
-        else:
-            features.append(rpm.install(src = target, dst = install_path))
+        features.append(_rpm_install(src = target, dst = install_path, mode = TARGET_MODES.get(target)))
     for target, install_path in SYSTEMD_STATIC_TARGETS.items():
         features.append(
             select({
@@ -150,19 +156,35 @@ def make_rpm_features():
             }),
         )
     for target, install_path in SCRIPTS_TARGETS.items():
-        features.append(rpm.install(src = target, dst = install_path, mode = 0o0755))
+        features.append(_rpm_install(src = target, dst = install_path, mode = 0o0755))
     for target, install_path in CONFIG_D_TARGETS.items():
-        features.append(rpm.install(src = target, dst = install_path, mode = 0o0755))
-
-    mac_features = []
+        features.append(_rpm_install(src = target, dst = install_path, mode = 0o0755))
+    features.append(
+        select({
+            "DEFAULT": None,
+            "ovr_config//os:linux": rpm.install(
+                src = LINUX_DAEMON_ENVIRONMENT_CONFIG,
+                dst = DAEMON_ENVIRONMENT_CONFIG_PATH,
+                mode = 0o0755,
+            ),
+            "ovr_config//os:macos": rpm.install(
+                src = MACOS_DAEMON_ENVIRONMENT_CONFIG,
+                dst = DAEMON_ENVIRONMENT_CONFIG_PATH,
+                group = rpm.group.wheel,
+                mode = 0o0755,
+            ),
+        }),
+    )
 
     for target, (install_path, mode) in MAC_ONLY_TARGETS.items():
-        mac_features.append(_rpm_install(src = "fbcode" + target, dst = install_path, mode = mode))
-    for mac_feature in mac_features:
         features.append(
             select({
                 "DEFAULT": None,
-                "ovr_config//os:macos": mac_feature,
+                "ovr_config//os:macos": _rpm_install(
+                    src = "fbcode" + target,
+                    dst = install_path,
+                    mode = mode,
+                ),
             }),
         )
     return features

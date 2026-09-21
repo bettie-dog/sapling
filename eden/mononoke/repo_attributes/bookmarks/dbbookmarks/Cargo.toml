@@ -13,12 +13,12 @@ path = "tests/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bookmarks = { version = "0.1.0", path = ".." }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_watchdog = { version = "0.1.0", path = "../../../common/futures_watchdog" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
@@ -40,4 +40,4 @@ mononoke_types-mocks = { version = "0.1.0", path = "../../../mononoke_types/mock
 quickcheck = "1.1"
 quickcheck_arbitrary_derive = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }

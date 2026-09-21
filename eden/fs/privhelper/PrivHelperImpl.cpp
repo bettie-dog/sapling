@@ -15,15 +15,16 @@
 #endif
 
 #include <folly/Exception.h>
-#include <folly/Expected.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/SocketAddress.h>
 #include <folly/Synchronized.h>
 #include <folly/futures/Future.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/logging/xlog.h>
+#include <folly/portability/Fcntl.h>
 #include <folly/portability/SysTypes.h>
 #include <folly/portability/Unistd.h>
 
@@ -32,6 +33,7 @@
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/common/utils/UserInfo.h"
+#include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperFlags.h"
@@ -61,36 +63,33 @@ namespace facebook::eden {
 namespace {
 
 /**
- * PrivHelperClientImpl contains the client-side logic (in the parent process)
- * for talking to the remote privileged process.
+ * The privhelper connection: the socket, the state guarding it, and every
+ * callback the UnixSocket and the EventBase hold a pointer to.
+ *
+ * Held by shared_ptr, and work posted to the EventBase captures a share.
+ * Nothing joins that work, so the session outlives the caller's PrivHelper
+ * whenever a task is still queued against it.
  */
-class PrivHelperClientImpl : public PrivHelper,
-                             private UnixSocket::ReceiveCallback,
-                             private UnixSocket::SendCallback,
-                             private EventBase::OnDestructionCallback {
+class PrivHelperClientSession
+    : public std::enable_shared_from_this<PrivHelperClientSession>,
+      private UnixSocket::ReceiveCallback,
+      private UnixSocket::SendCallback,
+      private EventBase::OnDestructionCallback {
  public:
-  PrivHelperClientImpl(File conn, std::optional<SpawnedProcess> proc)
-      : helperProc_(std::move(proc)),
-        state_{ThreadSafeData{
-            Status::NOT_STARTED,
+  explicit PrivHelperClientSession(File conn)
+      : state_{ThreadSafeData{
+            Status::NOT_ATTACHED,
             nullptr,
-            UnixSocket::makeUnique(nullptr, std::move(conn))}} {
-    pid_ = -1;
-    if (helperProc_.has_value()) {
-      pid_ = helperProc_->pid();
-    }
-    // If we need to get the pid from the server, we need to
-    // wait until the connection is started
-  }
-  ~PrivHelperClientImpl() override {
-    cleanup();
+            UnixSocket::makeUnique(nullptr, std::move(conn))}} {}
+
+  ~PrivHelperClientSession() override {
     XDCHECK_EQ(sendPending_, 0ul);
   }
 
-  void attachEventBase(EventBase* eventBase) override {
+  void attachEventBase(EventBase* eventBase) {
     {
       auto state = state_.wlock();
-      if (state->status != Status::NOT_STARTED) {
+      if (state->status != Status::NOT_ATTACHED) {
         throwf<std::runtime_error>(
             "PrivHelper::start() called in unexpected state {}",
             static_cast<uint32_t>(state->status));
@@ -103,9 +102,491 @@ class PrivHelperClientImpl : public PrivHelper,
     eventBase->runOnDestruction(*this);
   }
 
-  void detachEventBase() override {
+  void detachEventBase() {
     detachWithinEventBaseDestructor();
     cancel();
+  }
+
+  bool checkConnection() {
+    auto state = state_.rlock();
+    return state->status == Status::RUNNING && state->conn_;
+  }
+
+  /**
+   * Set the logger used for privhelper telemetry events. Must be called before
+   * attachEventBase(); read on the EventBase thread thereafter.
+   */
+  void setEdenFsEventsLogger(std::shared_ptr<EdenFsEventsLogger> logger) {
+    edenFsEventsLogger_ = std::move(logger);
+  }
+
+  /**
+   * Override the stall-report threshold. May only be called before requests
+   * are issued.
+   */
+  void setRequestStallThreshold(std::chrono::milliseconds threshold) {
+    requestStallThreshold_ = threshold;
+  }
+
+  int getRawClientFd() const {
+    auto state = state_.rlock();
+    return state->conn_ ? state->conn_->getRawFd() : -1;
+  }
+
+  std::shared_ptr<EdenFsEventsLogger> getEdenFsEventsLogger() const {
+    return edenFsEventsLogger_;
+  }
+
+  uint32_t getNextXid() {
+    return nextXid_.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  /**
+   * Close the socket to the privhelper server and fail outstanding requests.
+   *
+   * Returns false if the session was already shut down.
+   */
+  bool shutdown() {
+    EventBase* eventBase{nullptr};
+    {
+      auto state = state_.wlock();
+      if (state->status == Status::SHUT_DOWN) {
+        return false;
+      }
+      if (state->status == Status::RUNNING) {
+        eventBase = state->eventBase;
+        state->eventBase = nullptr;
+      }
+      state->status = Status::SHUT_DOWN;
+    }
+
+    // If the state was still RUNNING detach from the EventBase.
+    if (eventBase) {
+      eventBase->runImmediatelyOrRunInEventBaseThreadAndWait([this] {
+        {
+          auto state = state_.wlock();
+          state->conn_->clearReceiveCallback();
+          state->conn_->detachEventBase();
+        }
+        // Cancel stall watchdogs while still on the EventBase thread, since
+        // closeSocket() below destroys the pending request map from this
+        // thread.
+        cancelStallWatchdogs();
+        cancel();
+      });
+    }
+    // Make sure the socket is closed, and fail any outstanding requests.
+    // Closing the socket will signal the privhelper process to exit.
+    closeSocket(
+        folly::make_exception_wrapper<std::runtime_error>(
+            "privhelper client being destroyed"));
+    return true;
+  }
+
+  /**
+   * Send a request and wait for the response.
+   *
+   * A watchdog logs requests that stay pending longer than
+   * requestStallThreshold_. It is log-only: a stalled request is never
+   * failed, cancelled, or timed out.
+   */
+  Future<UnixSocket::Message> sendAndRecv(
+      uint32_t xid,
+      folly::StringPiece kind,
+      UnixSocket::Message&& msg) {
+    EventBase* eventBase;
+    {
+      auto state = state_.rlock();
+      if (state->status != Status::RUNNING) {
+        return folly::makeFuture<UnixSocket::Message>(std::runtime_error(
+            "cannot send new requests on closed privhelper connection"));
+      }
+      eventBase = state->eventBase;
+    }
+
+    // Note: We intentionally use EventBase::runInEventBaseThread() here rather
+    // than folly::via().
+    //
+    // folly::via() does not do what we want, as it causes chained futures to
+    // use the original executor rather than to execute inline.  In particular
+    // this causes problems during destruction if the EventBase in question has
+    // already been destroyed.
+    folly::Promise<UnixSocket::Message> promise;
+    auto future = promise.getFuture();
+    eventBase->runInEventBaseThread([self = shared_from_this(),
+                                     xid,
+                                     kind,
+                                     msg = std::move(msg),
+                                     promise = std::move(promise),
+                                     eventBase]() mutable {
+      // Double check that the connection is still open, and only hold the
+      // lock to look up the connection: send() can fail synchronously and
+      // invoke the error callbacks, which re-enter handleSocketError() and
+      // acquire state_ again, deadlocking this EventBase thread if the
+      // lock were still held.
+      //
+      // The status re-check also prevents arming a watchdog after shutdown()
+      // has run its one-and-only cancelStallWatchdogs() pass on this thread.
+      // conn_ can still be non-null at that point (detached but not yet
+      // closed), and closeSocket() could otherwise destroy the watchdog off
+      // the EventBase thread.
+      //
+      // Using the raw pointer after releasing the lock is safe: conn_ is
+      // only mutated on this EventBase thread, except in cleanup(), which
+      // first moves the status off RUNNING and then drains this EventBase.
+      // Any lambda like this one that was enqueued before the status
+      // change is ordered before cleanup()'s drain on this thread, so it
+      // runs while the socket is still alive; lambdas enqueued afterwards
+      // never pass the status check above.
+      UnixSocket* conn = nullptr;
+      {
+        auto state = self->state_.rlock();
+        if (state->status != Status::RUNNING || !state->conn_) {
+          promise.setException(
+              std::runtime_error(
+                  "cannot send new requests on closed privhelper connection"));
+          return;
+        }
+        conn = state->conn_.get();
+      }
+      // The watchdog captures a raw session pointer rather than a shared_ptr:
+      // it is owned by the session (via pendingRequests_) so it cannot outlive
+      // it, and a shared_ptr capture would form a reference cycle.
+      auto stallWatchdog = folly::AsyncTimeout::make(
+          *eventBase, [session = self.get(), xid]() noexcept {
+            session->requestStalled(xid);
+          });
+      stallWatchdog->scheduleTimeout(self->requestStallThreshold_);
+      self->pendingRequests_.emplace(
+          xid,
+          PendingRequest{
+              std::move(promise),
+              kind,
+              std::chrono::steady_clock::now(),
+              std::move(stallWatchdog)});
+      ++self->sendPending_;
+      conn->send(std::move(msg), self.get());
+    });
+    return future;
+  }
+
+  /**
+   * Send a request without waiting for a response.
+   *
+   * The message is only enqueued: there is no way to force the write out
+   * without aborting or racing UnixSocket's own queued writes, so it races the
+   * socket closing and may never reach the server.
+   */
+  void sendOneWay(UnixSocket::Message&& msg) {
+    EventBase* eventBase;
+    {
+      auto state = state_.rlock();
+      if (state->status != Status::RUNNING) {
+        return;
+      }
+      eventBase = state->eventBase;
+    }
+    if (!eventBase) {
+      return;
+    }
+
+    eventBase->runInEventBaseThread(
+        [self = shared_from_this(), msg = std::move(msg)]() mutable {
+          auto state = self->state_.wlock();
+          if (!state->conn_) {
+            return;
+          }
+          // The null send callback is load-bearing: this send can still be
+          // queued while closeSocket() holds state_'s write lock, and a
+          // callback would reacquire it via sendError(); folly::Synchronized
+          // is not recursive.
+          state->conn_->send(std::move(msg));
+        });
+  }
+
+ private:
+  struct PendingRequest {
+    folly::Promise<UnixSocket::Message> promise;
+    // Points at a string literal (static storage duration) passed to
+    // sendAndRecv; no copy needed.
+    folly::StringPiece kind;
+    std::chrono::steady_clock::time_point startTime;
+    // Cancels the stall watchdog when destroyed. A scheduled AsyncTimeout
+    // may only be destroyed on the EventBase thread; every detach path
+    // flips status off RUNNING and then cancels pending watchdogs there
+    // (cancelStallWatchdogs) before the map can be destroyed from another
+    // thread. sendAndRecv's EventBase-thread lambda re-checks status so no
+    // new watchdog can be armed after that cancel pass.
+    std::unique_ptr<folly::AsyncTimeout> stallWatchdog;
+    bool stalled{false};
+  };
+  using PendingRequestMap = std::unordered_map<uint32_t, PendingRequest>;
+  enum class Status : uint32_t {
+    /**
+     * Socket open, not on an EventBase: either never attached, or detached
+     * again when one was destroyed. The only state attachEventBase() accepts.
+     */
+    NOT_ATTACHED,
+    /** Socket open and attached. The only state that accepts new requests. */
+    RUNNING,
+    /**
+     * The socket went away and has been released: EOF, a send or receive
+     * error, or a local close. shutdown() has not run, so the process still
+     * needs reaping.
+     */
+    DISCONNECTED,
+    /** shutdown() has run: nothing left to release, and no process to reap. */
+    SHUT_DOWN,
+  };
+  struct ThreadSafeData {
+    Status status;
+    EventBase* eventBase;
+    UnixSocket::UniquePtr conn_;
+  };
+
+  // Runs on the EventBase thread when a request has been pending longer than
+  // requestStallThreshold_. Log-only: the request is left untouched.
+  void requestStalled(uint32_t xid) {
+    auto iter = pendingRequests_.find(xid);
+    if (iter == pendingRequests_.end()) {
+      return;
+    }
+    auto& request = iter->second;
+    request.stalled = true;
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - request.startTime);
+    XLOGF(
+        WARN,
+        "privhelper {} request (txid {}) still pending after {:.1f}s; "
+        "the privhelper may be wedged",
+        request.kind,
+        xid,
+        elapsed.count());
+    if (edenFsEventsLogger_) {
+      try {
+        edenFsEventsLogger_->logEvent(
+            PrivhelperRequestStall{request.kind.str(), elapsed.count()});
+      } catch (const std::exception& ex) {
+        XLOGF(
+            WARN,
+            "failed to log privhelper_request_stall event: {}",
+            ex.what());
+      }
+    }
+  }
+
+  void messageReceived(UnixSocket::Message&& message) noexcept override {
+    try {
+      processResponse(std::move(message));
+    } catch (const std::exception& ex) {
+      EDEN_BUG() << "unexpected error processing privhelper response: "
+                 << folly::exceptionStr(ex);
+    }
+  }
+
+  void processResponse(UnixSocket::Message&& message) {
+    Cursor cursor(&message.data);
+    PrivHelperConn::PrivHelperPacket packet =
+        PrivHelperConn::parsePacket(cursor);
+
+    auto iter = pendingRequests_.find(packet.metadata.transaction_id);
+    if (iter == pendingRequests_.end()) {
+      // This normally shouldn't happen unless there is a bug.
+      // We'll throw and our caller will turn this into an EDEN_BUG()
+      throwf<std::runtime_error>(
+          "received unexpected response from privhelper for unknown transaction ID {}",
+          packet.metadata.transaction_id);
+    }
+
+    auto request = std::move(iter->second);
+    pendingRequests_.erase(iter);
+    if (request.stalled) {
+      const auto elapsed = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - request.startTime);
+      XLOGF(
+          WARN,
+          "stalled privhelper {} request (txid {}) eventually completed "
+          "after {:.1f}s",
+          request.kind,
+          packet.metadata.transaction_id,
+          elapsed.count());
+    }
+    request.promise.setValue(std::move(message));
+  }
+
+  void eofReceived() noexcept override {
+    handleSocketError(
+        "eof",
+        folly::make_exception_wrapper<std::runtime_error>(
+            "privhelper process exited"));
+  }
+
+  void socketClosed() noexcept override {
+    handleSocketError(
+        "socket_closed",
+        folly::make_exception_wrapper<std::runtime_error>(
+            "privhelper client destroyed locally"));
+  }
+
+  void receiveError(const folly::exception_wrapper& ew) noexcept override {
+    // Fail all pending requests
+    handleSocketError(
+        "receive_error",
+        folly::make_exception_wrapper<std::runtime_error>(folly::to<string>(
+            "error reading from privhelper process: ",
+            folly::exceptionStr(ew))));
+  }
+
+  void sendSuccess() noexcept override {
+    --sendPending_;
+  }
+
+  void sendError(const folly::exception_wrapper& ew) noexcept override {
+    // Fail all pending requests
+    --sendPending_;
+    handleSocketError(
+        "send_error",
+        folly::make_exception_wrapper<std::runtime_error>(folly::to<string>(
+            "error sending to privhelper process: ", folly::exceptionStr(ew))));
+  }
+
+  void onEventBaseDestruction() noexcept override {
+    // This callback is run when the EventBase is destroyed.
+    // Detach from the EventBase.  We may be restarted later if
+    // attachEventBase() is called again later to attach us to a new EventBase.
+    detachWithinEventBaseDestructor();
+  }
+
+  void handleSocketError(
+      folly::StringPiece reason,
+      const folly::exception_wrapper& ew) {
+    // If we are RUNNING, move to the DISCONNECTED state and then close the
+    // socket and fail all pending requests.
+    //
+    // If we are in any other state just return early.
+    // This can occur if handleSocketError() is invoked multiple times (e.g.,
+    // for a send error and a receive error).  This can happen recursively since
+    // closing the socket will generally trigger any outstanding sends and
+    // receives to fail.
+    {
+      // Exit early if the state is not RUNNING.
+      // Whatever other function updated the state will have handled closing the
+      // socket and failing pending requests.
+      auto state = state_.wlock();
+      if (state->status != Status::RUNNING) {
+        return;
+      }
+      state->status = Status::DISCONNECTED;
+      state->eventBase = nullptr;
+    }
+    XLOG(ERR) << "lost connection to privhelper process (" << reason
+              << "): " << folly::exceptionStr(ew);
+    if (edenFsEventsLogger_) {
+      edenFsEventsLogger_->logEvent(PrivHelperExit{reason.str()});
+    }
+    closeSocket(ew);
+    // The EventBase is no longer in use; without this, destroying the
+    // client later fails OnDestructionCallback's must-be-canceled check.
+    cancel();
+  }
+
+  /**
+   * Tear down the connection and fail all pending requests.
+   *
+   * Safe to call from inside the socket's own callbacks:
+   * UnixSocket::destroy() defers its teardown until the callback stack
+   * unwinds.
+   */
+  void closeSocket(const folly::exception_wrapper& ew) {
+    PendingRequestMap pending;
+    pending.swap(pendingRequests_);
+    // Move the socket out of state_ and destroy it only after releasing the
+    // lock: if a receive callback is still registered (the EOF and error
+    // paths), destroying the socket synchronously invokes socketClosed(),
+    // which re-enters handleSocketError() and acquires state_ again.
+    // folly::SharedMutex is not reentrant, so destroying the socket while
+    // holding the write lock deadlocks the EventBase thread, silently
+    // hanging every future privhelper request.
+    UnixSocket::UniquePtr conn;
+    {
+      auto state = state_.wlock();
+      conn = std::move(state->conn_);
+    }
+    conn.reset();
+
+    for (auto& entry : pending) {
+      entry.second.promise.setException(ew);
+    }
+  }
+
+  // Separated out from detachEventBase() since it is not safe to cancel() an
+  // EventBase::OnDestructionCallback within the callback itself.
+  void detachWithinEventBaseDestructor() noexcept {
+    {
+      auto state = state_.wlock();
+      if (state->status != Status::RUNNING) {
+        return;
+      }
+      state->status = Status::NOT_ATTACHED;
+      state->eventBase = nullptr;
+      state->conn_->clearReceiveCallback();
+      state->conn_->detachEventBase();
+    }
+    cancelStallWatchdogs();
+  }
+
+  // Must run on the EventBase thread (or during EventBase destruction):
+  // a scheduled AsyncTimeout may only be cancelled there.
+  void cancelStallWatchdogs() noexcept {
+    for (auto& entry : pendingRequests_) {
+      entry.second.stallWatchdog.reset();
+    }
+  }
+
+  std::atomic<uint32_t> nextXid_{1};
+  folly::Synchronized<ThreadSafeData> state_;
+  // Must be set (via setEdenFsEventsLogger) before attachEventBase() is called.
+  // Read from EventBase thread thereafter; do not modify after attach.
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  // Pending requests are reported as stalled (log-only) after this long.
+  // May only be modified before requests are issued; read on the EventBase
+  // thread.
+  std::chrono::milliseconds requestStallThreshold_{std::chrono::minutes(1)};
+
+  // sendPending_, and pendingRequests_ are only accessed from the
+  // EventBase thread.
+  size_t sendPending_{0};
+  PendingRequestMap pendingRequests_;
+};
+
+/**
+ * PrivHelperClientImpl contains the client-side logic (in the parent process)
+ * for talking to the remote privileged process.
+ */
+class PrivHelperClientImpl : public PrivHelper {
+ public:
+  PrivHelperClientImpl(File conn, std::optional<SpawnedProcess> proc)
+      : helperProc_(std::move(proc)),
+        session_(std::make_shared<PrivHelperClientSession>(std::move(conn))) {
+    pid_ = -1;
+    if (helperProc_.has_value()) {
+      pid_ = helperProc_->pid();
+    }
+    // If we need to get the pid from the server, we need to
+    // wait until the connection is started
+  }
+  ~PrivHelperClientImpl() override {
+    if (session_->shutdown()) {
+      waitForHelperProcess();
+    }
+  }
+
+  void attachEventBase(EventBase* eventBase) override {
+    session_->attachEventBase(eventBase);
+  }
+
+  void detachEventBase() override {
+    session_->detachEventBase();
   }
 
   Future<File> fuseMount(
@@ -139,263 +620,49 @@ class PrivHelperClientImpl : public PrivHelper,
   Future<folly::Unit> setFuseReadAhead(
       StringPiece mountPath,
       uint32_t readAheadKb) override;
+  Future<Unit> setRestartArgs(const EdenFsRestartArgs& args) override;
+  void notifyCleanShutdown(StringPiece reason) noexcept override;
   void setEdenFsEventsLogger(
       std::shared_ptr<EdenFsEventsLogger> logger) override {
-    edenFsEventsLogger_ = std::move(logger);
+    session_->setEdenFsEventsLogger(std::move(logger));
+  }
+  void setRequestStallThresholdForTest(
+      std::chrono::milliseconds threshold) override {
+    session_->setRequestStallThreshold(threshold);
   }
   int stop() override;
   int getRawClientFd() const override {
-    auto state = state_.rlock();
-    return state->conn_->getRawFd();
+    return session_->getRawClientFd();
   }
-  bool checkConnection() override;
+  bool checkConnection() override {
+    return session_->checkConnection();
+  }
   int getPid() override;
 
  private:
-  using PendingRequestMap =
-      std::unordered_map<uint32_t, folly::Promise<UnixSocket::Message>>;
-  enum class Status : uint32_t {
-    NOT_STARTED,
-    RUNNING,
-    CLOSED,
-    WAITED,
-  };
-  struct ThreadSafeData {
-    Status status;
-    EventBase* eventBase;
-    UnixSocket::UniquePtr conn_;
-  };
-
   uint32_t getNextXid() {
-    return nextXid_.fetch_add(1, std::memory_order_acq_rel);
-  }
-  /**
-   * Close the socket to the privhelper server, and wait for it to exit.
-   *
-   * Returns the exit status of the privhelper process, or an errno value on
-   * error.
-   */
-  folly::Expected<ProcessStatus, int> cleanup() {
-    EventBase* eventBase{nullptr};
-    {
-      auto state = state_.wlock();
-      if (state->status == Status::WAITED) {
-        // We have already waited on the privhelper process.
-        return folly::makeUnexpected(ESRCH);
-      }
-      if (state->status == Status::RUNNING) {
-        eventBase = state->eventBase;
-        state->eventBase = nullptr;
-      }
-      state->status = Status::WAITED;
-    }
-
-    // If the state was still RUNNING detach from the EventBase.
-    if (eventBase) {
-      eventBase->runImmediatelyOrRunInEventBaseThreadAndWait([this] {
-        {
-          auto state = state_.wlock();
-          state->conn_->clearReceiveCallback();
-          state->conn_->detachEventBase();
-        }
-        cancel();
-      });
-    }
-    // Make sure the socket is closed, and fail any outstanding requests.
-    // Closing the socket will signal the privhelper process to exit.
-    closeSocket(std::runtime_error("privhelper client being destroyed"));
-
-    // Wait until the privhelper process exits.
-    if (helperProc_.has_value()) {
-      return folly::makeExpected<int>(helperProc_->wait());
-    } else {
-      // helperProc_ can be nullopt during the unit tests, where we aren't
-      // actually running the privhelper in a separate process.
-      return folly::makeExpected<int>(
-          ProcessStatus(ProcessStatus::State::Exited, 0));
-    }
+    return session_->getNextXid();
   }
 
-  /**
-   * Send a request and wait for the response.
-   */
   Future<UnixSocket::Message> sendAndRecv(
       uint32_t xid,
+      folly::StringPiece kind,
       UnixSocket::Message&& msg) {
-    EventBase* eventBase;
-    {
-      auto state = state_.rlock();
-      if (state->status != Status::RUNNING) {
-        return folly::makeFuture<UnixSocket::Message>(std::runtime_error(
-            "cannot send new requests on closed privhelper connection"));
-      }
-      eventBase = state->eventBase;
+    return session_->sendAndRecv(xid, kind, std::move(msg));
+  }
+
+  ProcessStatus waitForHelperProcess() {
+    if (helperProc_.has_value()) {
+      return helperProc_->wait();
     }
-
-    // Note: We intentionally use EventBase::runInEventBaseThread() here rather
-    // than folly::via().
-    //
-    // folly::via() does not do what we want, as it causes chained futures to
-    // use the original executor rather than to execute inline.  In particular
-    // this causes problems during destruction if the EventBase in question has
-    // already been destroyed.
-    folly::Promise<UnixSocket::Message> promise;
-    auto future = promise.getFuture();
-    eventBase->runInEventBaseThread([this,
-                                     xid,
-                                     msg = std::move(msg),
-                                     promise = std::move(promise)]() mutable {
-      // Double check that the connection is still open
-      {
-        auto state = state_.rlock();
-        if (!state->conn_) {
-          promise.setException(
-              std::runtime_error(
-                  "cannot send new requests on closed privhelper connection"));
-          return;
-        }
-      }
-      pendingRequests_.emplace(xid, std::move(promise));
-      ++sendPending_;
-      {
-        auto state = state_.wlock();
-        state->conn_->send(std::move(msg), this);
-      }
-    });
-    return future;
-  }
-
-  void messageReceived(UnixSocket::Message&& message) noexcept override {
-    try {
-      processResponse(std::move(message));
-    } catch (const std::exception& ex) {
-      EDEN_BUG() << "unexpected error processing privhelper response: "
-                 << folly::exceptionStr(ex);
-    }
-  }
-
-  void processResponse(UnixSocket::Message&& message) {
-    Cursor cursor(&message.data);
-    PrivHelperConn::PrivHelperPacket packet =
-        PrivHelperConn::parsePacket(cursor);
-
-    auto iter = pendingRequests_.find(packet.metadata.transaction_id);
-    if (iter == pendingRequests_.end()) {
-      // This normally shouldn't happen unless there is a bug.
-      // We'll throw and our caller will turn this into an EDEN_BUG()
-      throwf<std::runtime_error>(
-          "received unexpected response from privhelper for unknown transaction ID {}",
-          packet.metadata.transaction_id);
-    }
-
-    auto promise = std::move(iter->second);
-    pendingRequests_.erase(iter);
-    promise.setValue(std::move(message));
-  }
-
-  void eofReceived() noexcept override {
-    handleSocketError(std::runtime_error("privhelper process exited"));
-  }
-
-  void socketClosed() noexcept override {
-    handleSocketError(
-        std::runtime_error("privhelper client destroyed locally"));
-  }
-
-  void receiveError(const folly::exception_wrapper& ew) noexcept override {
-    // Fail all pending requests
-    handleSocketError(
-        std::runtime_error(
-            folly::to<string>(
-                "error reading from privhelper process: ",
-                folly::exceptionStr(ew))));
-  }
-
-  void sendSuccess() noexcept override {
-    --sendPending_;
-  }
-
-  void sendError(const folly::exception_wrapper& ew) noexcept override {
-    // Fail all pending requests
-    --sendPending_;
-    handleSocketError(
-        std::runtime_error(
-            folly::to<string>(
-                "error sending to privhelper process: ",
-                folly::exceptionStr(ew))));
-  }
-
-  void onEventBaseDestruction() noexcept override {
-    // This callback is run when the EventBase is destroyed.
-    // Detach from the EventBase.  We may be restarted later if
-    // attachEventBase() is called again later to attach us to a new EventBase.
-    detachWithinEventBaseDestructor();
-  }
-
-  void handleSocketError(const std::exception& ex) {
-    // If we are RUNNING, move to the CLOSED state and then close the socket and
-    // fail all pending requests.
-    //
-    // If we are in any other state just return early.
-    // This can occur if handleSocketError() is invoked multiple times (e.g.,
-    // for a send error and a receive error).  This can happen recursively since
-    // closing the socket will generally trigger any outstanding sends and
-    // receives to fail.
-    {
-      // Exit early if the state is not RUNNING.
-      // Whatever other function updated the state will have handled closing the
-      // socket and failing pending requests.
-      auto state = state_.wlock();
-      if (state->status != Status::RUNNING) {
-        return;
-      }
-      state->status = Status::CLOSED;
-      state->eventBase = nullptr;
-    }
-    closeSocket(ex);
-  }
-
-  void closeSocket(const std::exception& ex) {
-    PendingRequestMap pending;
-    pending.swap(pendingRequests_);
-    {
-      auto state = state_.wlock();
-      state->conn_.reset();
-    }
-    XDCHECK_EQ(sendPending_, 0ul);
-
-    for (auto& entry : pending) {
-      entry.second.setException(ex);
-    }
-  }
-
-  // Separated out from detachEventBase() since it is not safe to cancel() an
-  // EventBase::OnDestructionCallback within the callback itself.
-  void detachWithinEventBaseDestructor() noexcept {
-    {
-      auto state = state_.wlock();
-      if (state->status != Status::RUNNING) {
-        return;
-      }
-      state->status = Status::NOT_STARTED;
-      state->eventBase = nullptr;
-      state->conn_->clearReceiveCallback();
-      state->conn_->detachEventBase();
-    }
+    // helperProc_ can be nullopt during the unit tests, where we aren't
+    // actually running the privhelper in a separate process.
+    return ProcessStatus(ProcessStatus::State::Exited, 0);
   }
 
   std::optional<SpawnedProcess> helperProc_;
-  std::atomic<uint32_t> nextXid_{1};
-  folly::Synchronized<ThreadSafeData> state_;
   pid_t pid_;
-  // Must be set (via setEdenFsEventsLogger) before attachEventBase() is called.
-  // Read from EventBase thread thereafter; do not modify after attach.
-  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
-
-  // sendPending_, and pendingRequests_ are only accessed from the
-  // EventBase thread.
-  size_t sendPending_{0};
-  PendingRequestMap pendingRequests_;
+  const std::shared_ptr<PrivHelperClientSession> session_;
 };
 
 /**
@@ -446,10 +713,11 @@ Future<File> PrivHelperClientImpl::fuseMount(
   auto mountPathStr = mountPath.str();
   auto request =
       PrivHelperConn::serializeMountRequest(xid, mountPath, readOnly, vfsType);
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "fuse_mount", std::move(request))
       .thenValue(
           [mountPathStr = std::move(mountPathStr),
-           logger = edenFsEventsLogger_](UnixSocket::Message&& response)
+           logger = session_->getEdenFsEventsLogger()](
+              UnixSocket::Message&& response)
               -> folly::Future<UnixSocket::Message> {
             PrivHelperConn::parseEmptyResponse(
                 PrivHelperConn::REQ_MOUNT_FUSE, response);
@@ -475,10 +743,10 @@ Future<Unit> PrivHelperClientImpl::nfsMount(
   auto request =
       PrivHelperConn::serializeMountNfsRequest(xid, mountPath, options);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "nfs_mount", std::move(request))
       .thenValue(
           [mountPathStr = std::move(mountPathStr),
-           logger = edenFsEventsLogger_](
+           logger = session_->getEdenFsEventsLogger()](
               UnixSocket::Message&& response) mutable -> Future<Unit> {
             PrivHelperConn::parseEmptyResponse(
                 PrivHelperConn::REQ_MOUNT_NFS, response);
@@ -494,7 +762,7 @@ Future<Unit> PrivHelperClientImpl::fuseUnmount(
   auto request =
       PrivHelperConn::serializeUnmountRequest(xid, mountPath, options);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "fuse_unmount", std::move(request))
       .thenValue([](UnixSocket::Message&& response) mutable -> Future<Unit> {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_UNMOUNT_FUSE, response);
@@ -505,7 +773,7 @@ Future<Unit> PrivHelperClientImpl::fuseUnmount(
 Future<Unit> PrivHelperClientImpl::nfsUnmount(StringPiece mountPath) {
   auto xid = getNextXid();
   auto request = PrivHelperConn::serializeNfsUnmountRequest(xid, mountPath);
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "nfs_unmount", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_UNMOUNT_NFS, response);
@@ -519,7 +787,7 @@ Future<Unit> PrivHelperClientImpl::bindMount(
   auto request =
       PrivHelperConn::serializeBindMountRequest(xid, clientPath, mountPath);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "bind_mount", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_MOUNT_BIND, response);
@@ -531,7 +799,7 @@ folly::Future<folly::Unit> PrivHelperClientImpl::bindUnMount(
   auto xid = getNextXid();
   auto request = PrivHelperConn::serializeBindUnMountRequest(xid, mountPath);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "bind_unmount", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_UNMOUNT_BIND, response);
@@ -543,7 +811,7 @@ Future<Unit> PrivHelperClientImpl::takeoverShutdown(StringPiece mountPath) {
   auto request =
       PrivHelperConn::serializeTakeoverShutdownRequest(xid, mountPath);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "takeover_shutdown", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_TAKEOVER_SHUTDOWN, response);
@@ -558,14 +826,14 @@ Future<Unit> PrivHelperClientImpl::takeoverStartup(
   auto request = PrivHelperConn::serializeTakeoverStartupRequest(
       xid, mountPath, bindMounts);
 
-  return sendAndRecv(xid, std::move(request))
-      .thenValue(
-          [mountPathStr = std::move(mountPathStr),
-           logger = edenFsEventsLogger_](UnixSocket::Message&& response) {
-            PrivHelperConn::parseEmptyResponse(
-                PrivHelperConn::REQ_TAKEOVER_STARTUP, response);
-            logSanityCheckResult(logger, response, mountPathStr);
-          });
+  return sendAndRecv(xid, "takeover_startup", std::move(request))
+      .thenValue([mountPathStr = std::move(mountPathStr),
+                  logger = session_->getEdenFsEventsLogger()](
+                     UnixSocket::Message&& response) {
+        PrivHelperConn::parseEmptyResponse(
+            PrivHelperConn::REQ_TAKEOVER_STARTUP, response);
+        logSanityCheckResult(logger, response, mountPathStr);
+      });
 }
 
 Future<Unit> PrivHelperClientImpl::setLogFile(folly::File logFile) {
@@ -573,7 +841,7 @@ Future<Unit> PrivHelperClientImpl::setLogFile(folly::File logFile) {
   auto request =
       PrivHelperConn::serializeSetLogFileRequest(xid, std::move(logFile));
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "set_log_file", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_SET_LOG_FILE, response);
@@ -584,7 +852,7 @@ Future<pid_t> PrivHelperClientImpl::getServerPid() {
   auto xid = getNextXid();
   auto request = PrivHelperConn::serializeGetPidRequest(xid);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "get_pid", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         return PrivHelperConn::parseGetPidResponse(response);
       });
@@ -595,7 +863,7 @@ Future<NamespaceInfo> PrivHelperClientImpl::getNamespaceInfo(pid_t daemonPid) {
   auto request =
       PrivHelperConn::serializeGetNamespaceInfoRequest(xid, daemonPid);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "get_namespace_info", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         return PrivHelperConn::parseGetNamespaceInfoResponse(response);
       });
@@ -610,7 +878,7 @@ Future<pid_t> PrivHelperClientImpl::startFam(
   auto request = PrivHelperConn::serializeStartFamRequest(
       xid, paths, tmpOutputPath, specifiedOutputPath, shouldUpload);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "start_fam", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         return PrivHelperConn::parseStartFamResponse(response);
       });
@@ -620,7 +888,7 @@ Future<StopFileAccessMonitorResponse> PrivHelperClientImpl::stopFam() {
   auto xid = getNextXid();
   auto request = PrivHelperConn::serializeStopFamRequest(xid);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "stop_fam", std::move(request))
       .thenValue([&](UnixSocket::Message&& response) {
         StopFileAccessMonitorResponse stopResponse{};
         PrivHelperConn::parseStopFamResponse(
@@ -639,7 +907,7 @@ Future<Unit> PrivHelperClientImpl::setMemoryPriorityForProcess(
   auto request = PrivHelperConn::serializeSetMemoryPriorityForProcessRequest(
       xid, pid, priority);
 
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "set_memory_priority", std::move(request))
       .thenValue([pid, priority](UnixSocket::Message&& response) {
         try {
           PrivHelperConn::parseEmptyResponse(
@@ -666,29 +934,46 @@ Future<Unit> PrivHelperClientImpl::setFuseReadAhead(
   auto xid = getNextXid();
   auto request = PrivHelperConn::serializeSetFuseReadAheadRequest(
       xid, mountPath, readAheadKb);
-  return sendAndRecv(xid, std::move(request))
+  return sendAndRecv(xid, "set_fuse_read_ahead", std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         PrivHelperConn::parseEmptyResponse(
             PrivHelperConn::REQ_SET_FUSE_READ_AHEAD, response);
       });
 }
 
+Future<Unit> PrivHelperClientImpl::setRestartArgs(
+    const EdenFsRestartArgs& args) {
+  return folly::makeFutureWith([&]() -> Future<Unit> {
+    auto xid = getNextXid();
+    auto request = PrivHelperConn::serializeSetRestartArgsRequest(xid, args);
+
+    return sendAndRecv(xid, "set_restart_args", std::move(request))
+        .thenValue([](UnixSocket::Message&& response) {
+          PrivHelperConn::parseEmptyResponse(
+              PrivHelperConn::REQ_SET_RESTART_ARGS, response);
+        });
+  });
+}
+
+void PrivHelperClientImpl::notifyCleanShutdown(StringPiece reason) noexcept {
+  // Best effort: this runs on the shutdown path, where the message races the
+  // EOF and the server may never see it.
+  session_->sendOneWay(
+      PrivHelperConn::serializeNotifyCleanShutdownRequest(
+          getNextXid(), reason));
+}
+
 int PrivHelperClientImpl::stop() {
-  const auto result = cleanup();
-  if (result.hasError()) {
+  if (!session_->shutdown()) {
+    // Already torn down, so there is no process left to wait for.
     folly::throwSystemErrorExplicit(
-        result.error(), "error shutting down privhelper process");
+        ESRCH, "error shutting down privhelper process");
   }
-  auto status = result.value();
+  const auto status = waitForHelperProcess();
   if (status.killSignal() != 0) {
     return -status.killSignal();
   }
   return status.exitStatus();
-}
-
-bool PrivHelperClientImpl::checkConnection() {
-  auto state = state_.rlock();
-  return state->status == Status::RUNNING && state->conn_;
 }
 
 int PrivHelperClientImpl::getPid() {
@@ -705,6 +990,34 @@ int PrivHelperClientImpl::getPid() {
 }
 
 } // unnamed namespace
+
+bool tccDisclaimKillswitchPresent(const char* path) {
+  return access(path, F_OK) == 0;
+}
+
+#ifdef __APPLE__
+// csops(2) lives in <sys/codesign.h>, which is not in the public SDK; the
+// syscall wrapper is exported by libSystem. Constants from xnu
+// bsd/sys/codesign.h.
+extern "C" int csops(pid_t, unsigned int, void*, size_t);
+constexpr unsigned int kCsOpsTeamId = 14; // CS_OPS_TEAMID
+
+std::string selfCodeSigningTeamId() {
+  // The reply is an 8-byte header (type word, big-endian length) followed by
+  // the NUL-terminated team identifier. The kernel fails with EINVAL when the
+  // signature is not valid, ENOENT when there is no team (ad-hoc/unsigned),
+  // and ERANGE instead of truncating, so a zeroed buffer is always
+  // NUL-terminated.
+  char buf[8 + 64] = {};
+  if (csops(getpid(), kCsOpsTeamId, buf, sizeof(buf)) != 0) {
+    if (errno != ENOENT && errno != EINVAL) {
+      XLOGF(WARN, "csops(CS_OPS_TEAMID) failed: {}", folly::errnoStr(errno));
+    }
+    return "none";
+  }
+  return std::string(buf + 8);
+}
+#endif
 
 unique_ptr<PrivHelper>
 startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
@@ -729,6 +1042,12 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
         throw std::runtime_error("Too few arguments");
       }
       auto fdNum = folly::to<int>(argv[i + 1]);
+      // This descriptor crossed an exec, so it cannot have arrived
+      // close-on-exec. Without FD_CLOEXEC it leaks into every process EdenFS
+      // spawns, and the privhelper then sees no EOF when EdenFS dies.
+      folly::checkUnixError(
+          fcntl(fdNum, F_SETFD, FD_CLOEXEC),
+          "failed to set FD_CLOEXEC on the privhelper client descriptor");
       return make_unique<PrivHelperClientImpl>(
           folly::File(fdNum, true), std::nullopt);
     }
@@ -742,6 +1061,43 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
   }
 
   SpawnedProcess::Options opts;
+
+#ifdef __APPLE__
+  if (tccDisclaimKillswitchPresent()) {
+    XLOGF(
+        INFO,
+        "not disclaiming TCC responsibility for the privhelper: killswitch "
+        "file {} is present",
+        kTccDisclaimKillswitchPath);
+  } else if (auto team = selfCodeSigningTeamId(); team != kTccDisclaimTeamId) {
+    // csops(2) only inspects running processes, so this checks edenfs itself,
+    // which ships in the same package as the privhelper.
+    //
+    // TODO: parse the config prior to starting the privhelper so that the
+    // privhelper spawn can honor dynamic config values
+    // (core:disclaim-tcc-team-id here, and the killswitch file could then
+    // become core:disclaim-tcc-responsibility). Until then the privhelper
+    // uses the compiled default.
+    //
+    // A real certificate whose team differs (development cert, or a rotated
+    // release team) silently loses the disclaim, so that is a WARN; "none" is
+    // an ad-hoc buck build, which is expected.
+    const auto message = fmt::format(
+        "not disclaiming TCC responsibility for the privhelper: code signature "
+        "team {}, not the fleet team {}",
+        team,
+        kTccDisclaimTeamId);
+    if (team == "none") {
+      XLOG(INFO) << message;
+    } else {
+      XLOG(WARN) << message;
+    }
+  } else {
+    // Make the privhelper its own TCC responsible process so that TCC grants
+    // keyed to its code signature apply regardless of what launched EdenFS.
+    opts.disclaimTccResponsibility();
+  }
+#endif
 
   // If EdenFS is running as setuid-root, it needs to be cautious about the
   // privhelper process that it's about start. Note: from a standard release

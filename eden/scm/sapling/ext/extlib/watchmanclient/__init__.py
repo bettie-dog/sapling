@@ -106,7 +106,7 @@ class client:
         if "eden" not in repo.requirements:
             try:
                 self._approx_total_file_count = len(repo.dirstate._map)
-            except:
+            except Exception:
                 # Can error in cases such as dotgit mode - ignore.
                 pass
 
@@ -546,6 +546,8 @@ def getcanonicalpath(name, use_ctypes=False):
 
     # Match the old code behavior, not sure if necessary or correct.
     if os.name == "nt":
-        canonical = canonical[4:].replace("\\", "/")
+        if canonical.startswith("\\\\?\\"):
+            canonical = canonical[4:]
+        canonical = canonical.replace("\\", "/")
 
     return canonical

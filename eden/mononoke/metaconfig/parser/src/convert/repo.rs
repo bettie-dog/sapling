@@ -89,6 +89,7 @@ use metaconfig_types::WalkerJobType;
 use metaconfig_types::XRepoSyncSourceConfig;
 use metaconfig_types::XRepoSyncSourceConfigMapping;
 use metaconfig_types::ZelosConfig;
+use metaconfig_types::parse_bare_group_name;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::NonRootMPath;
@@ -1409,19 +1410,13 @@ fn parse_acl_manifest_mode(s: Option<&str>) -> Result<AclManifestMode> {
     }
 }
 
-/// Merge the legacy `path_acls` map and the new `path_restriction_metadata` map
-/// into a single typed map. The new field is authoritative: a legacy `path_acls`
-/// entry is folded in only when its path is absent from the new map. A path
-/// present in both with a *different* `repo_region_acl` fails config load
-/// (fail-closed) -- an intentional ACL change removes the legacy entry, leaving
-/// no overlap. A matching ACL lets the new entry win, keeping its explicit
-/// permission-request group.
-/// TODO(T277178795): delete this after deprecating path_acls field
-fn merge_path_restriction_metadata(
-    path_acls: BTreeMap<String, String>,
+/// Convert the raw per-path restriction metadata into its typed form. Every
+/// failure is fail-closed: a malformed path or identity aborts config load
+/// rather than silently dropping a restriction.
+fn convert_path_restriction_metadata(
     path_restriction_metadata: Option<BTreeMap<String, RawPathRestrictionMetadata>>,
 ) -> Result<HashMap<NonRootMPath, PathRestrictionMetadata>> {
-    let mut merged = path_restriction_metadata
+    path_restriction_metadata
         .unwrap_or_default()
         .into_iter()
         .map(|(path, raw)| {
@@ -1437,46 +1432,23 @@ fn merge_path_restriction_metadata(
                     })
                 })
                 .transpose()?;
+            let rollout_allowlist_group = raw
+                .rollout_allowlist_group
+                .as_deref()
+                .map(parse_bare_group_name)
+                .transpose()
+                .with_context(|| format!("Invalid rollout_allowlist_group for {path}"))?;
             Ok((
                 non_root_path,
                 PathRestrictionMetadata {
                     repo_region_acl,
                     permission_request_group,
+                    rollout_allowlist_group,
                     read_only: raw.read_only.unwrap_or(false),
                 },
             ))
         })
-        .collect::<Result<HashMap<NonRootMPath, PathRestrictionMetadata>>>()?;
-
-    for (path, acl) in path_acls {
-        let non_root_path = NonRootMPath::new(path.as_bytes())
-            .with_context(|| format!("Invalid path for restricted path config: {path}"))?;
-        let legacy_acl = MononokeIdentity::from_str(&acl)
-            .with_context(|| format!("Failed to parse MononokeIdentity for {path}"))?;
-        match merged.get(&non_root_path) {
-            Some(metadata) => {
-                if metadata.repo_region_acl != legacy_acl {
-                    bail!(
-                        "Divergent repo_region_acl for restricted path {path}: path_acls has `{}` but path_restriction_metadata has `{}`. Remove the path_acls entry to change the ACL.",
-                        legacy_acl,
-                        metadata.repo_region_acl
-                    );
-                }
-            }
-            None => {
-                merged.insert(
-                    non_root_path,
-                    PathRestrictionMetadata {
-                        repo_region_acl: legacy_acl,
-                        permission_request_group: None,
-                        read_only: false,
-                    },
-                );
-            }
-        }
-    }
-
-    Ok(merged)
+        .collect()
 }
 
 impl Convert for RawRestrictedPathsConfig {
@@ -1484,7 +1456,7 @@ impl Convert for RawRestrictedPathsConfig {
 
     fn convert(self) -> Result<Self::Output> {
         let path_restriction_metadata =
-            merge_path_restriction_metadata(self.path_acls, self.path_restriction_metadata)?;
+            convert_path_restriction_metadata(self.path_restriction_metadata)?;
 
         let manifest_id_store_config =
             convert_manifest_id_store_config(self.manifest_id_store_config.unwrap_or_default())?;
@@ -1498,9 +1470,6 @@ impl Convert for RawRestrictedPathsConfig {
 
         // tooling_allowlist_group is used directly as a group name for membership checking
         let tooling_allowlist_group = self.tooling_allowlist_acl;
-
-        // rollout_allowlist_group is used for tooling allowed during rollout
-        let rollout_allowlist_group = self.rollout_allowlist_acl;
 
         // admin_bypass_group is an optional group identity used for membership
         // checking when bypassing Path ACL enforcement.
@@ -1542,6 +1511,7 @@ impl Convert for RawRestrictedPathsConfig {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
+                    is_agent: raw.is_agent,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1551,7 +1521,6 @@ impl Convert for RawRestrictedPathsConfig {
             manifest_id_store_config,
             soft_path_acls,
             tooling_allowlist_group,
-            rollout_allowlist_group,
             admin_bypass_group,
             acl_file_name: self
                 .acl_file_name
@@ -1559,6 +1528,7 @@ impl Convert for RawRestrictedPathsConfig {
             enforcement_condition_sets,
             enforcement_enabled: self.enforcement_enabled.unwrap_or(false),
             acl_manifest_mode: parse_acl_manifest_mode(self.acl_manifest_mode.as_deref())?,
+            denial_message: self.denial_message,
         })
     }
 }
@@ -1719,10 +1689,7 @@ mod tests {
     }
 
     fn empty_raw_restricted_paths_config() -> RawRestrictedPathsConfig {
-        RawRestrictedPathsConfig {
-            path_acls: Default::default(),
-            ..Default::default()
-        }
+        RawRestrictedPathsConfig::default()
     }
 
     /// What it tests: refresh intervals and lookback cannot disable safety throttles.
@@ -1832,6 +1799,45 @@ mod tests {
     }
 
     #[mononoke::test]
+    fn test_parse_is_agent_passthrough() {
+        let raw_sets = vec![
+            RawEnforcementConditionSet {
+                is_agent: Some(true),
+                ..Default::default()
+            },
+            RawEnforcementConditionSet {
+                is_agent: Some(false),
+                ..Default::default()
+            },
+            RawEnforcementConditionSet {
+                is_agent: None,
+                ..Default::default()
+            },
+        ];
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_condition_sets = Some(raw_sets);
+        let cfg: RestrictedPathsConfig = raw.convert().unwrap();
+        assert_eq!(cfg.enforcement_condition_sets.len(), 3);
+        assert_eq!(cfg.enforcement_condition_sets[0].is_agent, Some(true));
+        assert_eq!(cfg.enforcement_condition_sets[1].is_agent, Some(false));
+        assert_eq!(cfg.enforcement_condition_sets[2].is_agent, None);
+    }
+
+    #[mononoke::test]
+    fn test_parse_denial_message_passthrough() {
+        let cfg: RestrictedPathsConfig = empty_raw_restricted_paths_config().convert().unwrap();
+        assert_eq!(cfg.denial_message, None);
+
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.denial_message = Some("see https://fburl.com/example".to_string());
+        let cfg: RestrictedPathsConfig = raw.convert().unwrap();
+        assert_eq!(
+            cfg.denial_message.as_deref(),
+            Some("see https://fburl.com/example")
+        );
+    }
+
+    #[mononoke::test]
     fn test_parse_client_identity_regexes_invalid_value_errors_with_value_in_message() {
         let raw_set = RawEnforcementConditionSet {
             client_identity_regexes: Some(vec!["[".to_string()]),
@@ -1849,55 +1855,6 @@ mod tests {
         );
     }
 
-    /// What it tests: a legacy `path_acls` entry with no `path_restriction_metadata`.
-    /// Expected: it is folded into metadata with no explicit request group and
-    /// `read_only = false`.
-    #[mononoke::test]
-    fn test_merge_path_acls_fallback_defaults() {
-        let mut raw = empty_raw_restricted_paths_config();
-        raw.path_acls = [("foo/bar".to_string(), "REPO_REGION:acl1".to_string())]
-            .into_iter()
-            .collect();
-
-        let cfg = raw.convert().unwrap();
-
-        let path = NonRootMPath::new("foo/bar").unwrap();
-        let md = cfg.path_restriction_metadata.get(&path).expect("entry");
-        assert_eq!(md.repo_region_acl.to_string(), "REPO_REGION:acl1");
-        assert_eq!(md.permission_request_group, None);
-        assert!(!md.read_only, "legacy path_acls entries are not read-only");
-    }
-
-    /// What it tests: a malformed `repo_region_acl` string in `path_acls`.
-    /// Expected: config load fails (fail-closed), not a silent drop.
-    #[mononoke::test]
-    fn test_merge_malformed_repo_region_acl_fails_closed_legacy() {
-        let mut raw = empty_raw_restricted_paths_config();
-        raw.path_acls = [("foo".to_string(), "not-an-identity".to_string())]
-            .into_iter()
-            .collect();
-
-        let err = raw.convert().unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("MononokeIdentity") && msg.contains("foo"),
-            "expected parse error, got: {msg}"
-        );
-    }
-
-    /// What it tests: a malformed path key in `path_acls`.
-    /// Expected: config load fails (fail-closed).
-    #[mononoke::test]
-    fn test_merge_malformed_path_key_fails_closed() {
-        let mut raw = empty_raw_restricted_paths_config();
-        raw.path_acls = [("".to_string(), "REPO_REGION:acl1".to_string())]
-            .into_iter()
-            .collect();
-
-        let err = raw.convert().unwrap_err();
-        assert!(format!("{err:#}").contains("Invalid path"));
-    }
-
     fn raw_metadata(
         repo_region_acl: &str,
         permission_request_group: Option<&str>,
@@ -1912,10 +1869,10 @@ mod tests {
     }
 
     /// What it tests: a `path_restriction_metadata` entry with explicit request
-    /// group and `read_only = true`, no legacy `path_acls`.
+    /// group and `read_only = true`.
     /// Expected: all explicit fields are preserved.
     #[mononoke::test]
-    fn test_merge_metadata_only_explicit_fields() {
+    fn test_path_restriction_metadata_explicit_fields() {
         let mut raw = empty_raw_restricted_paths_config();
         raw.path_restriction_metadata = Some(
             [(
@@ -1938,18 +1895,17 @@ mod tests {
         assert!(md.read_only, "explicit read_only=true is honored");
     }
 
-    /// What it tests: a path present in BOTH maps with the SAME repo_region_acl.
-    /// Expected: the new field wins, keeping its explicit request group.
+    /// What it tests: a `path_restriction_metadata` entry with only the required
+    /// `repo_region_acl` set.
+    /// Expected: the optional fields take their documented defaults — no request
+    /// group, and not read-only.
     #[mononoke::test]
-    fn test_merge_overlap_matching_acl_new_field_wins() {
+    fn test_path_restriction_metadata_optional_field_defaults() {
         let mut raw = empty_raw_restricted_paths_config();
-        raw.path_acls = [("foo".to_string(), "REPO_REGION:acl1".to_string())]
-            .into_iter()
-            .collect();
         raw.path_restriction_metadata = Some(
             [(
-                "foo".to_string(),
-                raw_metadata("REPO_REGION:acl1", Some("GROUP:reviewers"), Some(true)),
+                "foo/bar".to_string(),
+                raw_metadata("REPO_REGION:acl1", None, None),
             )]
             .into_iter()
             .collect(),
@@ -1957,28 +1913,97 @@ mod tests {
 
         let cfg = raw.convert().unwrap();
 
-        let path = NonRootMPath::new("foo").unwrap();
-        let md = cfg.path_restriction_metadata.get(&path).unwrap();
+        let path = NonRootMPath::new("foo/bar").unwrap();
+        let md = cfg.path_restriction_metadata.get(&path).expect("entry");
+        assert_eq!(md.repo_region_acl.to_string(), "REPO_REGION:acl1");
+        assert_eq!(md.permission_request_group, None);
         assert_eq!(
-            md.permission_request_group.as_ref().map(|i| i.to_string()),
-            Some("GROUP:reviewers".to_string()),
-            "new field wins on matching ACL"
+            md.rollout_allowlist_group, None,
+            "no rollout allowlist when the field is unset"
         );
-        assert!(md.read_only);
+        assert!(!md.read_only, "read_only defaults to false when unset");
     }
 
-    /// What it tests: a path present in BOTH maps with DIFFERENT repo_region_acl.
-    /// Expected: config load fails closed with a contextual error.
-    #[mononoke::test]
-    fn test_merge_overlap_divergent_acl_fails_closed() {
+    fn raw_metadata_with_rollout_group(
+        rollout_allowlist_group: &str,
+    ) -> RawPathRestrictionMetadata {
+        RawPathRestrictionMetadata {
+            repo_region_acl: "REPO_REGION:acl1".to_string(),
+            rollout_allowlist_group: Some(rollout_allowlist_group.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn convert_with_rollout_group(rollout_allowlist_group: &str) -> Result<RestrictedPathsConfig> {
         let mut raw = empty_raw_restricted_paths_config();
-        raw.path_acls = [("foo".to_string(), "REPO_REGION:legacy".to_string())]
-            .into_iter()
-            .collect();
         raw.path_restriction_metadata = Some(
             [(
                 "foo".to_string(),
-                raw_metadata("REPO_REGION:new", None, None),
+                raw_metadata_with_rollout_group(rollout_allowlist_group),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        raw.convert()
+    }
+
+    /// What it tests: a bare `rollout_allowlist_group` name is prefixed to a
+    /// `GROUP:` identity, matching how `admin_bypass_group` is spelled in config.
+    /// Expected: `titan_rollout` becomes `GROUP:titan_rollout`.
+    #[mononoke::test]
+    fn test_rollout_allowlist_group_is_prefixed() {
+        let cfg = convert_with_rollout_group("titan_rollout").unwrap();
+
+        let path = NonRootMPath::new("foo").unwrap();
+        let md = cfg.path_restriction_metadata.get(&path).expect("entry");
+        assert_eq!(
+            md.rollout_allowlist_group.as_ref().map(|i| i.to_string()),
+            Some("GROUP:titan_rollout".to_string()),
+        );
+    }
+
+    /// What it tests: malformed `rollout_allowlist_group` values.
+    /// Expected: every one fails config load rather than producing an identity
+    /// that silently never matches, which would leave a tent owner believing an
+    /// allowlist is active when it is not.
+    #[mononoke::test]
+    fn test_malformed_rollout_allowlist_group_fails_closed() {
+        // (value, fragment the error must mention)
+        let rejected = [
+            ("", "must not be empty"),
+            ("   ", "whitespace"),
+            (" titan_rollout", "whitespace"),
+            ("titan_rollout ", "whitespace"),
+            ("GROUP:titan_rollout", "omit the `GROUP:` prefix"),
+            ("USER:alice", "omit the `GROUP:` prefix"),
+        ];
+
+        for (value, expected_fragment) in rejected {
+            let err = convert_with_rollout_group(value)
+                .expect_err(&format!("`{value}` should be rejected"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(expected_fragment),
+                "error for `{value}` should mention {expected_fragment:?}, got: {msg}"
+            );
+            assert!(
+                msg.contains("foo"),
+                "error for `{value}` should name the offending path, got: {msg}"
+            );
+        }
+    }
+
+    /// What it tests: a malformed `repo_region_acl` string in
+    /// `path_restriction_metadata`.
+    /// Expected: config load fails (fail-closed), not a silent drop that would
+    /// leave the path unrestricted.
+    #[mononoke::test]
+    fn test_malformed_repo_region_acl_fails_closed() {
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.path_restriction_metadata = Some(
+            [(
+                "foo".to_string(),
+                raw_metadata("not-an-identity", None, None),
             )]
             .into_iter()
             .collect(),
@@ -1987,9 +2012,24 @@ mod tests {
         let err = raw.convert().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Divergent repo_region_acl") && msg.contains("foo"),
-            "expected divergent-acl fail-closed error, got: {msg}"
+            msg.contains("repo_region_acl") && msg.contains("foo"),
+            "expected parse error naming the field and path, got: {msg}"
         );
+    }
+
+    /// What it tests: a malformed path key in `path_restriction_metadata`.
+    /// Expected: config load fails (fail-closed).
+    #[mononoke::test]
+    fn test_malformed_path_key_fails_closed() {
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.path_restriction_metadata = Some(
+            [("".to_string(), raw_metadata("REPO_REGION:acl1", None, None))]
+                .into_iter()
+                .collect(),
+        );
+
+        let err = raw.convert().unwrap_err();
+        assert!(format!("{err:#}").contains("Invalid path"));
     }
 
     /// What it tests: a malformed `repo_region_acl` string in new-field metadata.

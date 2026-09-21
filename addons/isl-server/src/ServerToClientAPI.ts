@@ -314,6 +314,7 @@ export default class ServerToClientAPI {
             platformName: this.platform.platformName,
             version: this.connection.version,
             logFilePath: this.connection.logFileLocation ?? '(no log file, logging to stdout)',
+            isBasecamp: this.platform.isBasecamp ?? false,
           },
         });
         break;
@@ -668,12 +669,22 @@ export default class ServerToClientAPI {
         repo.fetchUncommittedChanges();
         repo.fetchSubmoduleMap();
         repo.checkForMergeConflicts();
+        repo.refreshWorktreeInfo();
         repo.fullRepoBranchModule?.pullSubscribedFullRepoBranches();
-        repo.codeReviewProvider?.triggerDiffSummariesFetch(repo.getAllDiffIds());
+        // Forced: an explicit refresh is the gesture for "CI moved but the diff did not", and
+        // that is exactly the case a cached count answers wrongly.
+        repo.codeReviewProvider?.triggerDiffSummariesFetch(repo.getAllDiffIds(), /* force */ true);
         repo.initialConnectionContext.tracker.track('DiffFetchSource', {
           extras: {source: 'manual_refresh'},
         });
         generatedFilesDetector.clear(); // allow generated files to be rechecked
+        break;
+      }
+      case 'refreshWorktreeInfo': {
+        // A sibling worktree's checkout happens outside this process's file
+        // watcher (each worktree has its own `.sl` dir), so it needs an
+        // explicit poke rather than relying on `onChange('everything')`.
+        repo.refreshWorktreeInfo();
         break;
       }
       case 'pageVisibility': {
@@ -752,7 +763,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingSignificantLinesOfCode',
                 requestId: data.requestId,
                 hash: data.hash,
-                result: {value: value ?? 0},
+                result: {value: value ?? {insertions: 0, deletions: 0}},
               });
             })
             .catch(err => {
@@ -773,7 +784,7 @@ export default class ServerToClientAPI {
               this.postMessage({
                 type: 'fetchedSignificantLinesOfCode',
                 hash: data.hash,
-                result: {value: value ?? 0},
+                result: {value: value ?? {insertions: 0, deletions: 0}},
               });
             })
             .catch(err => {
@@ -794,7 +805,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingAmendSignificantLinesOfCode',
                 requestId: data.requestId,
                 hash: data.hash,
-                result: {value: value ?? 0},
+                result: {value: value ?? {insertions: 0, deletions: 0}},
               });
             })
             .catch(err => {
@@ -861,7 +872,14 @@ export default class ServerToClientAPI {
         break;
       }
       case 'fetchDiffSummaries': {
-        repo.codeReviewProvider?.triggerDiffSummariesFetch(data.diffIds ?? repo.getAllDiffIds());
+        // Taken from the message rather than inferred from `diffIds`: clients outside this repo
+        // send the whole smartlog that way, and reading that as a handful of diffs of interest
+        // would leave the server with nothing recorded to refetch after a submit.
+        repo.codeReviewProvider?.triggerDiffSummariesFetch(
+          data.diffIds ?? repo.getAllDiffIds(),
+          /* force */ false,
+          /* partial */ data.partial === true,
+        );
         break;
       }
       case 'fetchLandInfo': {
@@ -1021,19 +1039,33 @@ export default class ServerToClientAPI {
         break;
       }
       case 'fetchFeatureFlag': {
-        Internal.fetchFeatureFlag?.(repo.initialConnectionContext, data.name).then(
-          (passes: boolean) => {
+        Promise.resolve(Internal.fetchFeatureFlag?.(repo.initialConnectionContext, data.name)).then(
+          passes => {
             this.logger.info(`feature flag ${data.name} ${passes ? 'PASSES' : 'FAILS'}`);
-            this.postMessage({type: 'fetchedFeatureFlag', name: data.name, passes});
+            this.postMessage({
+              type: 'fetchedFeatureFlag',
+              name: data.name,
+              passes: passes ?? false,
+            });
+          },
+          err => {
+            this.logger.error(`failed to fetch feature flag ${data.name}: `, err);
+            this.postMessage({type: 'fetchedFeatureFlag', name: data.name, passes: false});
           },
         );
         break;
       }
       case 'bulkFetchFeatureFlags': {
-        Internal.bulkFetchFeatureFlags?.(repo.initialConnectionContext, data.names).then(
-          (result: Record<string, boolean>) => {
+        Promise.resolve(
+          Internal.bulkFetchFeatureFlags?.(repo.initialConnectionContext, data.names),
+        ).then(
+          result => {
             this.logger.info(`feature flags ${JSON.stringify(result, null, 2)}`);
-            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result});
+            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result: result ?? {}});
+          },
+          err => {
+            this.logger.error('failed to bulk fetch feature flags: ', err);
+            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result: {}});
           },
         );
         break;

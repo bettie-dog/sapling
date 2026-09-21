@@ -22,7 +22,6 @@
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/PathFuncs.h"
@@ -108,7 +107,7 @@ class FakeSubstringFilteredBackingStoreTest
     wrappedStore_ = std::make_shared<FakeBackingStore>();
     auto fakeFilter = std::make_unique<FakeSubstringFilter>();
     filteredStore_ = std::make_shared<FilteredBackingStore>(
-        wrappedStore_, std::move(fakeFilter), edenConfig, true);
+        wrappedStore_, std::move(fakeFilter), edenConfig);
   }
 
   void TearDown() override {
@@ -125,7 +124,7 @@ class FakePrefixFilteredBackingStoreTest : public FilteredBackingStoreTestBase {
     wrappedStore_ = std::make_shared<FakeBackingStore>();
     auto fakeFilter = std::make_unique<FakePrefixFilter>();
     filteredStore_ = std::make_shared<FilteredBackingStore>(
-        wrappedStore_, std::move(fakeFilter), edenConfig, true);
+        wrappedStore_, std::move(fakeFilter), edenConfig);
   }
 
   void TearDown() override {
@@ -142,7 +141,7 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
   void SetUp() override {
     auto hgFilter = std::make_unique<HgSparseFilter>(repo.path().copy());
     filteredStoreFFI_ = std::make_shared<FilteredBackingStore>(
-        wrappedStore_, std::move(hgFilter), edenConfig, true);
+        wrappedStore_, std::move(hgFilter), edenConfig);
   }
 
   void TearDown() override {
@@ -162,7 +161,7 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
   // DCHECK on InlineExecutor (Task.h:470). See D98178331.
   folly::CPUThreadPoolExecutor executor_{1};
 
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> wrappedStore_{
       std::make_shared<SaplingBackingStore>(
@@ -174,11 +173,7 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
           &executor_,
           edenConfig,
           std::move(runtimeOptions),
-          std::make_shared<EdenFsEventsLogger>(
-              std::make_shared<NullStructuredLogger>(),
-              /*xplatLogger=*/nullptr,
-              edenConfig,
-              stats.copy()),
+          std::make_shared<EdenFsEventsLogger>(nullptr),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector)};

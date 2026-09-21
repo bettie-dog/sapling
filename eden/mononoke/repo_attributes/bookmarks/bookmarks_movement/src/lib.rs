@@ -7,6 +7,7 @@
 
 #![feature(trait_alias)]
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use ::repo_lock::RepoLockRef;
@@ -15,11 +16,13 @@ use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingArc;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bookmarks::BookmarkMoveAlreadyProcessed;
 use bookmarks::BookmarkTransaction;
 use bookmarks::BookmarkTransactionHook;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarksRef;
 use bookmarks_types::BookmarkKey;
+use bytes::Bytes;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
@@ -63,14 +66,19 @@ pub use pushrebase::PushrebaseOutcome;
 pub use pushrebase_hooks::PushrebaseHooksError;
 pub use pushrebase_hooks::get_pushrebase_hooks;
 
+pub use crate::affected_changesets::N_CHANGESETS_TO_LOAD_AT_ONCE;
+pub use crate::affected_changesets::check_case_conflicts;
+pub use crate::affected_changesets::newly_public_changeset_ids;
+pub use crate::affected_changesets::reject_disallowed_publishing_extras;
 pub use crate::create::CreateBookmarkOp;
 pub use crate::delete::DeleteBookmarkOp;
 pub use crate::hook_running::AdminBypassError;
 pub use crate::hook_running::run_bookmark_hooks;
 pub use crate::hook_running::run_changeset_hooks;
-pub use crate::pushrebase_onto::PushrebaseOntoBookmarkOp;
+pub use crate::pushrebase_onto::PushrebasePreparation;
 pub use crate::pushrebase_onto::postprocess_pushrebase_outcome;
-pub use crate::pushrebase_onto::prepare_pushrebase_hooks;
+pub use crate::pushrebase_onto::prepare_pushrebase;
+pub use crate::pushrebase_onto::pushrebase_flags;
 pub use crate::restrictions::BookmarkKindRestrictions;
 pub use crate::restrictions::check_bookmark_sync_config;
 pub use crate::update::BookmarkUpdatePolicy;
@@ -80,6 +88,18 @@ pub use crate::update::UpdateBookmarkOp;
 const ALLOW_NON_FFWD_PUSHVAR: &str = "x-git-allow-non-ffwd-push";
 const ALLOW_BRANCH_DELETION: &str = "x-git-allow-branch-deletion";
 const ALLOW_TAG_DELETION: &str = "x-git-allow-tag-deletion";
+const MIRROR_UPLOAD_PUSHVAR: &str = "MIRROR_UPLOAD";
+
+/// Whether the caller declares this bookmark move part of a mirror upload.
+///
+/// A mirror upload replays moves that a source repo already made, so it needs
+/// the mirror upload permission and it may reuse the source repo's log ids.
+/// This pushvar is the only thing that marks a move as a mirror upload.
+fn is_mirror_upload(pushvars: Option<&HashMap<String, Bytes>>) -> bool {
+    pushvars
+        .and_then(|p| p.get(MIRROR_UPLOAD_PUSHVAR))
+        .is_some_and(|v| **v == *b"true")
+}
 
 /// Trait alias for bookmarks movement repositories.
 ///
@@ -150,8 +170,20 @@ pub enum BookmarkMovementError {
     #[error("Bookmark transaction failed")]
     TransactionFailed,
 
+    /// A modern_sync mirror move to a `*_shadow` replica was already applied (a
+    /// lost-ack replay). Not a failure: the caller reuses the source log id, so
+    /// the move is idempotent and safe to replay.
+    #[error("Bookmark move already processed")]
+    AlreadyProcessed,
+
     #[error("Hooks failed:\n{}", describe_hook_rejections(.0.as_slice()))]
     HookFailure(Vec<HookRejection>),
+
+    #[error("Disallowed extra {extra} is set on {changeset_id}.")]
+    DisallowedExtra {
+        changeset_id: ChangesetId,
+        extra: String,
+    },
 
     #[error("Pushrebase failed: {0}")]
     PushrebaseError(#[source] PushrebaseError),
@@ -262,7 +294,15 @@ impl TransactionWithHooks {
     }
 
     pub async fn commit(self) -> Result<BookmarkUpdateLogId, BookmarkMovementError> {
-        let maybe_log_id = self.transaction.commit_with_hooks(self.txn_hooks).await?;
+        let maybe_log_id = match self.transaction.commit_with_hooks(self.txn_hooks).await {
+            Ok(maybe_log_id) => maybe_log_id,
+            Err(err) => {
+                if err.is::<BookmarkMoveAlreadyProcessed>() {
+                    return Err(BookmarkMovementError::AlreadyProcessed);
+                }
+                return Err(err.into());
+            }
+        };
         if let Some(log_id) = maybe_log_id {
             Ok(log_id.into())
         } else {

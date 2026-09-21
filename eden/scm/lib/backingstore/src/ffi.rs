@@ -11,11 +11,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Error;
 use anyhow::anyhow;
 use cxx::SharedPtr;
 use cxx::UniquePtr;
+use cxx::WeakPtr;
 use cxxerror::Result;
 use edenapi::types::DirectoryMetadata;
 use storemodel::FileAuxData as ScmStoreFileAuxData;
@@ -31,6 +33,7 @@ use types::fetch_cause::FetchCause;
 use types::fetch_mode::FetchMode;
 
 use crate::backingstore::BackingStore;
+use crate::backingstore::HgCacheStats;
 use crate::ffi_errors::into_backingstore_err;
 
 #[cxx::bridge(namespace = sapling)]
@@ -40,13 +43,15 @@ pub(crate) mod ffi {
     #[repr(u8)]
     pub enum FetchCause {
         // Lowest Priority - Unknown orginination
-        Unknown,
+        Unknown = 0,
         // The request originated from a Thrift prefetch endpoint
-        Prefetch,
+        Prefetch = 1,
+        // The request originated from a Thrift glob endpoint
+        Glob = 2,
         // The request originated from a Thrift endpoint
-        Thrift,
+        Thrift = 3,
         // Highest Priority - The request originated from FUSE/NFS/PrjFS
-        Fs,
+        Fs = 4,
     }
 
     #[namespace = "facebook::eden"]
@@ -161,6 +166,9 @@ pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("eden/scm/lib/backingstore/include/ffi.h");
 
+        #[namespace = "facebook::eden"]
+        type EdenFsEventsLogger;
+
         #[namespace = "folly"]
         type IOBuf = iobuf::IOBuf;
 
@@ -168,6 +176,11 @@ pub(crate) mod ffi {
         type GetTreeAuxBatchResolver;
         type GetBlobBatchResolver;
         type GetFileAuxBatchResolver;
+
+        fn sapling_backingstore_log_edenfs_event(
+            logger: &EdenFsEventsLogger,
+            sample_json: &str,
+        ) -> Result<()>;
 
         unsafe fn sapling_backingstore_get_tree_batch_handler(
             resolve_state: SharedPtr<GetTreeBatchResolver>,
@@ -197,6 +210,8 @@ pub(crate) mod ffi {
             blob: SharedPtr<FileAuxData>,
         );
     }
+
+    impl WeakPtr<EdenFsEventsLogger> {}
 
     unsafe extern "C++" {
         type TreeBuilder;
@@ -285,6 +300,46 @@ pub(crate) mod ffi {
         error: UniquePtr<SaplingBackingStoreError>,
     }
 
+    /// Disk-usage state of one cache (blob/tree/lfs). Mirrors
+    /// `storemodel::CacheUsage`; `used`/`limit` on `HgCacheStats` are only
+    /// meaningful when the corresponding state is `Available`. `Unavailable`
+    /// is appended last (not inserted before `Available`) so its ordinal
+    /// stays aligned with the Thrift `CacheUsageState` enum, which also
+    /// appends its `UNAVAILABLE` value at the end.
+    #[repr(u8)]
+    pub enum CacheUsageState {
+        NotConfigured,
+        Unsupported,
+        Available,
+        /// Configured, but its usage could not be measured due to an error.
+        /// The failure reason is logged server-side, not carried here.
+        Unavailable,
+    }
+
+    /// Stats for per-repo hgcache disk usage. Named `HgCacheStats` (not
+    /// `CacheStats`) to avoid colliding with EdenFS's own unrelated
+    /// in-memory hit/miss-counter `CacheStats` type on the C++ side.
+    pub struct HgCacheStats {
+        /// Only meaningful when `cache_path_configured` is true.
+        pub cache_path: String,
+        pub cache_path_configured: bool,
+        pub blob_state: CacheUsageState,
+        pub blob_bytes_used: u64,
+        /// u64::MAX means uncapped.
+        pub blob_bytes_limit: u64,
+        pub tree_state: CacheUsageState,
+        pub tree_bytes_used: u64,
+        pub tree_bytes_limit: u64,
+        pub lfs_state: CacheUsageState,
+        pub lfs_bytes_used: u64,
+        pub lfs_bytes_limit: u64,
+    }
+
+    pub struct GetCacheStatsResult {
+        data: SharedPtr<HgCacheStats>,
+        error: UniquePtr<SaplingBackingStoreError>,
+    }
+
     extern "Rust" {
         type BackingStore;
 
@@ -293,6 +348,7 @@ pub(crate) mod ffi {
             mount: &str,
             eden_client_dir: &str,
             walk_mode: &str,
+            eden_fs_events_logger: SharedPtr<EdenFsEventsLogger>,
         ) -> Result<Box<BackingStore>>;
 
         pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String>;
@@ -360,6 +416,11 @@ pub(crate) mod ffi {
 
         pub fn sapling_backingstore_flush(store: &BackingStore);
 
+        /// Process-wide switch for the tracing-to-Scuba sink. Mirrors the
+        /// daemon's `telemetry:enable-scribe-logging`; call it at startup and
+        /// after every config reload.
+        pub fn sapling_backingstore_set_scribe_logging_enabled(enabled: bool);
+
         pub fn sapling_backingstore_get_glob_files(
             store: &BackingStore,
             commit_id: &[u8],
@@ -398,7 +459,43 @@ pub(crate) mod ffi {
 
         pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &str);
 
+        pub fn sapling_backingstore_get_cache_stats(store: &BackingStore) -> GetCacheStatsResult;
+
         pub fn sapling_flush_counters();
+    }
+}
+
+/// Borrows EdenServer's logger without delaying its shutdown and queue drain.
+struct EdenFsEventsLoggerAdapter {
+    logger: Mutex<WeakPtr<ffi::EdenFsEventsLogger>>,
+}
+
+// SAFETY: The adapter never exposes its cxx pointers. The mutex serializes weak
+// pointer upgrades, C++ calls, and destruction of each temporary SharedPtr. A
+// successful upgrade keeps EdenFsEventsLogger alive throughout the call; an
+// expired pointer is never dereferenced. EdenFsEventsLogger only forwards const
+// logging calls to XplatLoggerCore, whose transform registry and message queue
+// are protected by folly::Synchronized, including calls from other C++ owners.
+// The pointers have no thread-affine destruction requirements. Dropping this
+// adapter requires exclusive ownership and releases only a weak reference.
+unsafe impl Send for EdenFsEventsLoggerAdapter {}
+unsafe impl Sync for EdenFsEventsLoggerAdapter {}
+
+impl edenfs_telemetry::SampleLogger for EdenFsEventsLoggerAdapter {
+    fn log(&self, sample: edenfs_telemetry::EdenSample) -> anyhow::Result<()> {
+        let weak_logger = self
+            .logger
+            .lock()
+            .map_err(|_| anyhow!("EdenFsEventsLogger mutex is poisoned"))?;
+        let logger = weak_logger.upgrade();
+        let Some(logger) = logger.as_ref() else {
+            // EdenServer has released its logger during shutdown. Do not keep
+            // it alive or route late events back to the legacy logger.
+            return Ok(());
+        };
+        let sample_json = serde_json::to_string(&sample)?;
+        ffi::sapling_backingstore_log_edenfs_event(logger, &sample_json)?;
+        Ok(())
     }
 }
 
@@ -418,6 +515,7 @@ impl From<ffi::FetchCause> for FetchCause {
         match fetch_cause {
             ffi::FetchCause::Unknown => FetchCause::EdenUnknown,
             ffi::FetchCause::Prefetch => FetchCause::EdenPrefetch,
+            ffi::FetchCause::Glob => FetchCause::EdenGlob,
             ffi::FetchCause::Thrift => FetchCause::EdenThrift,
             ffi::FetchCause::Fs => FetchCause::EdenFs,
             _ => FetchCause::Unspecified, // should never happen
@@ -432,13 +530,14 @@ fn select_cause(fetch_causes_iter: impl Iterator<Item = ffi::FetchCause>) -> (Fe
     let mut most_popular_cause = None;
     let mut len = 0;
     let mut max_count = 0;
-    let mut cause_counts = [0; 4]; // 4 is the number of variants in FetchCause enum
+    let mut cause_counts = [0; 5];
     for cause in fetch_causes_iter {
         let cause_index = match cause {
             ffi::FetchCause::Unknown => 0,
             ffi::FetchCause::Prefetch => 1,
-            ffi::FetchCause::Thrift => 2,
-            ffi::FetchCause::Fs => 3,
+            ffi::FetchCause::Glob => 2,
+            ffi::FetchCause::Thrift => 3,
+            ffi::FetchCause::Fs => 4,
             _ => 0, // should never happen
         };
         len += 1;
@@ -495,8 +594,15 @@ pub fn sapling_backingstore_new(
     mount: &str,
     eden_client_dir: &str,
     walk_mode: &str,
+    eden_fs_events_logger: SharedPtr<ffi::EdenFsEventsLogger>,
 ) -> Result<Box<BackingStore>> {
-    super::init::backingstore_global_init();
+    if eden_fs_events_logger.is_null() {
+        super::init::backingstore_global_init();
+    } else {
+        super::init::backingstore_global_init_with_logger(Arc::new(EdenFsEventsLoggerAdapter {
+            logger: Mutex::new(eden_fs_events_logger.downgrade()),
+        }));
+    }
 
     let mut extra_sapling_configs = Vec::new();
 
@@ -513,6 +619,13 @@ pub fn sapling_backingstore_new(
         &extra_sapling_configs,
     )?;
     Ok(Box::new(store))
+}
+
+pub fn sapling_backingstore_set_scribe_logging_enabled(enabled: bool) {
+    #[cfg(feature = "scuba")]
+    edenfs_telemetry::tracing_logger::set_scribe_logging_enabled(enabled);
+    #[cfg(not(feature = "scuba"))]
+    let _ = enabled;
 }
 
 pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String> {
@@ -693,7 +806,7 @@ pub fn sapling_backingstore_get_tree_batch(
 
             let resolver = resolver.clone();
 
-            if req.cause != ffi::FetchCause::Prefetch && error.is_null() {
+            if should_trigger_walk_detection(req.cause) && error.is_null() {
                 let path = path_from_oid(req.oid);
                 if !path.is_empty() {
                     sapling_backingstore_witness_dir_read(
@@ -717,6 +830,10 @@ pub fn sapling_backingstore_get_tree_batch(
 fn path_from_oid(oid: &[u8]) -> &[u8] {
     // TODO: don't assume knowledge about the sl ObjectId format.
     if oid.len() <= 21 { &[] } else { &oid[21..] }
+}
+
+fn should_trigger_walk_detection(cause: ffi::FetchCause) -> bool {
+    !matches!(cause, ffi::FetchCause::Prefetch | ffi::FetchCause::Glob)
 }
 
 pub fn sapling_backingstore_get_tree_aux(
@@ -873,6 +990,62 @@ pub fn sapling_dogfooding_host(store: &BackingStore) -> Result<bool> {
 
 pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &str) {
     store.set_parent_hint(parent_id);
+}
+
+/// Flatten a `CacheUsage` into (state, used, limit) for the FFI struct.
+/// `used`/`limit` are 0 unless `Available`; an uncapped `Available` limit
+/// maps to `u64::MAX`, the same "uncapped" sentinel already used internally
+/// by `indexedlogutil::Store::max_bytes()` for permanent (non-rotated) logs.
+fn to_ffi_cache_usage(usage: storemodel::CacheUsage) -> (ffi::CacheUsageState, u64, u64) {
+    match usage {
+        storemodel::CacheUsage::NotConfigured => (ffi::CacheUsageState::NotConfigured, 0, 0),
+        storemodel::CacheUsage::Unsupported => (ffi::CacheUsageState::Unsupported, 0, 0),
+        storemodel::CacheUsage::Unavailable => (ffi::CacheUsageState::Unavailable, 0, 0),
+        storemodel::CacheUsage::Available { used, limit } => (
+            ffi::CacheUsageState::Available,
+            used,
+            limit.unwrap_or(u64::MAX),
+        ),
+    }
+}
+
+fn to_ffi_cache_stats(stats: HgCacheStats) -> ffi::HgCacheStats {
+    let (blob_state, blob_bytes_used, blob_bytes_limit) = to_ffi_cache_usage(stats.blob);
+    let (tree_state, tree_bytes_used, tree_bytes_limit) = to_ffi_cache_usage(stats.tree);
+    let (lfs_state, lfs_bytes_used, lfs_bytes_limit) = to_ffi_cache_usage(stats.lfs);
+    ffi::HgCacheStats {
+        cache_path_configured: stats.cache_path.is_some(),
+        // `cache_path` is display-only (never used for path I/O), so a
+        // lossy UTF-8 conversion here only risks cosmetic corruption of an
+        // already-rare non-UTF8 path on Linux - not worth widening the cxx
+        // bridge field to raw bytes for this diagnostic-only value.
+        cache_path: stats
+            .cache_path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        blob_state,
+        blob_bytes_used,
+        blob_bytes_limit,
+        tree_state,
+        tree_bytes_used,
+        tree_bytes_limit,
+        lfs_state,
+        lfs_bytes_used,
+        lfs_bytes_limit,
+    }
+}
+
+pub fn sapling_backingstore_get_cache_stats(store: &BackingStore) -> ffi::GetCacheStatsResult {
+    match store.get_cache_stats() {
+        Ok(stats) => ffi::GetCacheStatsResult {
+            data: SharedPtr::new(to_ffi_cache_stats(stats)),
+            error: UniquePtr::null(),
+        },
+        Err(err) => ffi::GetCacheStatsResult {
+            data: SharedPtr::null(),
+            error: into_backingstore_err(err),
+        },
+    }
 }
 
 pub fn sapling_backingstore_flush(store: &BackingStore) {
@@ -1036,7 +1209,35 @@ pub fn sapling_flush_counters() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use edenfs_telemetry::EdenSample;
+    use edenfs_telemetry::SampleLogger;
+
     use super::*;
+
+    #[test]
+    fn test_events_logger_adapter_without_live_logger() {
+        let logger = Arc::new(EdenFsEventsLoggerAdapter {
+            logger: Mutex::new(WeakPtr::null()),
+        });
+
+        // An expired weak pointer also upgrades to null. Exercise that path
+        // concurrently through the Rust adapter, not just the C++ log helper.
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let logger = Arc::clone(&logger);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        logger.log(EdenSample::new()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_batch_fetch_stats_maps_fetch_context_counts() {
@@ -1050,10 +1251,125 @@ mod tests {
     }
 
     #[test]
+    fn test_to_ffi_cache_stats_maps_each_field_distinctly() {
+        // Distinct values per field, including three same-typed triples
+        // (blob/tree/lfs used, limit) that a copy-paste transposition would
+        // swap without a compile error.
+        let stats = HgCacheStats {
+            cache_path: Some(PathBuf::from("/tmp/hgcache/repo")),
+            blob: storemodel::CacheUsage::Available {
+                used: 111,
+                limit: Some(222),
+            },
+            tree: storemodel::CacheUsage::Available {
+                used: 333,
+                limit: Some(444),
+            },
+            lfs: storemodel::CacheUsage::Available {
+                used: 555,
+                limit: Some(666),
+            },
+        };
+
+        let ffi_stats = to_ffi_cache_stats(stats);
+
+        assert_eq!(ffi_stats.cache_path, "/tmp/hgcache/repo");
+        assert!(ffi_stats.cache_path_configured);
+        assert!(matches!(
+            ffi_stats.blob_state,
+            ffi::CacheUsageState::Available
+        ));
+        assert_eq!(ffi_stats.blob_bytes_used, 111);
+        assert_eq!(ffi_stats.blob_bytes_limit, 222);
+        assert!(matches!(
+            ffi_stats.tree_state,
+            ffi::CacheUsageState::Available
+        ));
+        assert_eq!(ffi_stats.tree_bytes_used, 333);
+        assert_eq!(ffi_stats.tree_bytes_limit, 444);
+        assert!(matches!(
+            ffi_stats.lfs_state,
+            ffi::CacheUsageState::Available
+        ));
+        assert_eq!(ffi_stats.lfs_bytes_used, 555);
+        assert_eq!(ffi_stats.lfs_bytes_limit, 666);
+    }
+
+    #[test]
+    fn test_to_ffi_cache_stats_not_configured_and_unsupported() {
+        let stats = HgCacheStats {
+            cache_path: None,
+            blob: storemodel::CacheUsage::NotConfigured,
+            tree: storemodel::CacheUsage::Unsupported,
+            lfs: storemodel::CacheUsage::Available {
+                used: 1,
+                limit: None,
+            },
+        };
+
+        let ffi_stats = to_ffi_cache_stats(stats);
+
+        assert_eq!(ffi_stats.cache_path, "");
+        assert!(!ffi_stats.cache_path_configured);
+        assert!(matches!(
+            ffi_stats.blob_state,
+            ffi::CacheUsageState::NotConfigured
+        ));
+        assert!(matches!(
+            ffi_stats.tree_state,
+            ffi::CacheUsageState::Unsupported
+        ));
+        assert!(matches!(
+            ffi_stats.lfs_state,
+            ffi::CacheUsageState::Available
+        ));
+        assert_eq!(ffi_stats.lfs_bytes_used, 1);
+        assert_eq!(
+            ffi_stats.lfs_bytes_limit,
+            u64::MAX,
+            "an uncapped Available limit must map to the u64::MAX sentinel"
+        );
+    }
+
+    #[test]
+    fn test_to_ffi_cache_stats_maps_unavailable() {
+        // A measurement failure (see `backingstore::cache_usage_or_unavailable`)
+        // must map to the `Unavailable` state, not `NotConfigured`/`Unsupported`
+        // - those mean something different (no cache / store can't report).
+        let stats = HgCacheStats {
+            cache_path: Some(PathBuf::from("/tmp/hgcache/repo")),
+            blob: storemodel::CacheUsage::Unavailable,
+            tree: storemodel::CacheUsage::Available {
+                used: 1,
+                limit: Some(2),
+            },
+            lfs: storemodel::CacheUsage::Unavailable,
+        };
+
+        let ffi_stats = to_ffi_cache_stats(stats);
+
+        assert!(matches!(
+            ffi_stats.blob_state,
+            ffi::CacheUsageState::Unavailable
+        ));
+        assert_eq!(ffi_stats.blob_bytes_used, 0);
+        assert_eq!(ffi_stats.blob_bytes_limit, 0);
+        assert!(matches!(
+            ffi_stats.tree_state,
+            ffi::CacheUsageState::Available
+        ));
+        assert!(matches!(
+            ffi_stats.lfs_state,
+            ffi::CacheUsageState::Unavailable
+        ));
+    }
+
+    #[test]
     fn test_select_cause() {
         let causes = [
             ffi::FetchCause::Unknown,
             ffi::FetchCause::Prefetch,
+            ffi::FetchCause::Glob,
             ffi::FetchCause::Thrift,
             ffi::FetchCause::Fs,
         ];
@@ -1085,5 +1401,14 @@ mod tests {
         // All the same cause - return `true`.
         let selected = select_cause(std::iter::repeat_n(ffi::FetchCause::Prefetch, 5));
         assert_eq!(selected, (FetchCause::EdenPrefetch, true));
+    }
+
+    #[test]
+    fn test_walk_detection_fetch_causes() {
+        assert!(!should_trigger_walk_detection(ffi::FetchCause::Prefetch));
+        assert!(!should_trigger_walk_detection(ffi::FetchCause::Glob));
+        assert!(should_trigger_walk_detection(ffi::FetchCause::Unknown));
+        assert!(should_trigger_walk_detection(ffi::FetchCause::Thrift));
+        assert!(should_trigger_walk_detection(ffi::FetchCause::Fs));
     }
 }

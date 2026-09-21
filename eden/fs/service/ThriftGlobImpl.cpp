@@ -67,6 +67,7 @@ folly::coro::now_task<std::unique_ptr<LocalFiles>> computeLocalFiles(
                             ->enforceParents.getValue();
   bool caseSensitive =
       serverState->getEdenConfig()->globUseMountCaseSensitivity.getValue();
+  auto globMatchOptions = serverState->getGlobMatchOptions();
 
   auto status = co_await edenMount->co_diff(
       rootInode,
@@ -107,7 +108,7 @@ folly::coro::now_task<std::unique_ptr<LocalFiles>> computeLocalFiles(
        status->entries_ref().value()) {
     if (scmFileStatus == ScmFileStatus::ADDED) {
       for (auto& matcher : globMatchers) {
-        if (matcher.match(pathString)) {
+        if (matcher.match(pathString, globMatchOptions)) {
           localFiles->addedFiles.insert(pathString);
         }
       }
@@ -115,7 +116,7 @@ folly::coro::now_task<std::unique_ptr<LocalFiles>> computeLocalFiles(
       localFiles->removedFiles.insert(pathString);
     } else if (scmFileStatus == ScmFileStatus::MODIFIED) {
       for (auto& matcher : globMatchers) {
-        if (matcher.match(pathString)) {
+        if (matcher.match(pathString, globMatchOptions)) {
           localFiles->modifiedFiles.insert(pathString);
         }
       }
@@ -137,13 +138,10 @@ ThriftGlobImpl::ThriftGlobImpl(const GlobParams& params)
       rootIds_{*params.revisions()},
       searchRootUser_{*params.searchRoot()} {}
 
-ThriftGlobImpl::ThriftGlobImpl(
-    const PrefetchParams& params,
-    bool prefetchOptimizations)
+ThriftGlobImpl::ThriftGlobImpl(const PrefetchParams& params)
     : includeDotfiles_{true},
       prefetchFiles_{!*params.directoriesOnly()},
-      suppressFileList_{
-          prefetchOptimizations && !*params.returnPrefetchedFiles()},
+      suppressFileList_{!*params.returnPrefetchedFiles()},
       rootIds_{*params.revisions()},
       searchRootUser_{*params.searchRoot()} {}
 
@@ -152,11 +150,15 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     std::shared_ptr<ServerState> serverState,
     std::vector<std::string> globs,
     const ObjectFetchContextPtr& fetchContext) {
-  bool prefetchOptimizations =
-      serverState->getEdenConfig()->prefetchOptimizations.getValue();
-  bool dedupePrefetchFiles =
-      serverState->getEdenConfig()->globDedupePrefetchFiles.getValue() ||
-      !prefetchOptimizations;
+  auto config = serverState->getEdenConfig();
+  auto globMatchOptions = serverState->getGlobMatchOptions();
+  size_t prefetchBlobBatchSize = config->prefetchBlobBatchSize.getValue();
+  if (prefetchBlobBatchSize == 0) {
+    XLOG_EVERY_MS(ERR, 60'000)
+        << "thrift:prefetch-blob-batch-size must be positive";
+    prefetchBlobBatchSize = 1;
+  }
+  bool dedupePrefetchFiles = config->globDedupePrefetchFiles.getValue();
 
   auto fileBlobsToPrefetch =
       prefetchFiles_ ? std::make_shared<PrefetchList>() : nullptr;
@@ -189,8 +191,8 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     globTree = std::make_shared<GlobTree>(
         bool(includeDotfiles_),
         caseSensitivity,
-        bool(prefetchOptimizations),
-        serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue());
+        serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue(),
+        globMatchOptions);
     compileGlobs(globs, *globTree);
     for (auto& rootId : rootIds_) {
       const RootId& originRootId = originRootIds->emplace_back(
@@ -205,7 +207,6 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
                fileBlobsToPrefetch,
                globResults,
                &originRootId,
-               prefetchOptimizations,
                suppressFileList =
                    suppressFileList_]() mutable -> folly::coro::Task<void> {
                 auto rootTree =
@@ -222,9 +223,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
                     RelativePathPiece(),
                     std::move(tree),
                     fileBlobsToPrefetch.get(),
-                    suppressFileList && prefetchOptimizations
-                        ? nullptr
-                        : globResults.get(),
+                    suppressFileList ? nullptr : globResults.get(),
                     originRootId);
               }));
     }
@@ -237,10 +236,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     uint32_t asyncDepth =
         serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue();
     globNode = std::make_shared<GlobNode>(
-        includeDotfiles,
-        caseSensitive,
-        bool(prefetchOptimizations),
-        asyncDepth);
+        includeDotfiles, caseSensitive, asyncDepth, globMatchOptions);
     compileGlobs(globs, *globNode);
     const RootId& originRootId =
         originRootIds->emplace_back(edenMount->getCheckedOutRootId());
@@ -252,7 +248,6 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
              fileBlobsToPrefetch,
              globResults,
              &originRootId,
-             prefetchOptimizations,
              searchRoot,
              suppressFileList =
                  suppressFileList_]() mutable -> folly::coro::Task<void> {
@@ -264,8 +259,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
                   RelativePathPiece(),
                   inode.asTreePtr(),
                   fileBlobsToPrefetch.get(),
-                  suppressFileList && prefetchOptimizations ? nullptr
-                                                            : globResults.get(),
+                  suppressFileList ? nullptr : globResults.get(),
                   originRootId);
             }));
   }
@@ -279,8 +273,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
   // When there are 0 or 1 revisions, every entry has the same origin hash.
   // Skip the per-file renderRootId() call and the resulting list, as no
   // caller can use it to distinguish between revisions.
-  bool populateOriginHashes = numRevisions > 1 ||
-      !serverState->getEdenConfig()->globSkipRedundantOriginHashes.getValue();
+  bool populateOriginHashes = numRevisions > 1;
 
   // Note: we use collectAllTryRange() rather than collectAllRange() here
   // because collectAllRange() sends cooperative cancellation to sibling
@@ -351,9 +344,9 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     auto range = folly::Range{blobs->data(), blobs->size()};
 
     std::vector<folly::coro::Task<void>> prefetchTasks;
-    while (range.size() > 20480) {
-      auto curRange = range.subpiece(0, 20480);
-      range.advance(20480);
+    while (range.size() > prefetchBlobBatchSize) {
+      auto curRange = range.subpiece(0, prefetchBlobBatchSize);
+      range.advance(prefetchBlobBatchSize);
       prefetchTasks.emplace_back(
           folly::coro::co_invoke(
               [store, curRange, fetchContext = fetchContext.copy()]()

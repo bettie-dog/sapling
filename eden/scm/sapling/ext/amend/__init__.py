@@ -276,6 +276,8 @@ def amend(ui, repo, *pats, **opts):
 
     - Specify ``--no-rebase`` to prevent the automatic rebasing of descendants.
     """
+    cmdutil.checkunfinished(repo, op="amend")
+
     # 'rebase' is a tristate option: None=auto, True=force, False=disable
     rebase = opts.get("rebase")
     to = opts.get("to")
@@ -354,10 +356,6 @@ def amend(ui, repo, *pats, **opts):
     # contents have been copied into opts['message'] by logmessage
     opts["logfile"] = ""
 
-    from sapling.ext.fbcodereview import validate_message_change
-
-    validate_message_change(repo, old.description(), opts["message"])
-
     oldbookmarks = old.bookmarks()
     with repo.wlock(), repo.lock():
         node = cmdutil.amend(ui, repo, old, {}, pats, opts)
@@ -365,6 +363,8 @@ def amend(ui, repo, *pats, **opts):
         if node == old.node():
             ui.status(_("nothing changed\n"))
             return 1
+
+        cmdutil.commitstatus(repo, node, opts=opts, predecessor=old)
 
         conf = ui.config("amend", "autorestack", RESTACK_DEFAULT)
         noconflict = None
@@ -529,6 +529,7 @@ def amendtocommit(ui, repo, commitspec, pats=None, opts=None):
             parentnode = memctx.commit()
             mapping[mappednodes[i]] = (parentnode,)
 
+        amendednode = mapping[dest.node()][0]
         scmutil.cleanupnodes(repo, {dest.node(): mapping.pop(dest.node())}, "amend")
         scmutil.cleanupnodes(repo, mapping, "rebase")
 
@@ -537,6 +538,9 @@ def amendtocommit(ui, repo, commitspec, pats=None, opts=None):
             repo.dirstate.rebuild(
                 parentnode, repo[parentnode].manifest(), wctx.files(), exact=True
             )
+
+    if amendednode != dest.node():
+        cmdutil.commitstatus(repo, amendednode, opts=opts, predecessor=dest)
 
 
 def inmemorymerge(ui, repo, src, dest, base):

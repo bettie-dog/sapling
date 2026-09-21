@@ -73,6 +73,19 @@ cpp_unittest(
 )
 
 cpp_unittest(
+    name = "invalidation_queue",
+    srcs = ["InvalidationQueueTest.cpp"],
+    network_access = network_access_utils.none(),
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/fs/utils:invalidation_queue",
+        "//folly:cancellation_token",
+        "//folly:scope_guard",
+    ],
+)
+
+cpp_unittest(
     name = "ring_buffer",
     srcs = ["RingBufferTest.cpp"],
     network_access = network_access_utils.none(),
@@ -130,7 +143,9 @@ cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gtest",
         "//eden/fs/utils:glob_path",
+        "//thrift/lib/cpp2/op:encode",
         "//thrift/lib/cpp2/protocol:protocol",
+        "//thrift/lib/cpp2/type:tag",
     ],
 )
 
@@ -185,6 +200,29 @@ cpp_unittest(
     supports_static_listing = False,
     deps = [
         "//eden/fs/utils:mount_health_check",
+        "//folly/portability:gtest",
+    ],
+)
+
+cpp_unittest(
+    name = "win_stacktrace_test",
+    srcs = ["WinStackTraceTest.cpp"],
+    compatible_with = [
+        "ovr_config//os:windows",
+    ],
+    # The network_access_utils helpers resolve to "all" on non-Linux, which
+    # the Windows RE test platform rejects (only restricted isolation modes
+    # and the platform default are allowed). Leave network_access unset on
+    # Windows so the platform default isolation applies; this test needs no
+    # network. Same pattern as buck2/tests/meta_only/e2e/targets/cross_os_tests.
+    network_access = select({
+        "DEFAULT": None,
+        "ovr_config//os:linux": network_access_utils.NETWORK_ACCESS_NONE,
+    }),
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/utils:win_stacktrace",
+        "//folly:c_portability",
         "//folly/portability:gtest",
     ],
 )

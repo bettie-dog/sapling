@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {ReactNode} from 'react';
 import type {WorktreeEntry} from './types';
 
 import {Badge} from 'isl-components/Badge';
@@ -17,11 +18,11 @@ import {TextField} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useCallback, useState} from 'react';
-import {basename, dirname} from 'shared/utils';
+import {basename, dirname, guessPathSep, pathsAreIdentical} from 'shared/utils';
 import serverAPI from './ClientToServerAPI';
 import {Column, Row} from './ComponentUtils';
 import css from './CwdSelector.module.css';
-import {DropdownField} from './DropdownFields';
+import {DropdownField, DropdownFields} from './DropdownFields';
 import {Internal} from './Internal';
 import {useFeatureFlagSync} from './featureFlags';
 import {T, t} from './i18n';
@@ -30,15 +31,47 @@ import {RemoveWorktreeOperation} from './operations/RemoveWorktreeOperation';
 import {RenameWorktreeOperation} from './operations/RenameWorktreeOperation';
 import {useRunOperation} from './operationsState';
 import platform from './platform';
-import {repositoryInfo, worktreeInfoData} from './serverAPIState';
+import {applicationinfo, repositoryInfo, worktreeInfoData} from './serverAPIState';
 import {useModal} from './useModal';
 
-export function WorktreeSection({dismiss}: {dismiss: () => unknown}) {
+function useWorktreesEnabled(): boolean {
   const worktreesEnabled = useFeatureFlagSync(Internal.featureFlags?.Worktrees);
   const info = useAtomValue(repositoryInfo);
 
   // Only show worktrees for EdenFS repos that are not git-based
-  if (!worktreesEnabled || info?.isEdenFs !== true || info?.codeReviewSystem.type === 'github') {
+  return worktreesEnabled && info?.isEdenFs === true && info?.codeReviewSystem.type !== 'github';
+}
+
+/** Top-bar button, next to the branches button, showing the same worktree info as the repo dropdown. */
+export function WorktreeButton() {
+  const enabled = useWorktreesEnabled();
+  if (!enabled) {
+    return null;
+  }
+  return (
+    <Tooltip
+      title={<T>Worktrees</T>}
+      trigger="click"
+      placement="bottom"
+      group="topbar"
+      component={dismiss => (
+        <DropdownFields
+          title={<T>Worktrees</T>}
+          icon="worktree"
+          data-testid="worktree-details-dropdown">
+          <WorktreeSection dismiss={dismiss} />
+        </DropdownFields>
+      )}>
+      <Button icon data-testid="worktree-button">
+        <Icon icon="worktree" />
+      </Button>
+    </Tooltip>
+  );
+}
+
+export function WorktreeSection({dismiss}: {dismiss: () => unknown}) {
+  const enabled = useWorktreesEnabled();
+  if (!enabled) {
     return null;
   }
   return (
@@ -129,6 +162,7 @@ function WorktreeRowWithHover({
   showModal: ReturnType<typeof useModal>;
   dismiss: () => unknown;
 }) {
+  const appInfo = useAtomValue(applicationinfo);
   return (
     <div
       key={wt.path}
@@ -179,6 +213,8 @@ function WorktreeRowWithHover({
                   changeCwd(wt.path);
                   return;
                 }
+                const isBasecamp = appInfo?.isBasecamp === true;
+                const newWindowLabel = isBasecamp ? t('Open in New Tile') : t('Open in New Window');
                 const choice = await showModal({
                   type: 'confirm',
                   title: <T>Switch Worktree</T>,
@@ -190,24 +226,24 @@ function WorktreeRowWithHover({
                           Switch to worktree $path?
                         </T>
                       </Row>
-                      <Row>
-                        <Subtle>
-                          <T>Opening in current window will reload the editor.</T>
-                        </Subtle>
-                      </Row>
+                      {!isBasecamp && (
+                        <Row>
+                          <Subtle>
+                            <T>Opening in current window will reload the editor.</T>
+                          </Subtle>
+                        </Row>
+                      )}
                     </Column>
                   ),
-                  buttons: [
-                    {label: t('Open in Current Window')},
-                    {label: t('Open in New Window'), primary: true},
-                  ],
+                  buttons: isBasecamp
+                    ? [{label: newWindowLabel, primary: true}]
+                    : [
+                        {label: t('Open in Current Window')},
+                        {label: newWindowLabel, primary: true},
+                      ],
                 });
                 if (choice != null) {
-                  if (choice.label === t('Open in New Window')) {
-                    serverAPI.postMessage({type: 'platform/openInNewWindow', path: wt.path});
-                  } else {
-                    serverAPI.postMessage({type: 'platform/openFolder', path: wt.path});
-                  }
+                  openWorktreeInWindow(wt.path, choice.label === newWindowLabel);
                 }
               }}>
               <Icon icon="arrow-swap" />
@@ -371,6 +407,7 @@ function AddWorktreeModal({
 }) {
   const [destPath, setDestPath] = useState(defaultDest);
   const [label, setLabel] = useState('');
+  const appInfo = useAtomValue(applicationinfo);
   const isVSCode = platform.platformName === 'vscode';
   const [openIn, setOpenIn] = useState<AddWorktreeResult['openIn']>(isVSCode ? 'new' : 'none');
   const [activate, setActivate] = useState(false);
@@ -415,18 +452,17 @@ function AddWorktreeModal({
               {
                 title: (
                   <Row>
-                    <T>Open in new window</T>
+                    {appInfo?.isBasecamp ? <T>Open in new tile</T> : <T>Open in new window</T>}
                     <Badge>Recommended</Badge>
                   </Row>
                 ),
                 value: 'new',
               },
-              {
-                title: <T>Open in current window</T>,
-                value: 'current',
-              },
+              ...(appInfo?.isBasecamp
+                ? []
+                : [{title: <T>Open in current window</T>, value: 'current'}]),
               {title: <T>Don't open</T>, value: 'none'},
-            ] as const
+            ] as Array<{value: AddWorktreeResult['openIn']; title: ReactNode}>
           }
           current={openIn}
           onChange={setOpenIn}
@@ -460,7 +496,7 @@ function AddWorktreeModal({
   );
 }
 
-function RenameWorktreeModal({
+export function RenameWorktreeModal({
   returnResultAndDismiss,
   currentLabel,
   wtBasename,
@@ -495,7 +531,7 @@ function RenameWorktreeModal({
   );
 }
 
-function changeCwd(newCwd: string) {
+export function changeCwd(newCwd: string) {
   serverAPI.postMessage({
     type: 'changeCwd',
     cwd: newCwd,
@@ -503,22 +539,11 @@ function changeCwd(newCwd: string) {
   serverAPI.cwdChanged();
 }
 
-function guessPathSep(path: string): '/' | '\\' {
-  if (path.includes('\\')) {
-    return '\\';
+/** Ask the host platform to open `path` either in the current window or a new one. */
+export function openWorktreeInWindow(path: string, newWindow: boolean) {
+  if (newWindow) {
+    serverAPI.postMessage({type: 'platform/openInNewWindow', path});
   } else {
-    return '/';
+    serverAPI.postMessage({type: 'platform/openFolder', path});
   }
-}
-
-function pathsAreIdentical(path1: string, path2: string): boolean {
-  const normalizedPath1 = path1.replaceAll('\\', '/');
-  const normalizedPath2 = path2.replaceAll('\\', '/');
-
-  const isWindowsAbsolutePath = (path: string) => /^[A-Za-z]:\//.test(path);
-  if (isWindowsAbsolutePath(normalizedPath1) && isWindowsAbsolutePath(normalizedPath2)) {
-    return normalizedPath1.toLowerCase() === normalizedPath2.toLowerCase();
-  }
-
-  return normalizedPath1 === normalizedPath2;
 }

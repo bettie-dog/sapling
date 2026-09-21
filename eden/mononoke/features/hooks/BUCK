@@ -12,9 +12,6 @@ rust_library(
             "doctest": False,
             "test": False,
         },
-        "cargo_toml_config": {
-            "dependencies_override": {"dependencies": {"gix-config": {"features": ["sha1"]}}},
-        },
     },
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
@@ -56,7 +53,7 @@ rust_library(
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
-        "//common/rust/identity:identity_ext",
+        "//common/rust/build_info:build_info",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/stats:stats",
         "//common/rust/zippydb/zippydb-thrift:zippydb_thrift",

@@ -12,13 +12,15 @@ import {
   type RunnableOperation,
   type Submodule,
   type ValidatedRepoInfo,
+  type WorktreeInfo,
 } from 'isl/src/types';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as ejeca from 'shared/ejeca';
 import * as fsUtils from 'shared/fs';
-import {clone, mockLogger, nextTick} from 'shared/testUtils';
+import {clone, mockLogger} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import {Internal} from '../Internal';
 import {absolutePathForFileInRepo, Repository} from '../Repository';
 import {makeServerSideTracker} from '../analytics/serverSideTracker';
@@ -27,6 +29,7 @@ import {
   setConfigOverrideForTests,
   type ResolveCommandConflictOutput,
 } from '../commands';
+import {ErrorShortMessages} from '../constants';
 import {type ServerPlatform} from '../serverPlatform';
 import {type RepositoryContext} from '../serverTypes';
 
@@ -48,7 +51,12 @@ const mockTracker = makeServerSideTracker(
 );
 
 function mockEjeca(
-  cmds: Array<[RegExp, (() => {stdout: string} | Error) | {stdout: string} | Error]>,
+  cmds: Array<
+    [
+      RegExp,
+      (() => {stdout: string; stderr?: string} | Error) | {stdout: string; stderr?: string} | Error,
+    ]
+  >,
 ) {
   return jest.spyOn(ejeca, 'ejeca').mockImplementation(((cmd: string, args: Array<string>) => {
     const argStr = cmd + ' ' + args?.join(' ');
@@ -347,6 +355,43 @@ describe('Repository', () => {
       );
     });
 
+    it('produces repo-root-relative file args when cwd is a deeper subdir of the root', async () => {
+      // Regression for "cwd relative path ... is not under root": once cwd is canonicalized to the
+      // root's namespace, the relativized file arg must not climb above the root with `../`.
+      const canonicalRoot = '/data/repos/fbsource';
+      const canonicalCwd = '/data/repos/fbsource/www';
+
+      const symlinkedRepoInfo: ValidatedRepoInfo = {
+        ...repoInfo,
+        dotdir: `${canonicalRoot}/.sl`,
+        repoRoot: canonicalRoot,
+        isEdenFs: true,
+      };
+      const symlinkedCtx: RepositoryContext = {...ctx, cwd: canonicalCwd};
+      const repo = new Repository(symlinkedRepoInfo, symlinkedCtx);
+      const relativeFile =
+        'flib/intern/aurora/lint_rules/ast_linters/graphql/__tests__/GraphQLBuildSandboxCacheTopologyLintRuleTest.php';
+
+      await repo.runOrQueueOperation(
+        symlinkedCtx,
+        {
+          id: '1',
+          trackEventName: 'AmendFileSubsetOperation',
+          runner: CommandRunner.Sapling,
+          args: ['amend', {type: 'repo-relative-file', path: `www/${relativeFile}`}],
+        },
+        jest.fn(),
+      );
+
+      expect(ejecaSpy).toHaveBeenCalledWith(
+        'sl',
+        ['amend', relativeFile, '--noninteractive'],
+        expect.anything(),
+      );
+      const passedArgs = ejecaSpy.mock.calls[0][1] as Array<string>;
+      expect(passedArgs.some(arg => arg.startsWith('..'))).toBe(false);
+    });
+
     it('handles allowed configs', async () => {
       await runOperation({
         args: ['commit', {type: 'config', key: 'ui.allowemptycommit', value: 'True'}],
@@ -417,7 +462,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
 
       const ejecaSpy = mockEjeca([[/^sl diff/, () => ({stdout: EXAMPLE_DIFFSTAT})]]);
       const results = repo.fetchSignificantLinesOfCode(ctx, 'abcdef', ['generated.file']);
-      await expect(results).resolves.toEqual(45);
+      await expect(results).resolves.toEqual({insertions: 45, deletions: 0});
       expect(ejecaSpy).toHaveBeenCalledWith(
         'sl',
         expect.arrayContaining([
@@ -501,6 +546,31 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
       );
     });
 
+    it('reports when smartlog finds too many commits to render', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      const onChange = jest.fn();
+      repo.subscribeToSmartlogCommitsChanges(onChange);
+      mockEjeca([
+        [
+          /^sl log/,
+          {
+            stdout: '',
+            stderr:
+              'smartlog: too many (160811) commits, not rendering all of them\n' +
+              "(consider running 'sl doctor' to hide unrelated commits)\n",
+          },
+        ],
+      ]);
+
+      await repo.fetchSmartlogCommits();
+
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          commits: {error: expect.objectContaining({message: ErrorShortMessages.TooManyCommits})},
+        }),
+      );
+    });
+
     it('updates revset when changing date range', async () => {
       const ejecaSpy = mockEjeca([]);
       const repo = new Repository(repoInfo, ctx);
@@ -547,6 +617,39 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
         ejecaSpy,
         'smartlog((interestingbookmarks() + heads(draft())) + . + present(aaa) + present(bbb))',
       );
+    });
+
+    it('includes other worktrees checked-out hashes in revset, excluding own worktree', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      (repo as unknown as {worktreeInfo: WorktreeInfo}).worktreeInfo = {
+        sharedRoot: repoInfo.repoRoot,
+        worktrees: [
+          {path: repoInfo.repoRoot, role: 'main', node: 'abc123'},
+          {path: '/path/to/other', role: 'linked', node: 'def456'},
+          {path: '/path/to/no-hash', role: 'linked'},
+        ],
+      };
+
+      const ejecaSpy = mockEjeca([]);
+      await repo.fetchSmartlogCommits();
+      expectCalledWithRevset(
+        ejecaSpy,
+        'smartlog(((interestingbookmarks() + heads(draft())) & date(-14)) + . + present(def456))',
+      );
+    });
+
+    it('getOtherWorktreeDotHashes dedupes and excludes own worktree', () => {
+      const repo = new Repository(repoInfo, ctx);
+      (repo as unknown as {worktreeInfo: WorktreeInfo}).worktreeInfo = {
+        sharedRoot: repoInfo.repoRoot,
+        worktrees: [
+          {path: repoInfo.repoRoot, role: 'main', node: 'abc123'},
+          {path: '/path/to/other', role: 'linked', node: 'def456'},
+          {path: '/path/to/other2', role: 'linked', node: 'def456'},
+        ],
+      };
+
+      expect(repo.getOtherWorktreeDotHashes()).toEqual(['def456']);
     });
   });
 
@@ -1222,6 +1325,8 @@ describe('fetchSubmoduleMap', () => {
             ]),
           },
         ],
+        // checked-out hash for the *other* worktree, fetched via `sl whereami -R <path>`
+        [/^sl whereami/, {stdout: 'bbb'}],
       ]);
 
       const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
@@ -1232,7 +1337,7 @@ describe('fetchSubmoduleMap', () => {
         sharedRoot: '/repo/main',
         worktrees: [
           {path: '/repo/main', role: 'main'},
-          {path: '/repo/feature', label: 'feature-x', role: 'linked'},
+          {path: '/repo/feature', label: 'feature-x', role: 'linked', node: 'bbb'},
         ],
       });
     });
@@ -1296,6 +1401,8 @@ describe('fetchSubmoduleMap', () => {
             ]),
           },
         ],
+        // this repo is /repo/feature, so /repo/main is the "other" worktree queried
+        [/^sl whereami/, {stdout: 'aaa'}],
       ]);
 
       const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
@@ -1305,9 +1412,39 @@ describe('fetchSubmoduleMap', () => {
       expect(worktreeInfo).toBeDefined();
       expect(worktreeInfo!.sharedRoot).toBe('/repo/main');
       expect(worktreeInfo!.worktrees).toEqual([
-        {path: '/repo/main', role: 'main'},
+        {path: '/repo/main', role: 'main', node: 'aaa'},
         {path: '/repo/feature', label: 'feature-x', role: 'linked'},
       ]);
+    });
+
+    it('leaves node unset when `sl whereami` fails for a sibling worktree', async () => {
+      mockEjeca([
+        [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
+        [/^sl root --shared/, {stdout: '/repo/main'}],
+        [/^sl root/, {stdout: '/repo/main'}],
+        [/^sl debugroots/, {stdout: '/repo/main'}],
+        [
+          /^sl --config worktree\.enabled=true worktree list/,
+          {
+            stdout: JSON.stringify([
+              {path: '/repo/main', role: 'main'},
+              {path: '/repo/feature', label: 'feature-x', role: 'linked'},
+            ]),
+          },
+        ],
+        [/^sl whereami/, new Error('worktree mid-checkout')],
+      ]);
+
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      const repo = new Repository(info, ctx);
+      await repo.refreshWorktreeInfo();
+      expect(repo.getWorktreeInfo()).toEqual({
+        sharedRoot: '/repo/main',
+        worktrees: [
+          {path: '/repo/main', role: 'main'},
+          {path: '/repo/feature', label: 'feature-x', role: 'linked'},
+        ],
+      });
     });
 
     it('leaves worktreeInfo undefined when sharedRoot is unavailable', async () => {

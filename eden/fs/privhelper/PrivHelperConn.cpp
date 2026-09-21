@@ -9,6 +9,7 @@
 
 #include "eden/fs/privhelper/PrivHelperConn.h"
 
+#include <fmt/core.h>
 #include <folly/Demangle.h>
 #include <folly/Exception.h>
 #include <folly/File.h>
@@ -43,7 +44,7 @@ constexpr size_t kDefaultBufferSize = 1024;
 // We need to bump this version number any time the protocol is changed. This is
 // so that the EdenFS daemon and privhelper daemon understand which version of
 // the protocol to use when sending/processing requests and responses.
-constexpr uint32_t PRIVHELPER_CURRENT_VERSION = 1;
+constexpr uint32_t PRIVHELPER_CURRENT_VERSION = 2;
 
 UnixSocket::Message serializeRequestPacket(
     uint32_t xid,
@@ -134,6 +135,14 @@ uint32_t deserializeUint32(Cursor& cursor) {
   return cursor.read<uint32_t>();
 }
 
+void serializeUint64(Appender& a, uint64_t val) {
+  a.write<uint64_t>(val);
+}
+
+uint64_t deserializeUint64(Cursor& cursor) {
+  return cursor.read<uint64_t>();
+}
+
 void serializeInt32(Appender& a, int32_t val) {
   a.write<int32_t>(val);
 }
@@ -166,11 +175,15 @@ folly::SocketAddress deserializeSocketAddress(Cursor& cursor) {
   }
 }
 
+// Legacy iosize option. Serialized to its old value for compatibility with old
+// privhelpers.
+constexpr uint32_t kLegacyIoSizeWireSlot = 16 * 1024;
+
 void serializeNFSMountOptions(Appender& a, const NFSMountOptions& options) {
   serializeSocketAddress(a, options.mountdAddr);
   serializeSocketAddress(a, options.nfsdAddr);
   serializeBool(a, options.readOnly);
-  serializeUint32(a, options.iosize);
+  serializeUint32(a, kLegacyIoSizeWireSlot);
   serializeBool(a, options.useReaddirplus);
   serializeBool(a, options.useSoftMount);
   serializeUint32(a, options.readIOSize);
@@ -188,7 +201,8 @@ NFSMountOptions deserializeNFSMountOptions(Cursor& cursor) {
   options.mountdAddr = deserializeSocketAddress(cursor);
   options.nfsdAddr = deserializeSocketAddress(cursor);
   options.readOnly = deserializeBool(cursor);
-  options.iosize = deserializeUint32(cursor);
+  // Legacy iosize option, ignored.
+  deserializeUint32(cursor);
   options.useReaddirplus = deserializeBool(cursor);
   options.useSoftMount = deserializeBool(cursor);
   options.readIOSize = deserializeUint32(cursor);
@@ -216,6 +230,131 @@ void deserializeUnmountOptions(Cursor& cursor, UnmountOptions& options) {
   options.force = (bitset & UnmountOptionBits::FORCE) != 0;
   options.detach = (bitset & UnmountOptionBits::DETACH) != 0;
   options.expire = (bitset & UnmountOptionBits::EXPIRE) != 0;
+}
+
+/**
+ * Read a length-prefixed string, charging it against a cumulative byte budget.
+ *
+ * The privhelper parses as root, and Cursor::readFixedString() reserves the
+ * declared length before checking that many bytes are present, so the length
+ * must be bounded before it is used.
+ */
+std::string
+deserializeBoundedString(Cursor& cursor, StringPiece what, size_t& budget) {
+  const size_t length = deserializeUint32(cursor);
+  if (length > budget) {
+    folly::throwSystemErrorExplicit(
+        EINVAL,
+        fmt::format(
+            "{} declares {} bytes with {} left in its budget",
+            what,
+            length,
+            budget));
+  }
+  const size_t available = cursor.totalLength();
+  if (length > available) {
+    folly::throwSystemErrorExplicit(
+        EINVAL,
+        fmt::format(
+            "{} declares {} bytes but {} remain in the message",
+            what,
+            length,
+            available));
+  }
+  budget -= length;
+  return cursor.readFixedString(length);
+}
+
+uint32_t
+deserializeBoundedCount(Cursor& cursor, StringPiece what, uint32_t limit) {
+  const auto count = deserializeUint32(cursor);
+  if (count > limit) {
+    folly::throwSystemErrorExplicit(
+        EINVAL,
+        fmt::format("{} declares {} entries, limit is {}", what, count, limit));
+  }
+  return count;
+}
+
+void validateBoundedSize(size_t size, StringPiece what, size_t limit) {
+  if (size > limit) {
+    throwf<std::invalid_argument>(
+        "{} has {} bytes, limit is {}", what, size, limit);
+  }
+}
+
+void validateBoundedCount(size_t count, StringPiece what, uint32_t limit) {
+  if (count > limit) {
+    throwf<std::invalid_argument>(
+        "{} has {} entries, limit is {}", what, count, limit);
+  }
+}
+
+void chargeSerializedString(
+    StringPiece value,
+    StringPiece what,
+    size_t& budget) {
+  if (value.size() > budget) {
+    throwf<std::invalid_argument>(
+        "{} has {} bytes with {} left in its budget",
+        what,
+        value.size(),
+        budget);
+  }
+  budget -= value.size();
+}
+
+void validateRestartArgs(const EdenFsRestartArgs& args) {
+  validateBoundedSize(
+      args.sentinelPath.size(),
+      "sentinel path",
+      PrivHelperConn::kMaxSentinelPathBytes);
+  validateBoundedCount(
+      args.relaunchArgv.size(),
+      "relaunch argv",
+      PrivHelperConn::kMaxRelaunchArgvEntries);
+  validateBoundedCount(
+      args.relaunchEnv.size(),
+      "relaunch env",
+      PrivHelperConn::kMaxRelaunchEnvEntries);
+
+  size_t budget = PrivHelperConn::kMaxRelaunchBytes;
+  for (const auto& arg : args.relaunchArgv) {
+    chargeSerializedString(arg, "relaunch argv entry", budget);
+  }
+  for (const auto& [name, value] : args.relaunchEnv) {
+    chargeSerializedString(name, "relaunch env name", budget);
+    chargeSerializedString(value, "relaunch env value", budget);
+  }
+}
+
+std::vector<std::string> deserializeRelaunchArgv(
+    Cursor& cursor,
+    size_t& budget) {
+  const auto count = deserializeBoundedCount(
+      cursor, "relaunch argv", PrivHelperConn::kMaxRelaunchArgvEntries);
+  std::vector<std::string> argv;
+  argv.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    argv.push_back(
+        deserializeBoundedString(cursor, "relaunch argv entry", budget));
+  }
+  return argv;
+}
+
+std::vector<std::pair<std::string, std::string>> deserializeRelaunchEnv(
+    Cursor& cursor,
+    size_t& budget) {
+  const auto count = deserializeBoundedCount(
+      cursor, "relaunch env", PrivHelperConn::kMaxRelaunchEnvEntries);
+  std::vector<std::pair<std::string, std::string>> env;
+  env.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    auto name = deserializeBoundedString(cursor, "relaunch env name", budget);
+    auto value = deserializeBoundedString(cursor, "relaunch env value", budget);
+    env.emplace_back(std::move(name), std::move(value));
+  }
+  return env;
 }
 
 // Helper for setting close-on-exec.  Not needed on systems
@@ -614,6 +753,69 @@ void PrivHelperConn::parseStartFamRequest(
   specifiedOutputPath = deserializeString(cursor);
   shouldUpload = deserializeBool(cursor);
   checkAtEnd(cursor, "start fam");
+}
+
+UnixSocket::Message PrivHelperConn::serializeSetRestartArgsRequest(
+    uint32_t xid,
+    const EdenFsRestartArgs& args) {
+  validateRestartArgs(args);
+  auto msg = serializeRequestPacket(xid, REQ_SET_RESTART_ARGS);
+  Appender appender(&msg.data, kDefaultBufferSize);
+
+  serializeBool(appender, args.enabled);
+  serializeString(appender, args.sentinelPath);
+  serializeUint32(appender, args.relaunchArgv.size());
+  for (const auto& arg : args.relaunchArgv) {
+    serializeString(appender, arg);
+  }
+  serializeUint32(appender, args.relaunchEnv.size());
+  for (const auto& [name, value] : args.relaunchEnv) {
+    serializeString(appender, name);
+    serializeString(appender, value);
+  }
+  serializeUint32(appender, args.restartCount);
+  serializeUint64(appender, args.firstRestartEpochSec);
+  serializeUint32(appender, args.maxRestarts);
+  serializeUint32(appender, args.windowSeconds);
+  return msg;
+}
+
+void PrivHelperConn::parseSetRestartArgsRequest(
+    Cursor& cursor,
+    EdenFsRestartArgs& args) {
+  args.enabled = deserializeBool(cursor);
+  size_t pathBudget = kMaxSentinelPathBytes;
+  args.sentinelPath =
+      deserializeBoundedString(cursor, "sentinel path", pathBudget);
+  size_t relaunchBudget = kMaxRelaunchBytes;
+  args.relaunchArgv = deserializeRelaunchArgv(cursor, relaunchBudget);
+  args.relaunchEnv = deserializeRelaunchEnv(cursor, relaunchBudget);
+  args.restartCount = deserializeUint32(cursor);
+  args.firstRestartEpochSec = deserializeUint64(cursor);
+  args.maxRestarts = deserializeUint32(cursor);
+  args.windowSeconds = deserializeUint32(cursor);
+  checkAtEnd(cursor, "set restart args");
+}
+
+UnixSocket::Message PrivHelperConn::serializeNotifyCleanShutdownRequest(
+    uint32_t xid,
+    StringPiece reason) {
+  auto msg = serializeRequestPacket(xid, REQ_NOTIFY_CLEAN_SHUTDOWN);
+  Appender appender(&msg.data, kDefaultBufferSize);
+  serializeString(appender, reason.subpiece(0, kMaxCleanShutdownReasonBytes));
+  return msg;
+}
+
+void PrivHelperConn::parseNotifyCleanShutdownRequest(
+    Cursor& cursor,
+    std::string& reason) {
+  size_t budget = kMaxCleanShutdownReasonBytes;
+  reason = deserializeBoundedString(cursor, "shutdown reason", budget);
+  checkAtEnd(cursor, "notify clean shutdown");
+}
+
+bool PrivHelperConn::isOneWayRequest(MsgType type) {
+  return type == REQ_NOTIFY_CLEAN_SHUTDOWN;
 }
 
 void PrivHelperConn::serializeStopFamResponse(

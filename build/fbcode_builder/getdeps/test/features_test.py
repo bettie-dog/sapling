@@ -3,7 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ def _ctx_with_features(features: set[str] | None = None) -> ManifestContext:
             "os": "linux",
             "distro": None,
             "distro_vers": None,
+            "distro_family": None,
             "fb": "off",
             "fbsource": "off",
             "test": "off",
@@ -65,6 +65,7 @@ def _make_loader(manifests: dict[str, str]) -> ManifestLoader:
             "os": "linux",
             "distro": None,
             "distro_vers": None,
+            "distro_family": None,
             "fb": "off",
             "fbsource": "off",
             "test": "off",

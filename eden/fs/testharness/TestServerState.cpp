@@ -25,13 +25,19 @@
 
 namespace facebook::eden {
 
-std::shared_ptr<ServerState> createTestServerState() {
+std::shared_ptr<ServerState> createTestServerState(
+    std::shared_ptr<UnboundedQueueExecutor> fsChannelThreadPool) {
   // Use a real thread pool rather than a ManualExecutor so that work scheduled
   // on the ServerState executor (e.g. ThriftGlobImpl::glob) actually runs;
   // callers drive the resulting future with a blocking get().
   auto executor =
       std::make_shared<UnboundedQueueExecutor>(1, "TestServerState");
+  if (!fsChannelThreadPool) {
+    fsChannelThreadPool = executor;
+  }
   auto edenConfig = EdenConfig::createTestEdenConfig();
+  // This test helper does not provide the EventBase required by NFS servers.
+  edenConfig->enableNfsServer.setValue(false, ConfigSourceType::Default, true);
   auto reloadableConfig = std::make_shared<ReloadableConfig>(edenConfig);
 
   return std::make_shared<ServerState>(
@@ -40,12 +46,12 @@ std::shared_ptr<ServerState> createTestServerState() {
       SessionInfo{},
       std::make_shared<FakePrivHelper>(),
       executor,
-      executor,
+      fsChannelThreadPool,
       std::make_shared<FakeClock>(),
       std::make_shared<ProcessInfoCache>(),
       std::make_shared<NullStructuredLogger>(),
       std::make_shared<NullStructuredLogger>(),
-      std::make_shared<ErrorLogger>(nullptr, SessionInfo{}, nullptr),
+      std::make_shared<ErrorLogger>(),
       std::make_shared<NullScribeLogger>(),
       std::make_shared<ReloadableConfig>(edenConfig),
       *edenConfig,

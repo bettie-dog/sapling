@@ -11,9 +11,9 @@ license = "GPLv2+"
 ahash = { version = "0.8.11", features = ["runtime-rng"] }
 anyhow = "1.0.104"
 array-init = "0.1"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 auto_impl = "1.3.0"
-bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
+bitflags = { version = "2.13.2", features = ["serde", "std"], default-features = false }
 blame = { version = "0.1.0", path = "../../derived_data/blame" }
 blobrepo_hg = { version = "0.1.0", path = "../../blobrepo/blobrepo_hg" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
@@ -32,7 +32,7 @@ context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context"
 dashmap = { version = "6.2.1", features = ["rayon", "serde"] }
 deleted_manifest = { version = "0.1.0", path = "../../derived_data/deleted_manifest" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
-derive_more = { version = "1.0.0", features = ["full"] }
+derive_more = { version = "2.1.1", features = ["full"] }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
 executor_lib = { version = "0.1.0", path = "../../cmdlib/sharding" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
@@ -43,7 +43,7 @@ filenodes_derivation = { version = "0.1.0", path = "../../derived_data/filenodes
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
 filetime = "0.2.29"
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hash_memo = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 hex = { version = "0.4.3", features = ["alloc"] }
 internment = { version = "0.8.6", features = ["arc", "serde"] }
@@ -77,12 +77,12 @@ sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
 yield_stream = { version = "0.1.0", path = "../../common/yield_stream" }
-zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }
+zstd = { version = "0.14.0", features = ["experimental", "zstdmt"] }
 
 [dev-dependencies]
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

@@ -51,12 +51,14 @@ void BackingStoreLogger::logImport(
     case ObjectFetchContext::Cause::Prefetch:
       cause_string = "Prefetch";
       break;
+    case ObjectFetchContext::Cause::Glob:
+      cause_string = "Glob";
+      break;
     case ObjectFetchContext::Unknown:
       cause_string = "Unknown";
   }
-  if (auto causeDetail = context.getCauseDetail()) {
-    cause_string =
-        folly::to<std::string>(cause_string, " - ", causeDetail.value());
+  if (auto detail = context.getCauseDetail()) {
+    cause_string = folly::to<std::string>(cause_string, " - ", detail.value());
   }
 
   std::string typeString = "<invalid>";

@@ -16,7 +16,6 @@ use permission_checker::AclProvider;
 use permission_checker::BoxPermissionChecker;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
-use permission_checker::MononokeIdentitySetExt;
 use permission_checker::PermissionCheckResult;
 use permission_checker::PermissionCheckerBuilder;
 use tokio::join;
@@ -126,6 +125,13 @@ pub trait RepoPermissionChecker: Send + Sync + 'static {
         &'a self,
         region_hipster_acls: &'a [&'a str],
         identities: &'a MononokeIdentitySet,
+    ) -> PermissionCheckResult;
+
+    /// Like check_if_write_access_allowed, but also returns why access was
+    /// denied, so the reason can be reported to the pushing user.
+    async fn check_if_write_access_allowed_with_result(
+        &self,
+        identities: &MononokeIdentitySet,
     ) -> PermissionCheckResult;
 }
 
@@ -305,11 +311,6 @@ impl RepoPermissionChecker for ProdRepoPermissionChecker {
         identities: &MononokeIdentitySet,
         service_name: &str,
     ) -> bool {
-        if identities.likely_an_agent()
-            && justknobs::eval("scm/mononoke:block_agentic_service_writes", None, None)
-        {
-            return false;
-        }
         self.service_permchecker
             .check_set(identities, &[service_name])
             .await
@@ -343,7 +344,16 @@ impl RepoPermissionChecker for ProdRepoPermissionChecker {
                 }
             }
         }
-        PermissionCheckResult::Denied
+        PermissionCheckResult::denied()
+    }
+
+    async fn check_if_write_access_allowed_with_result(
+        &self,
+        identities: &MononokeIdentitySet,
+    ) -> PermissionCheckResult {
+        self.repo_permchecker
+            .check_set_with_result(identities, &["write"])
+            .await
     }
 }
 
@@ -418,6 +428,13 @@ impl RepoPermissionChecker for AlwaysAllowRepoPermissionChecker {
     ) -> PermissionCheckResult {
         PermissionCheckResult::Allowed(None)
     }
+
+    async fn check_if_write_access_allowed_with_result(
+        &self,
+        _identities: &MononokeIdentitySet,
+    ) -> PermissionCheckResult {
+        PermissionCheckResult::Allowed(None)
+    }
 }
 
 pub struct NeverAllowRepoPermissionChecker {}
@@ -481,7 +498,7 @@ impl RepoPermissionChecker for NeverAllowRepoPermissionChecker {
         &self,
         _identities: &MononokeIdentitySet,
     ) -> PermissionCheckResult {
-        PermissionCheckResult::Denied
+        PermissionCheckResult::denied()
     }
 
     async fn check_if_region_read_access_allowed_with_result<'a>(
@@ -489,6 +506,13 @@ impl RepoPermissionChecker for NeverAllowRepoPermissionChecker {
         _region_hipster_acls: &'a [&'a str],
         _identities: &'a MononokeIdentitySet,
     ) -> PermissionCheckResult {
-        PermissionCheckResult::Denied
+        PermissionCheckResult::denied()
+    }
+
+    async fn check_if_write_access_allowed_with_result(
+        &self,
+        _identities: &MononokeIdentitySet,
+    ) -> PermissionCheckResult {
+        PermissionCheckResult::denied()
     }
 }

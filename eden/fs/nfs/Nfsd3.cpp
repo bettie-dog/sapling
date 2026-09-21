@@ -7,19 +7,32 @@
 
 #include "eden/fs/nfs/Nfsd3.h"
 
+#include <algorithm>
 #include <memory>
+#include <string_view>
 #include <type_traits>
 
+#include <fb303/ThreadCachedServiceData.h>
+#include <fmt/format.h>
+#include <utility>
+
+#include <folly/ScopeGuard.h>
+
 #include <folly/String.h>
+#include <folly/Synchronized.h>
 #include <folly/Utility.h>
-#include <folly/executors/SerialExecutor.h>
+#include <folly/container/F14Map.h>
 #include <folly/futures/Future.h>
 #include <folly/portability/Stdlib.h>
+#include "eden/common/utils/FaultInjector.h"
 
 #include "eden/common/telemetry/RequestMetricsScope.h"
 #include "eden/common/utils/IDGen.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/common/utils/Throw.h"
+#include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/config/ReloadableConfig.h"
+#include "eden/fs/nfs/NfsAccessRateLimiter.h"
 #include "eden/fs/nfs/NfsRequestContext.h"
 #include "eden/fs/nfs/NfsUtils.h"
 #include "eden/fs/nfs/NfsdRpc.h"
@@ -69,6 +82,91 @@ void incrementNfsGcInvalidationCounter(
   stats->increment(counter);
 }
 
+/**
+ * Whether an AUTH_SYS credential carries `gid` as its primary gid or as one
+ * of its auxiliary gids; this is what an nfs:gid-access-policy entry matches.
+ */
+bool credsHaveGid(const authsys_parms& creds, uint32_t gid) {
+  return creds.gid == gid ||
+      std::find(creds.gids.begin(), creds.gids.end(), gid) != creds.gids.end();
+}
+
+/**
+ * Procedures the uid/gid access modes never act on (never counted,
+ * never rejected): NULL is the liveness and mount handshake probe, and
+ * FSSTAT/FSINFO/PATHCONF are per-mount bookkeeping that NFS clients issue
+ * on their own behalf. Rejecting any of these could wedge the mount itself
+ * rather than shed the targeted file I/O.
+ */
+bool isAccessModeExempt(uint32_t proc) {
+  switch (static_cast<nfsv3Procs>(proc)) {
+    case nfsv3Procs::null:
+    case nfsv3Procs::fsstat:
+    case nfsv3Procs::fsinfo:
+    case nfsv3Procs::pathconf:
+      return true;
+    default:
+      return false;
+  }
+}
+
+using AccessRateLimiters =
+    folly::Synchronized<folly::F14FastMap<uint32_t, NfsAccessRateLimiter>>;
+
+/**
+ * Whether one access mode entry rejects a request: Block always does,
+ * RateLimit only once `id`'s budget of `count` per `windowSeconds` is
+ * exhausted, and Log never does.
+ */
+bool accessModeRejects(
+    NfsAccessMode mode,
+    AccessRateLimiters& limiters,
+    uint32_t id,
+    uint32_t count,
+    uint32_t windowSeconds) {
+  switch (mode) {
+    case NfsAccessMode::Log:
+      return false;
+    case NfsAccessMode::Block:
+      return true;
+    case NfsAccessMode::RateLimit: {
+      // Shared lock on the common path; the bucket itself is atomic. Only
+      // the first request for an id takes the exclusive lock to create it.
+      // Bucket references never outlive the lock, so the map is free to
+      // rehash.
+      {
+        auto locked = limiters.rlock();
+        if (auto it = locked->find(id); it != locked->end()) {
+          return !it->second.allow(count, windowSeconds);
+        }
+      }
+      return !limiters.wlock()->try_emplace(id).first->second.allow(
+          count, windowSeconds);
+    }
+  }
+  return false;
+}
+
+/**
+ * Per-id access stats, exported as nfs.<name>.<id>.sum, .sum.60, etc. The
+ * wrapper formats the key only the first time it sees an id and caches the
+ * handle per thread.
+ */
+DEFINE_dynamic_timeseries(nfs_access_uid, "nfs.access.uid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(nfs_policed_uid, "nfs.policed.uid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(nfs_blocked_uid, "nfs.blocked.uid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(nfs_access_gid, "nfs.access.gid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(nfs_policed_gid, "nfs.policed.gid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(nfs_blocked_gid, "nfs.blocked.gid.{}", fb303::SUM);
+DEFINE_dynamic_timeseries(
+    nfs_access_uid_proc,
+    "nfs.access.uid.{}.{}",
+    fb303::SUM);
+DEFINE_dynamic_timeseries(
+    nfs_access_gid_proc,
+    "nfs.access.gid.{}.{}",
+    fb303::SUM);
+
 class Nfsd3ServerProcessor final : public RpcServerProcessor {
  public:
   explicit Nfsd3ServerProcessor(
@@ -78,27 +176,33 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
       ErrorLogger& errorLogger,
       AbsolutePath mountPath,
       CaseSensitivity caseSensitive,
-      uint32_t iosize,
+      uint32_t readIoSize,
+      uint32_t writeIoSize,
       folly::Promise<FsStopDataPtr>& stopPromise,
       ProcessAccessLog& processAccessLog,
       std::atomic<size_t>& traceDetailedArguments,
       std::shared_ptr<TraceBus<NfsTraceEvent>>& traceBus,
       std::chrono::nanoseconds longRunningFSRequestThreshold,
-      bool fastPathRPCs)
+      bool fastPathRPCs,
+      std::shared_ptr<ReloadableConfig> config,
+      InvalidatingInodes& invalidatingInodes)
       : dispatcher_(std::move(dispatcher)),
         straceLogger_(straceLogger),
         edenFsEventsLogger_(edenFsEventsLogger),
         errorLogger_(errorLogger),
         mountPath_(std::move(mountPath)),
         caseSensitive_(caseSensitive),
-        iosize_(iosize),
+        readIoSize_(readIoSize),
+        writeIoSize_(writeIoSize),
         stopPromise_{stopPromise},
         processAccessLog_{processAccessLog},
         traceDetailedArguments_(traceDetailedArguments),
         metadataSizeMismatchLogged_(false),
         traceBus_(traceBus),
         longRunningFSRequestThreshold_(longRunningFSRequestThreshold),
-        fastPathRPCs_(fastPathRPCs) {}
+        fastPathRPCs_(fastPathRPCs),
+        config_{std::move(config)},
+        invalidatingInodes_{invalidatingInodes} {}
 
   Nfsd3ServerProcessor(const Nfsd3ServerProcessor&) = delete;
   Nfsd3ServerProcessor(Nfsd3ServerProcessor&&) = delete;
@@ -111,12 +215,32 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
       uint32_t xid,
       uint32_t progNumber,
       uint32_t progVersion,
-      uint32_t procNumber) override;
+      uint32_t procNumber,
+      const std::optional<authsys_parms>& authSysCreds) override;
+
+  bool shouldParseAuthSysCreds() override;
+
+  auth_stat checkAuthentication(
+      const call_body& callBody,
+      const std::optional<authsys_parms>& authSysCreds) override;
 
   void onShutdown(RpcStopData stopData) override;
   void clientConnected() override;
+  void onExtraConnection() override {
+    dispatcher_->getStats()->increment(&NfsStats::nfsRpcExtraConnection);
+  }
+  void onExtraConnectionRefused() override {
+    dispatcher_->getStats()->increment(&NfsStats::nfsRpcExtraConnectionRefused);
+  }
   bool shouldFastPathRPCs() const override {
     return fastPathRPCs_;
+  }
+  bool acceptsMultipleConnections() const override {
+    return !config_ ||
+        !config_->getEdenConfig()->nfsRefuseExtraClientConnections.getValue();
+  }
+  bool gcStaleReplyEnabled() const {
+    return !config_ || config_->getEdenConfig()->nfsGcStaleReply.getValue();
   }
   bool isUnimplementedProc(uint32_t proc) const override;
 
@@ -233,7 +357,8 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
   ErrorLogger& errorLogger_;
   AbsolutePath mountPath_;
   CaseSensitivity caseSensitive_;
-  uint32_t iosize_;
+  uint32_t readIoSize_;
+  uint32_t writeIoSize_;
   // This promise is owned by the nfs3d. The nfs3d owns an RPC server that owns
   // this server processor. This promise should only be used during the
   // lifetime of  nfs3d. The way we currently enforce this is by waiting for
@@ -253,6 +378,13 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
    */
   std::chrono::nanoseconds longRunningFSRequestThreshold_;
   bool fastPathRPCs_;
+  std::shared_ptr<ReloadableConfig> config_;
+  InvalidatingInodes& invalidatingInodes_;
+  // Per-id budgets for NfsAccessMode::RateLimit entries, scoped to this
+  // mount's processor. Created on first use and kept for the processor's
+  // lifetime: the id set is small and bounded by config.
+  AccessRateLimiters uidRateLimiters_;
+  AccessRateLimiters gidRateLimiters_;
   std::atomic<size_t> inflightRequests_{0};
   // Used to check rate limiting. Set once in constructor via setFsChannel().
   // Nulled in onShutdown() before Nfsd3 destruction. The backpressure check
@@ -489,6 +621,27 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::setattr(
           XdrTrait<SETATTR3res>::serialize(ser, res);
         } else {
           const auto& setattrRes = try_.value();
+          if (setattrRes.noop && gcStaleReplyEnabled()) {
+            // A no-op SETATTR of a directory whose GC chmod is running is that
+            // chmod, see Nfsd3::invalidateWithQueueLimit. The stale reply is
+            // what makes the client forget the directory's names, so the
+            // children's references are cleared now, before it is sent:
+            // anything the client looks up afterwards it references anew. No
+            // lock is held here, so forget may take the directory's contents
+            // lock. Nothing tells GC's chmod apart from a client's own
+            // same-mode chmod of the directory while it runs: such a client
+            // takes the stale reply, fails once, and GC's chmod is then
+            // answered normally with nothing left to do. With the stale reply
+            // disabled the chmod is answered normally and
+            // Nfsd3::runInvalidation forgets once it succeeded.
+            if (auto forget = invalidatingInodes_.takeForget(ino)) {
+              forget();
+              stats->increment(&NfsStats::nfsInvalidationGcStaleReply);
+              SETATTR3res res{{{nfsstat3::NFS3ERR_STALE, SETATTR3resfail{}}}};
+              XdrTrait<SETATTR3res>::serialize(ser, res);
+              return folly::unit;
+            }
+          }
 
           SETATTR3res res{
               {{nfsstat3::NFS3_OK,
@@ -572,7 +725,8 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::lookup(
                 ser = std::move(ser),
                 dirAttrFut = std::move(dirAttrFut),
                 stats = dispatcher_->getStats().copy(),
-                ino = dirIno](
+                ino = dirIno,
+                &context](
                    folly::Try<std::tuple<InodeNumber, struct stat>>&&
                        lookupTry) mutable {
         return std::move(dirAttrFut)
@@ -580,9 +734,13 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::lookup(
                       ser = std::move(ser),
                       lookupTry = std::move(lookupTry),
                       stats = std::move(stats),
-                      ino](const folly::Try<struct stat>& dirStat) mutable {
+                      ino,
+                      &context](
+                         const folly::Try<struct stat>& dirStat) mutable {
               if (lookupTry.hasException()) {
                 auto error = exceptionToNfsError(lookupTry.exception(), stats);
+                // Whatever the error, no entry was handed out.
+                context.markNegativeLookup();
                 detail::logNfsError(
                     error,
                     lookupTry.exception(),
@@ -1572,13 +1730,15 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::fsinfo(
         FSINFO3resok{
             // TODO(xavierd): fill the post_op_attr.
             post_op_attr{},
-            /*rtmax=*/iosize_,
-            /*rtpref=*/iosize_,
+            /*rtmax=*/readIoSize_,
+            /*rtpref=*/readIoSize_,
             /*rtmult=*/1,
-            /*wtmax=*/iosize_,
-            /*wtpref=*/iosize_,
+            /*wtmax=*/writeIoSize_,
+            /*wtpref=*/writeIoSize_,
             /*wtmult=*/1,
-            /*dtpref=*/iosize_,
+            // READDIR replies are reads, so they share the read size. The
+            // client's dsize is configured separately via `nfs:dir-read-size`.
+            /*dtpref=*/readIoSize_,
             /*maxfilesize=*/std::numeric_limits<uint64_t>::max(),
             // TODO: support nanosecond granularity on Windows
             /*time_delta*/ folly::kIsWindows ? nfstime3{1, 0} : nfstime3{0, 1},
@@ -1643,13 +1803,24 @@ NfsArgsDetails formatSattr3(const sattr3& attr) {
     return std::string();
   };
 
-  // TODO(xavierd): format the times too?
+  auto formatTime = [](const auto& time) {
+    if (time.tag == time_how::SET_TO_SERVER_TIME) {
+      return std::string{"now"};
+    }
+    if (time.tag == time_how::SET_TO_CLIENT_TIME) {
+      const auto& value = std::get<nfstime3>(time.v);
+      return fmt::format("{}.{:09}", value.seconds, value.nseconds);
+    }
+    return std::string{};
+  };
   return fmt::format(
-      FMT_STRING("mode={}, uid={}, gid={}, size={}"),
+      FMT_STRING("mode={}, uid={}, gid={}, size={}, atime={}, mtime={}"),
       formatOpt(attr.mode, "{:#o}"),
       formatOpt(attr.uid),
       formatOpt(attr.gid),
-      formatOpt(attr.size));
+      formatOpt(attr.size),
+      formatTime(attr.atime),
+      formatTime(attr.mtime));
 }
 
 NfsArgsDetails formatSetattr(folly::io::Cursor deser) {
@@ -2128,6 +2299,35 @@ constexpr auto kNfs3dHandlers = [] {
   return handlers;
 }();
 
+/**
+ * The handler table's procedure names in lowercase, the spelling
+ * nfs:access-policy-procedures uses, built once on first use.
+ */
+const std::array<std::string, kNfs3dHandlers.size()>& lowerProcNames() {
+  static const auto names = [] {
+    std::array<std::string, kNfs3dHandlers.size()> lower;
+    for (size_t proc = 0; proc < kNfs3dHandlers.size(); ++proc) {
+      lower[proc] = kNfs3dHandlers[proc].name.str();
+      folly::toLowerAscii(lower[proc]);
+    }
+    return lower;
+  }();
+  return names;
+}
+
+/**
+ * Whether `proc` is in nfs:access-policy-procedures: one hash lookup of the
+ * procedure's lowercase name. Any other entry in the set, including a
+ * procedure name in different casing, matches nothing, and a procedure
+ * number outside the handler table is never policed.
+ */
+bool isPolicedProcedure(
+    uint32_t proc,
+    const std::unordered_set<std::string>& procedures) {
+  return proc < kNfs3dHandlers.size() &&
+      procedures.contains(lowerProcNames()[proc]);
+}
+
 bool Nfsd3ServerProcessor::isUnimplementedProc(uint32_t proc) const {
   return proc == folly::to_underlying(nfsv3Procs::commit) ||
       proc >= kNfs3dHandlers.size();
@@ -2195,12 +2395,23 @@ struct LiveRequest {
       const HandlerEntry& handlerEntry,
       folly::io::Cursor& deser,
       uint32_t xid,
-      uint32_t procNumber)
+      uint32_t procNumber,
+      const std::optional<authsys_parms>& authSysCreds)
       : traceBus_{std::move(traceBus)}, xid_{xid}, procNumber_{procNumber} {
     if (traceDetailedArguments.load(std::memory_order_acquire)) {
+      auto details = handlerEntry.formatArgs(deser);
+      // The kernel issues requests of its own, as root, next to those it
+      // makes for processes; the credential tells them apart in a trace.
+      if (authSysCreds) {
+        // Named apart from the uid and gid a SETATTR asks to set.
+        details.str += fmt::format(
+            "{}cred_uid={}, cred_gid={}",
+            details.str.empty() ? "" : ", ",
+            authSysCreds->uid,
+            authSysCreds->gid);
+      }
       traceBus_->publish(
-          NfsTraceEvent::start(
-              xid, procNumber, handlerEntry.formatArgs(deser)));
+          NfsTraceEvent::start(xid, procNumber, std::move(details)));
     } else {
       traceBus_->publish(NfsTraceEvent::start(xid, procNumber));
     }
@@ -2219,6 +2430,16 @@ struct LiveRequest {
   uint32_t xid_;
   uint32_t procNumber_;
 };
+
+/**
+ * Whether the procedure resolves a directory's entries, handing the client
+ * handles for (or names of) its children.
+ */
+bool resolvesEntries(uint32_t procNumber) {
+  const auto proc = static_cast<nfsv3Procs>(procNumber);
+  return proc == nfsv3Procs::lookup || proc == nfsv3Procs::readdir ||
+      proc == nfsv3Procs::readdirplus;
+}
 
 SamplingGroup nfsProcSamplingGroup(uint32_t procNumber) {
   XDCHECK(procNumber < kNfs3dHandlers.size())
@@ -2344,13 +2565,115 @@ void Nfsd3ServerProcessor::serializeInlineReject(
   serializeJukeboxError(ser, xid, proc);
 }
 
+bool Nfsd3ServerProcessor::shouldParseAuthSysCreds() {
+  // A detailed trace shows each request's uid and gid, which needs the
+  // credential parsed.
+  if (traceDetailedArguments_.load(std::memory_order_acquire) != 0) {
+    return true;
+  }
+  if (!config_) {
+    return false;
+  }
+  // Single decision point for the credential fast path: with no uid or gid
+  // entries configured, requests need no identity and the per-request
+  // AUTH_SYS parse is skipped entirely. Both maps are read off one snapshot.
+  auto config = config_->getEdenConfig();
+  return !config->nfsUidAccessPolicy.getValue().empty() ||
+      !config->nfsGidAccessPolicy.getValue().empty();
+}
+
+auth_stat Nfsd3ServerProcessor::checkAuthentication(
+    const call_body& callBody,
+    const std::optional<authsys_parms>& authSysCreds) {
+  // Control-plane procedures are exempt (see isAccessModeExempt), and
+  // requests without a parsable AUTH_SYS credential carry no identity;
+  // neither is ever acted on.
+  if (!config_ || !authSysCreds || isAccessModeExempt(callBody.proc)) {
+    return auth_stat::AUTH_OK;
+  }
+  // Every uid/gid entry the credential matches is counted, not just the
+  // first, and any rejecting one rejects the request. Block/rate_limit and
+  // the rate-limit budget apply only to procedures in
+  // nfs:access-policy-procedures; other procedures never reach the limiter.
+  auto config = config_->getEdenConfig();
+  // Resolved on the first matching entry, at most once per request: most
+  // requests match no entry at all.
+  std::optional<bool> policed;
+  auto isPoliced = [&] {
+    if (!policed) {
+      policed = isPolicedProcedure(
+          callBody.proc, config->nfsAccessPolicyProcedures.getValue());
+    }
+    return *policed;
+  };
+  const auto count = config->nfsAccessPolicyRateLimitCount.getValue();
+  const auto windowSeconds =
+      config->nfsAccessPolicyRateLimitWindowSeconds.getValue();
+  // Per-procedure keys use the lowercase handler name; a procedure number
+  // outside the table has none and is counted per id only.
+  const std::string* procName = callBody.proc < kNfs3dHandlers.size()
+      ? &lowerProcNames()[callBody.proc]
+      : nullptr;
+  bool block = false;
+
+  const auto& uidPolicy = config->nfsUidAccessPolicy.getValue();
+  if (auto entry = uidPolicy.find(authSysCreds->uid);
+      entry != uidPolicy.end()) {
+    STATS_nfs_access_uid.add(1, authSysCreds->uid);
+    if (procName) {
+      STATS_nfs_access_uid_proc.add(
+          1, authSysCreds->uid, std::string_view{*procName});
+    }
+    if (isPoliced()) {
+      STATS_nfs_policed_uid.add(1, authSysCreds->uid);
+      if (accessModeRejects(
+              entry->second,
+              uidRateLimiters_,
+              authSysCreds->uid,
+              count,
+              windowSeconds)) {
+        STATS_nfs_blocked_uid.add(1, authSysCreds->uid);
+        block = true;
+      }
+    }
+  }
+  for (const auto& [gid, mode] : config->nfsGidAccessPolicy.getValue()) {
+    if (!credsHaveGid(*authSysCreds, gid)) {
+      continue;
+    }
+    STATS_nfs_access_gid.add(1, gid);
+    if (procName) {
+      STATS_nfs_access_gid_proc.add(1, gid, std::string_view{*procName});
+    }
+    if (!isPoliced()) {
+      continue;
+    }
+    STATS_nfs_policed_gid.add(1, gid);
+    if (accessModeRejects(mode, gidRateLimiters_, gid, count, windowSeconds)) {
+      STATS_nfs_blocked_gid.add(1, gid);
+      block = true;
+    }
+  }
+  if (!block) {
+    return auth_stat::AUTH_OK;
+  }
+  dispatcher_->getStats()->increment(&NfsStats::nfsBlockedAccess);
+  // AUTH_TOOWEAK rather than AUTH_REJECTEDCRED: NFS clients treat TOOWEAK
+  // as terminal and surface a permission error to the caller (the macOS
+  // client maps it to a clean EACCES), while REJECTEDCRED asks the client
+  // to refresh its credential and retry, which would turn every blocked
+  // call into a retry loop.
+  return auth_stat::AUTH_TOOWEAK;
+}
+
 ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
     folly::io::Cursor deser,
     folly::io::QueueAppender ser,
     uint32_t xid,
     uint32_t progNumber,
     uint32_t progVersion,
-    uint32_t procNumber) {
+    uint32_t procNumber,
+    const std::optional<authsys_parms>& authSysCreds) {
   if (progNumber != kNfsdProgNumber) {
     serializeReply(ser, accept_stat::PROG_UNAVAIL, xid);
     return folly::unit;
@@ -2384,16 +2707,23 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
   auto inodeNumber = handlerEntry.formatArgs(deser).inode;
 
   auto liveRequest = LiveRequest{
-      traceBus_, traceDetailedArguments_, handlerEntry, deser, xid, procNumber};
+      traceBus_,
+      traceDetailedArguments_,
+      handlerEntry,
+      deser,
+      xid,
+      procNumber,
+      authSysCreds};
 
   // TODO: Add requestMetrics for NFS.
   std::shared_ptr<RequestMetricsScope::LockedRequestWatchList> nullRequestWatch;
   auto context = std::make_unique<NfsRequestContext>(
       xid,
-      handlerEntry.name,
+      static_cast<nfsv3Procs>(procNumber),
       processAccessLog_,
       edenFsEventsLogger_,
-      longRunningFSRequestThreshold_);
+      longRunningFSRequestThreshold_,
+      authSysCreds);
   context->startRequest(
       dispatcher_->getStats().copy(), handlerEntry.duration, nullRequestWatch);
   // The data that contextRef reference to is alive for the duration of the
@@ -2404,16 +2734,29 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
            return (this->*handlerEntry.handler)(
                std::move(deser), std::move(ser), contextRef);
          })
-      .thenValue([this, inodeNumber = std::move(inodeNumber)](auto&&) {
-        if (inodeNumber.has_value()) {
-          XLOGF(
-              DBG9,
-              "Update last fs request time for inode: {}",
-              inodeNumber.value());
-          return dispatcher_->updateLastFsRequestTime(inodeNumber.value());
-        }
-        return ImmediateFuture<folly::Unit>(folly::unit);
-      })
+      .thenValue(
+          [this, inodeNumber = std::move(inodeNumber), procNumber, &contextRef](
+              auto&&) {
+            if (inodeNumber.has_value()) {
+              const bool handsOutEntries =
+                  resolvesEntries(procNumber) && !contextRef.isNegativeLookup();
+              if (!handsOutEntries &&
+                  invalidatingInodes_.contains(inodeNumber.value())) {
+                XLOGF(
+                    DBG9,
+                    "Not updating last fs request time for inode {} being "
+                    "invalidated",
+                    inodeNumber.value());
+                return ImmediateFuture<folly::Unit>(folly::unit);
+              }
+              XLOGF(
+                  DBG9,
+                  "Update last fs request time for inode: {}",
+                  inodeNumber.value());
+              return dispatcher_->updateLastFsRequestTime(inodeNumber.value());
+            }
+            return ImmediateFuture<folly::Unit>(folly::unit);
+          })
       .thenTry([this, &handlerEntry](folly::Try<folly::Unit>&& res) {
         if (res.hasException()) {
           if (dispatcher_->getStats() && handlerEntry.countFailure) {
@@ -2469,14 +2812,18 @@ Nfsd3::Nfsd3(
     folly::Duration /*requestTimeout*/,
     std::shared_ptr<Notifier> /*notifier*/,
     CaseSensitivity caseSensitive,
-    uint32_t iosize,
+    uint32_t readIoSize,
+    uint32_t writeIoSize,
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval,
     std::chrono::nanoseconds longRunningFSRequestThreshold,
     size_t traceBusCapacity,
-    bool fastPathRPCs)
+    bool fastPathRPCs,
+    std::shared_ptr<ReloadableConfig> config,
+    FaultInjector& faultInjector)
     : privHelper_{privHelper},
       mountPath_{std::move(mountPath)},
+      faultInjector_{faultInjector},
       stats_{dispatcher->getStats().copy()},
       server_([&]() {
         auto proc = std::make_shared<Nfsd3ServerProcessor>(
@@ -2486,13 +2833,18 @@ Nfsd3::Nfsd3(
             errorLogger,
             mountPath_,
             caseSensitive,
-            iosize,
+            readIoSize,
+            writeIoSize,
             stopPromise_,
             processAccessLog_,
             traceDetailedArguments_,
             traceBus_,
             longRunningFSRequestThreshold,
-            fastPathRPCs);
+            fastPathRPCs,
+            // Not moved: the invalidation queue below reads its thread count
+            // from the config too.
+            config,
+            invalidatingInodes_);
         proc->setFsChannel(this);
         return RpcServer::create(
             std::move(proc),
@@ -2503,15 +2855,20 @@ Nfsd3::Nfsd3(
             highNfsRequestsLogInterval);
       }()),
       processAccessLog_(std::move(processInfoCache)),
-      invalidationExecutor_{
-          folly::SerialExecutor::create(folly::getGlobalCPUExecutor())},
+      edenFsEventsLogger_{edenFsEventsLogger},
       traceDetailedArguments_{0},
-      traceBus_{TraceBus<NfsTraceEvent>::create("NfsTrace", traceBusCapacity)} {
+      traceBus_{TraceBus<NfsTraceEvent>::create("NfsTrace", traceBusCapacity)},
+      invalidationQueue_{
+          config ? config->getEdenConfig()->nfsNumInvalidationThreads.getValue()
+                 : 1,
+          [this](Invalidation& invalidation) { runInvalidation(invalidation); },
+          fmt::format("nfsinval{}", mountPath_.basename())} {
   XLOGF(
       INFO,
       "Creating Nfsd3: mountPath={}, caseSensitive={}",
       mountPath_,
       caseSensitive);
+  invalidationQueue_.start();
 
   initializeInflightRequestsRateLimiter(maximumInFlightRequests);
 
@@ -2583,49 +2940,226 @@ folly::SemiFuture<folly::Unit> Nfsd3::unmount(UnmountOptions /* options */) {
 void Nfsd3::invalidate(
     AbsolutePath path,
     mode_t mode,
-    folly::Function<void()> onSuccess,
     std::optional<NfsInvalidationSource> source) {
-  auto stats = stats_.copy();
+  invalidationQueue_.add(
+      Invalidation{.path = std::move(path), .mode = mode, .source = source});
+}
+
+std::optional<folly::SemiFuture<std::optional<uint64_t>>>
+Nfsd3::invalidateWithQueueLimit(
+    AbsolutePath path,
+    mode_t mode,
+    folly::Function<uint64_t()> forget,
+    std::vector<InodeNumber> lineage,
+    size_t maxQueueSize,
+    const folly::CancellationToken& cancellationToken) {
+  folly::Promise<uint64_t> result;
+  auto resultFuture = result.getSemiFuture();
+  Invalidation invalidation{
+      std::move(path),
+      mode,
+      NfsInvalidationSource::Gc,
+      std::move(lineage),
+      [forget = std::move(forget), result = std::move(result)]() mutable {
+        auto outcome = folly::makeTryWith([&] { return forget(); });
+        // Release the inode references forget holds before waking the walk.
+        forget = nullptr;
+        result.setTry(std::move(outcome));
+      },
+      std::move(resultFuture)};
+  invalidation.done = folly::Promise<std::optional<uint64_t>>{};
+  auto done = invalidation.done.getSemiFuture();
+  if (!invalidationQueue_.addWithLimit(
+          std::move(invalidation), maxQueueSize, cancellationToken)) {
+    return std::nullopt;
+  }
+  return done;
+}
+
+/**
+ * Runs on the invalidation queue's threads. The chmod runs off the request
+ * threads because both the kernel and EdenFS hold locks that would otherwise
+ * deadlock; see InvalidationQueue.
+ */
+void InvalidatingInodes::add(
+    const std::vector<InodeNumber>& lineage,
+    folly::Function<void()> forget) {
+  if (lineage.empty()) {
+    return;
+  }
+  // A replaced forget holds inode references and is destroyed outside the
+  // lock, as in remove().
+  folly::Function<void()> replaced;
+  auto inodes = inodes_.wlock();
+  for (auto ino : lineage) {
+    ++(*inodes)[ino].count;
+  }
+  auto& head = (*inodes)[lineage[0]];
+  if (head.forget) {
+    // Both forgets clear the same directory's children, so replacing the
+    // earlier one only leaves its walk reporting no invalidation.
+    XLOGF_EVERY_MS(
+        ERR,
+        60'000,
+        "directory {} is already being invalidated",
+        lineage[0].get());
+  }
+  replaced = std::exchange(head.forget, std::move(forget));
+  numLineages_.fetch_add(1, std::memory_order_release);
+}
+
+void InvalidatingInodes::remove(const std::vector<InodeNumber>& lineage) {
+  if (lineage.empty()) {
+    return;
+  }
+  // A forget that no SETATTR took holds inode references; destroying it
+  // can take inode locks, so it dies after the lock below is released.
+  folly::Function<void()> forget;
+  auto inodes = inodes_.wlock();
+  if (auto head = inodes->find(lineage[0]); head != inodes->end()) {
+    forget = std::move(head->second.forget);
+  }
+  for (auto ino : lineage) {
+    auto it = inodes->find(ino);
+    XDCHECK(it != inodes->end()) << "inode " << ino.get() << " not registered";
+    if (it != inodes->end() && --it->second.count == 0) {
+      inodes->erase(it);
+    }
+  }
+  numLineages_.fetch_sub(1, std::memory_order_release);
+}
+
+bool InvalidatingInodes::contains(InodeNumber ino) const {
+  if (numLineages_.load(std::memory_order_acquire) == 0) {
+    return false;
+  }
+  return inodes_.rlock()->count(ino) != 0;
+}
+
+folly::Function<void()> InvalidatingInodes::takeForget(InodeNumber ino) {
+  if (numLineages_.load(std::memory_order_acquire) == 0) {
+    return nullptr;
+  }
+  auto inodes = inodes_.wlock();
+  if (auto it = inodes->find(ino); it != inodes->end()) {
+    return std::move(it->second.forget);
+  }
+  return nullptr;
+}
+
+void Nfsd3::runInvalidation(Invalidation& invalidation) {
+  const auto& path = invalidation.path;
+  const auto mode = invalidation.mode;
+  const auto source = invalidation.source;
+  const auto& stats = stats_;
+  const bool isGc = !invalidation.lineage.empty();
   incrementNfsGcInvalidationCounter(
       stats, source, &NfsStats::nfsInvalidationGcAttempt);
-  invalidationExecutor_->add([path = std::move(path),
-                              mode,
-                              onSuccess = std::move(onSuccess),
-                              source,
-                              stats = std::move(stats)]() mutable {
-    XLOGF(DBG9, "Invalidating: {} mode: {}", path.c_str(), mode);
-    const auto chmodResult = chmod(path.c_str(), mode);
-    const auto error = errno;
-    if (chmodResult == 0) {
-      incrementNfsGcInvalidationCounter(
-          stats, source, &NfsStats::nfsInvalidationGcSuccess);
-      XLOGF(DBG9, "Finished invalidating: {}", path.c_str());
-      if (onSuccess) {
-        onSuccess();
+  invalidatingInodes_.add(invalidation.lineage, std::move(invalidation.forget));
+  SCOPE_EXIT {
+    invalidatingInodes_.remove(invalidation.lineage);
+    if (invalidation.done.valid()) {
+      // remove() destroyed forget if no SETATTR took it, breaking result.
+      auto result = std::move(invalidation.result).getTry();
+      if (result.hasValue()) {
+        invalidation.done.setValue(result.value());
+      } else if (result.hasException<folly::BrokenPromise>()) {
+        invalidation.done.setValue(std::nullopt);
+      } else {
+        invalidation.done.setException(result.exception());
       }
-    } else if (error == ENOENT) {
-      incrementNfsGcInvalidationCounter(
-          stats, source, &NfsStats::nfsInvalidationGcEnoent);
-      // ENOENT is expected after removing files.
-      XLOGF(DBG9, "Finished invalidating (no longer exists): {}", path.c_str());
-    } else if (error == EACCES) {
-      incrementNfsGcInvalidationCounter(
-          stats, source, &NfsStats::nfsInvalidationGcFailure);
-      // Restricted directories can reject the synthetic chmod used to
-      // invalidate the NFS client cache.
-      XLOGF(
-          DBG9, "Finished invalidating (permission denied): {}", path.c_str());
-    } else {
-      incrementNfsGcInvalidationCounter(
-          stats, source, &NfsStats::nfsInvalidationGcFailure);
-      XLOGF(
-          DFATAL,
-          "Error invalidating path {} to mode {} using chmod: {}",
-          path,
-          mode,
-          folly::errnoStr(error));
     }
-  });
+  };
+  // Tests hold the chmod here, with the directory registered above, and send
+  // the requests the kernel would make for it themselves.
+  std::string_view relative = path.view();
+  const auto mountPrefix = mountPath_.view();
+  relative = relative.size() > mountPrefix.size() &&
+          relative.substr(0, mountPrefix.size()) == mountPrefix &&
+          relative[mountPrefix.size()] == '/'
+      ? relative.substr(mountPrefix.size() + 1)
+      : std::string_view{};
+  faultInjector_.check("nfsInvalidation", relative);
+  XLOGF(DBG9, "Invalidating: {} mode: {}", path.c_str(), mode);
+  const auto chmodResult = chmod(path.c_str(), mode);
+  const auto error = errno;
+  // GC's chmod is answered with a stale handle error on purpose, see
+  // invalidateWithQueueLimit, so ESTALE is its success.
+  bool staleReply = false;
+#ifndef _WIN32
+  staleReply = isGc && error == ESTALE;
+#endif
+  if (chmodResult == 0 || staleReply) {
+    incrementNfsGcInvalidationCounter(
+        stats, source, &NfsStats::nfsInvalidationGcSuccess);
+    XLOGF(DBG9, "Finished invalidating: {}", path.c_str());
+    if (chmodResult == 0 && !invalidation.lineage.empty()) {
+      // The SETATTR was answered normally, because
+      // experimental:nfs-gc-stale-reply is off or because it did not look
+      // like GC's own: forget the children now that the chmod succeeded, as
+      // GC did before the stale reply. The client keeps its names, so a
+      // forgotten child it uses again comes back as a stale file handle.
+      if (auto forget =
+              invalidatingInodes_.takeForget(invalidation.lineage[0])) {
+        forget();
+      }
+    }
+  } else if (error == ENOENT) {
+    incrementNfsGcInvalidationCounter(
+        stats, source, &NfsStats::nfsInvalidationGcEnoent);
+    // ENOENT is expected after removing files.
+    XLOGF(DBG9, "Finished invalidating (no longer exists): {}", path.c_str());
+  } else if (error == EACCES) {
+    incrementNfsGcInvalidationCounter(
+        stats, source, &NfsStats::nfsInvalidationGcFailure);
+    // Restricted directories can reject the synthetic chmod used to
+    // invalidate the NFS client cache.
+    XLOGF(DBG9, "Finished invalidating (permission denied): {}", path.c_str());
+#ifdef __APPLE__
+  } else if (error == EPERM) {
+    incrementNfsGcInvalidationCounter(
+        stats, source, &NfsStats::nfsInvalidationGcFailure);
+    // On macOS, EPERM is a known operational condition rather than a
+    // programming error: it typically means TCC denied the synthetic chmod
+    // because the daemon's responsible process lacks the
+    // SystemPolicyNetworkVolumes grant. When that happens every GC
+    // invalidation fails identically, so one line per daemon lifetime
+    // carries all the information. On other platforms EPERM stays in the
+    // generic DFATAL branch below: there it is a genuine anomaly.
+    XLOGF_FIRST_N(
+        ERR,
+        1,
+        "Permission denied invalidating path {} to mode {} using chmod. "
+        "This usually means TCC denied SystemPolicyNetworkVolumes "
+        "for the daemon's responsible process. Run `eden doctor`, or "
+        "restart EdenFS with `eden restart` to recover. Further EPERM "
+        "failures will not be logged; see the nfs.invalidation.gc.failure "
+        "counter.",
+        path,
+        mode);
+    // Emit the telemetry event on every EPERM failure so the event table
+    // carries the true failure count; the log line above stays
+    // once-per-daemon to avoid log spam. Per-failure emission is cheap and
+    // non-blocking: XplatLogger enqueues into a bounded queue (dropping,
+    // never blocking, when full) drained by a background Scribe producer.
+    if (edenFsEventsLogger_) {
+      edenFsEventsLogger_->logEvent(
+          TccInvalidationDenied{error, path.asString()});
+    }
+#endif
+  } else {
+    incrementNfsGcInvalidationCounter(
+        stats, source, &NfsStats::nfsInvalidationGcFailure);
+    // Not a programming error: the path is on the mount, so the chmod can
+    // fail for any reason an NFS request can.
+    XLOGF_EVERY_MS(
+        ERR,
+        60'000,
+        "Error invalidating path {} to mode {} using chmod: {}",
+        path,
+        mode,
+        folly::errnoStr(error));
+  }
 }
 
 uint32_t Nfsd3::getProgramNumber() {
@@ -2644,23 +3178,11 @@ void Nfsd3::invalidateInodes(
 }
 
 ImmediateFuture<folly::Unit> Nfsd3::completeInvalidations() {
-  folly::Promise<folly::Unit> promise;
-  auto result = promise.getFuture();
-  invalidationExecutor_->add([promise = std::move(promise)]() mutable {
-    // Since the invalidationExecutor_ is a SerialExecutor, this lambda will
-    // run only when all the previously added open have completed.
-    promise.setValue(folly::unit);
-  });
-  return result;
+  return invalidationQueue_.flush();
 }
 
 folly::coro::now_task<folly::Unit> Nfsd3::co_completeInvalidations() {
-  folly::Promise<folly::Unit> promise;
-  auto result = promise.getSemiFuture();
-  invalidationExecutor_->add([promise = std::move(promise)]() mutable {
-    promise.setValue(folly::unit);
-  });
-  co_await std::move(result);
+  co_await invalidationQueue_.flush().semi();
   co_return folly::unit;
 }
 

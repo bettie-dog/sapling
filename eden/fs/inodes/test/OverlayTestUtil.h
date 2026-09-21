@@ -11,9 +11,7 @@
 #include <memory>
 #include <sstream>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/PathFuncs.h"
-#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/Overlay.h"
@@ -37,24 +35,16 @@ inline std::string debugDumpOverlayInodes(
   return out.str();
 }
 
-/**
- * Create a test EdenFsEventsLogger for use in unit tests.
- * Uses NullStructuredLogger and null xplatLogger/reloadableConfig.
- */
 inline std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger() {
-  return std::make_shared<EdenFsEventsLogger>(
-      std::make_shared<NullStructuredLogger>(),
-      /*xplatLogger=*/nullptr,
-      /*reloadableConfig=*/nullptr,
-      makeRefPtr<EdenStats>());
+  return std::make_shared<EdenFsEventsLogger>(nullptr);
 }
 
 /**
  * Create a no-op ErrorLogger for use in unit tests.
- * Scribe is null so log() returns immediately.
+ * XplatLogger is null so log() returns immediately.
  */
 inline ErrorLogger makeTestErrorLogger() {
-  return ErrorLogger{nullptr, {}, nullptr};
+  return ErrorLogger{};
 }
 
 // Friend of Overlay so tests can drive the private WAL compaction path

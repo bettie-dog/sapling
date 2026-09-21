@@ -11,7 +11,11 @@
 #include <folly/Range.h>
 #include <folly/SocketAddress.h>
 #include <sys/types.h>
+#include <chrono>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace folly {
 class EventBase;
@@ -33,8 +37,6 @@ struct NFSMountOptions {
   folly::SocketAddress mountdAddr;
   folly::SocketAddress nfsdAddr;
   bool readOnly = false;
-  // DEPRECATED: use readIOSize and writeIOSize instead
-  uint32_t iosize{};
   bool useReaddirplus = false;
   bool useSoftMount = false;
   uint32_t readIOSize{};
@@ -76,6 +78,78 @@ struct StopFileAccessMonitorResponse {
   std::string tmpOutputPath;
   std::string specifiedOutputPath;
   bool shouldUpload;
+};
+
+/*
+ * Environment variables that carry the restart budget across a relaunch.
+ *
+ * The privhelper sets them on the daemon it spawns, and that daemon reports
+ * them back to the next privhelper in EdenFsRestartArgs.
+ */
+inline constexpr folly::StringPiece kEdenFsRestartCountEnv{
+    "EDENFS_RESTART_COUNT"};
+inline constexpr folly::StringPiece kEdenFsFirstRestartAtEnv{
+    "EDENFS_FIRST_RESTART_AT"};
+
+/**
+ * Read one of the restart-budget environment variables above.
+ *
+ * Absent, empty or malformed all mean zero, which is the right answer for a
+ * daemon the user started.
+ */
+uint64_t readEdenFsRestartCounterEnv(folly::StringPiece name);
+
+/*
+ * How long a crash relaunch waits for the startup below it, and how long it
+ * then gives that startup to exit once it stops waiting.
+ *
+ * A relaunch is best effort, so these are deliberately far shorter than the
+ * restart window the circuit breaker counts over. `kRelaunchStartupTimeout` is
+ * the daemon waiting on the process it spawned and `kSupervisorStartupTimeout`
+ * is the privhelper waiting on that daemon; the static_assert holds the
+ * daemon's wait, plus the budget it spends terminating a hung child, inside
+ * the privhelper's, whose expiry is a SIGKILL that would leave that child
+ * unsupervised.
+ *
+ * The termination budget matches the daemon's own SIGTERM budget:
+ * core:sigterm-shutdown-timeout defaults to 20s, plus slack to finish exiting.
+ */
+inline constexpr std::chrono::seconds kRestartTerminationTimeout{30};
+inline constexpr std::chrono::seconds kRelaunchStartupTimeout{120};
+inline constexpr std::chrono::seconds kSupervisorStartupTimeout{180};
+static_assert(
+    kRelaunchStartupTimeout + kRestartTerminationTimeout <
+    kSupervisorStartupTimeout);
+
+/*
+ * Everything the privhelper needs in order to relaunch edenfs after a crash.
+ *
+ * The privhelper reads no configuration of its own: edenfs delivers the backoff
+ * policy and the command to relaunch with here.
+ */
+struct EdenFsRestartArgs {
+  bool enabled = false;
+  // The daemon's restart sentinel: an empty file whose existence is the "still
+  // armed" flag, and whose name carries the pid and a per-arm token that
+  // identify the generation that created it. A clean shutdown removes it.
+  std::string sentinelPath;
+  // The command line to relaunch edenfs with, already stripped of sudo,
+  // `--takeover` and inherited file descriptor arguments.
+  std::vector<std::string> relaunchArgv;
+  // The environment to relaunch with. The privhelper replaces the child's
+  // environment wholesale, so an incomplete one leaves the new daemon without
+  // a PATH, HOME or USER. Applied in order, so a later entry for a key wins.
+  std::vector<std::pair<std::string, std::string>> relaunchEnv;
+  // Restarts already performed within the current window. The privhelper exits
+  // after restarting, so the count travels to the new daemon through the
+  // environment and comes back here from the new daemon.
+  uint32_t restartCount = 0;
+  uint64_t firstRestartEpochSec = 0;
+  uint32_t maxRestarts = 0;
+  uint32_t windowSeconds = 0;
+
+  friend bool operator==(const EdenFsRestartArgs&, const EdenFsRestartArgs&) =
+      default;
 };
 
 struct NamespaceInfo {
@@ -251,6 +325,32 @@ class PrivHelper {
   virtual void setEdenFsEventsLogger(
       std::shared_ptr<EdenFsEventsLogger> /* logger */) {}
 
+  /**
+   * Give the privhelper what it needs to relaunch edenfs if this daemon dies
+   * without first calling notifyCleanShutdown().
+   *
+   * Default no-op so that FakePrivHelper and StubPrivHelper need no changes.
+   */
+  [[nodiscard]] virtual folly::Future<folly::Unit> setRestartArgs(
+      const EdenFsRestartArgs& args);
+
+  /**
+   * Tell the privhelper that this daemon is shutting down deliberately.
+   *
+   * One-way and best effort: there is no response, and a failure to deliver
+   * must not block shutdown. Default no-op so that FakePrivHelper and
+   * StubPrivHelper need no changes.
+   */
+  virtual void notifyCleanShutdown(folly::StringPiece reason) noexcept;
+
+  /**
+   * Override the threshold after which a pending privhelper request is
+   * reported as stalled. Test-only. Default no-op so that FakePrivHelper and
+   * StubPrivHelper need no changes.
+   */
+  virtual void setRequestStallThresholdForTest(
+      std::chrono::milliseconds /* threshold */) {}
+
   /*
    * Explicitly stop the privhelper process.
    *
@@ -271,7 +371,8 @@ class PrivHelper {
   virtual int stop() = 0;
 
   /**
-   * Returns the underlying file descriptor value.
+   * Returns the underlying file descriptor value, or -1 if the connection
+   * has been closed.
    * This is intended to be used to pass the privhelper_fd option down
    * to a child process and it must not to used for general reading/writing.
    */

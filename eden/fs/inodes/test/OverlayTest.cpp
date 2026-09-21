@@ -28,10 +28,11 @@
 #include <thread>
 
 #include "eden/common/testharness/TempFile.h"
-#include "eden/common/utils/PathMapMutator.h"
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
+#include "eden/fs/inodes/InodeMetadata.h"
+#include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/OverlayFile.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/fscatalog/InodePath.h"
@@ -40,7 +41,7 @@
 #include "eden/fs/service/PrettyPrinters.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/test/CapturingScribeLogger.h"
+#include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestChecks.h"
@@ -660,12 +661,12 @@ TEST_P(RawOverlayTest, cannot_create_overlay_file_in_corrupt_overlay) {
 
 TEST(OverlayErrorLoggingTest, createOverlayFileLogsErrorOnFailure) {
   folly::test::TemporaryDirectory testDir;
-  auto scribe = std::make_shared<CapturingScribeLogger>();
+  CapturingXplatLogger xplatLogger;
   auto edenConfig = EdenConfig::createTestEdenConfig();
   edenConfig->enableErrorLogging.setValue(
       true, ConfigSourceType::Default, true);
   auto config = std::make_shared<ReloadableConfig>(edenConfig);
-  ErrorLogger errorLogger(scribe, SessionInfo{}, config);
+  ErrorLogger errorLogger(config, &xplatLogger);
 
   auto overlay = Overlay::create(
       canonicalPath(testDir.path().string()),
@@ -691,10 +692,9 @@ TEST(OverlayErrorLoggingTest, createOverlayFileLogsErrorOnFailure) {
       overlay->createOverlayFile(ino, folly::ByteRange{"contents"_sp}),
       std::system_error);
 
-  ASSERT_EQ(scribe->messages().size(), 1);
-  const auto& msg = scribe->messages()[0];
-  EXPECT_NE(msg.find("overlay"), std::string::npos)
-      << "Should contain overlay component, got: " << msg;
+  ASSERT_EQ(xplatLogger.events().size(), 1);
+  EXPECT_EQ(
+      xplatLogger.events()[0].event.getStringMap().at("component"), "overlay");
 }
 
 TEST_P(RawOverlayTest, cannot_save_overlay_dir_when_closed) {
@@ -750,6 +750,29 @@ TEST_P(RawOverlayTest, max_inode_number_is_1_if_overlay_is_empty) {
   EXPECT_EQ(2_ino, overlay->allocateInodeNumber());
 }
 
+// An unclean restart rediscovers the next inode number by scanning the
+// overlay, so numbers above the highest referenced one get handed out again.
+// Metadata records for those numbers belong to inodes that no longer exist,
+// and a new inode must not inherit them.
+TEST_P(RawOverlayTest, uncleanRestartDropsMetadataAboveNextInodeNumber) {
+  auto ino = overlay->allocateInodeNumber();
+  auto record = [] {
+    return InodeMetadata{S_IFLNK | 0755, 0, 0, InodeTimestamps{}};
+  };
+  // The root is the highest inode number the scan finds, so its record is
+  // the last one that must survive.
+  overlay->getInodeMetadataTable()->populateIfNotSet(kRootNodeId, record);
+  overlay->getInodeMetadataTable()->populateIfNotSet(ino, record);
+  ASSERT_TRUE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+
+  recreate(OverlayRestartMode::UNCLEAN);
+
+  EXPECT_TRUE(
+      overlay->getInodeMetadataTable()->getOptional(kRootNodeId).has_value());
+  EXPECT_FALSE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+  EXPECT_EQ(ino, overlay->allocateInodeNumber());
+}
+
 TEST_P(RawOverlayTest, allocateInodeNumbers) {
   // Allocate a range of 5 inode numbers starting from 2
   auto start = overlay->allocateInodeNumbers(5);
@@ -769,6 +792,62 @@ TEST_P(RawOverlayTest, allocateInodeNumbers) {
   auto start3 = overlay->allocateInodeNumbers(0);
   EXPECT_EQ(12_ino, start3);
   EXPECT_EQ(12_ino, overlay->allocateInodeNumber());
+}
+
+TEST_P(RawOverlayTest, persistsInodeReservation) {
+  constexpr uint64_t reservationSize = 4096;
+  const auto reservationPath =
+      (getLocalDir() + "inode-reservation"_pc).asString();
+  const auto initialReservation = std::to_string(2 + reservationSize);
+  const auto secondReservation = std::to_string(2 + 2 * reservationSize);
+  EXPECT_TRUE(boost::filesystem::is_symlink(reservationPath));
+  EXPECT_EQ(
+      initialReservation,
+      boost::filesystem::read_symlink(reservationPath).string());
+
+  EXPECT_EQ(2_ino, overlay->allocateInodeNumbers(reservationSize));
+  EXPECT_EQ(
+      initialReservation,
+      boost::filesystem::read_symlink(reservationPath).string());
+
+  EXPECT_EQ(InodeNumber{2 + reservationSize}, overlay->allocateInodeNumber());
+  EXPECT_EQ(
+      secondReservation,
+      boost::filesystem::read_symlink(reservationPath).string());
+
+  overlay->close();
+  ASSERT_EQ(0, unlink((getLocalDir() + "next-inode-number"_pc).c_str()));
+  EXPECT_TRUE(boost::filesystem::is_symlink(reservationPath));
+  EXPECT_EQ(
+      secondReservation,
+      boost::filesystem::read_symlink(reservationPath).string());
+}
+
+TEST_P(RawOverlayTest, replacesInvalidInodeReservation) {
+  constexpr uint64_t reservationSize = 4096;
+  const auto reservationPath =
+      (getLocalDir() + "inode-reservation"_pc).asString();
+  overlay->close();
+  overlay = nullptr;
+  ASSERT_EQ(0, unlink(reservationPath.c_str()));
+  ASSERT_EQ(0, symlink("invalid", reservationPath.c_str()));
+
+  EXPECT_NO_THROW(loadOverlay());
+  EXPECT_EQ(
+      std::to_string(2 + reservationSize),
+      boost::filesystem::read_symlink(reservationPath).string());
+}
+
+TEST_P(RawOverlayTest, inodeReservationWriteFailureFailsInitialization) {
+  const auto reservationPath =
+      (getLocalDir() + "inode-reservation"_pc).asString();
+  const auto tempPath = (getLocalDir() + "inode-reservation.tmp"_pc).asString();
+  overlay->close();
+  overlay = nullptr;
+  ASSERT_EQ(0, unlink(reservationPath.c_str()));
+  ASSERT_TRUE(boost::filesystem::create_directory(tempPath));
+
+  EXPECT_THROW(loadOverlay(), std::system_error);
 }
 
 TEST_P(RawOverlayTest, remembers_max_inode_number_of_tree_inodes) {
@@ -1381,9 +1460,12 @@ struct WalLifecycleOverlay {
 
 WalLifecycleOverlay makeWalLifecycleOverlay(
     const AbsolutePath& dir,
-    CaseSensitivity caseSensitive = kPathMapDefaultCaseSensitive) {
+    CaseSensitivity caseSensitive = kPathMapDefaultCaseSensitive,
+    uint64_t walMinCompactionThreshold = 0) {
   auto rawConfig = EdenConfig::createTestEdenConfig();
   rawConfig->overlayUseWal.setValue(true, ConfigSourceType::CommandLine);
+  rawConfig->experimentalOverlayWalMinCompactionThreshold.setValue(
+      walMinCompactionThreshold, ConfigSourceType::CommandLine);
   auto reloadable = std::make_shared<ReloadableConfig>(rawConfig);
   auto stats = makeRefPtr<EdenStats>();
   auto noopErrorLogger = makeTestErrorLogger();
@@ -1542,6 +1624,26 @@ TEST(WalCompactionTest, compactsWhenRngHits) {
   bundle.overlay->close();
 }
 
+TEST(WalCompactionTest, smallDirectoryUsesMinimumThreshold) {
+  folly::test::TemporaryDirectory tmp("eden_wal_compact");
+  auto dir = canonicalPath(tmp.path().string());
+  auto bundle = makeWalLifecycleOverlay(
+      dir, kPathMapDefaultCaseSensitive, /*walMinCompactionThreshold=*/300);
+  ASSERT_NE(nullptr, bundle.store);
+  // Without the floor, 3 * max(size, 10) = 30 would compact an empty
+  // directory. The floor keeps this WAL append deferred.
+  OverlayTestHelper::setWalCompactionRng(*bundle.overlay, [] { return 30u; });
+
+  auto parent = bundle.overlay->allocateInodeNumber();
+  DirContents content(kPathMapDefaultCaseSensitive);
+  bundle.store->appendWalEntry(
+      parent, WalOpType::REMOVE, PathComponentPiece{"x"}, nullptr);
+  OverlayTestHelper::maybeCompactWal(*bundle.overlay, parent, content);
+  EXPECT_TRUE(bundle.store->hasWal(parent));
+
+  bundle.overlay->close();
+}
+
 TEST(WalCompactionTest, nonWalCatalogDoesNotInvokeRng) {
   auto tmpdir = makeTempDir("eden_wal_compact");
   auto path = realpath(tmpdir.path().string());
@@ -1649,6 +1751,88 @@ TEST(OverlayLoadWalTest, loadAppliesDelta) {
   bundle.overlay->close();
 }
 
+// A WAL ADD the Overlay cannot represent, because its inode number was never
+// allocated or its mode has bits DirEntry cannot hold, is dropped from the
+// merged directory instead of aborting on the DirEntry or visitDirEntries
+// checks. The drop counts as a parse error, so the base is rewritten and the
+// WAL removed.
+class OverlayLoadCorruptWalTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    bundle_ = makeWalLifecycleOverlay(canonicalPath(tmp_.path().string()));
+    ASSERT_NE(nullptr, bundle_.store);
+    parent_ = bundle_.overlay->allocateInodeNumber();
+    DirContents base(kPathMapDefaultCaseSensitive);
+    base.emplace(
+        "a"_pc, S_IFREG | 0644, bundle_.overlay->allocateInodeNumber());
+    bundle_.overlay->saveOverlayDir(parent_, base);
+  }
+
+  void TearDown() override {
+    bundle_.overlay->close();
+  }
+
+  void appendAdd(PathComponentPiece name, int32_t mode, uint64_t inodeNumber) {
+    overlay::OverlayEntry entry;
+    entry.mode() = mode;
+    entry.inodeNumber() = inodeNumber;
+    bundle_.store->appendWalEntry(parent_, WalOpType::ADD, name, &entry);
+  }
+
+  void expectOnlyBaseEntrySurvives() {
+    auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+    EXPECT_EQ(1u, loaded.size());
+    EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+    EXPECT_FALSE(bundle_.store->hasWal(parent_));
+  }
+
+  folly::test::TemporaryDirectory tmp_{"eden_wal_load_corrupt"};
+  WalLifecycleOverlay bundle_;
+  InodeNumber parent_;
+};
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithUnallocatedInodeNumber) {
+  appendAdd(
+      "bogus"_pc,
+      S_IFREG | 0644,
+      bundle_.overlay->getMaxInodeNumber().get() + 1000);
+  expectOnlyBaseEntrySurvives();
+}
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithInvalidMode) {
+  appendAdd(
+      "bogus"_pc,
+      0x0f000000 | S_IFREG | 0644,
+      bundle_.overlay->allocateInodeNumber().get());
+  expectOnlyBaseEntrySurvives();
+}
+
+// fsck folds WAL entries into the base file without being able to check
+// their modes, so the base is validated the same way: an entry with a mode
+// DirEntry cannot hold is dropped and the base rewritten without it.
+TEST_F(OverlayLoadCorruptWalTest, dropsBaseEntryWithInvalidMode) {
+  overlay::OverlayEntry good;
+  good.mode() = S_IFREG | 0644;
+  good.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayEntry bad;
+  bad.mode() = 0x0f000000 | S_IFREG | 0644;
+  bad.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayDir dir;
+  dir.entries()->emplace("a", good);
+  dir.entries()->emplace("bogus", bad);
+  auto* catalog = bundle_.overlay->getRawInodeCatalog();
+  catalog->saveOverlayDir(parent_, std::move(dir));
+
+  auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+  EXPECT_EQ(1u, loaded.size());
+  EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+
+  auto rewritten = catalog->loadOverlayDir(parent_);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("a"));
+}
+
 TEST(OverlayLoadWalTest, collapsedAddRemoveIsApplied) {
   folly::test::TemporaryDirectory tmp("eden_wal_load_collapse");
   auto dir = canonicalPath(tmp.path().string());
@@ -1663,8 +1847,8 @@ TEST(OverlayLoadWalTest, collapsedAddRemoveIsApplied) {
   bundle.overlay->saveOverlayDir(parent, base);
 
   // ADD then REMOVE for a fresh name → loadWalDelta collapses to REMOVE,
-  // which the mutator then erases. The base "a" is unaffected since the
-  // collapsed delta only touches "b".
+  // which the WAL replay then erases. The base "a" is unaffected since
+  // the collapsed delta only touches "b".
   overlay::OverlayEntry entryB;
   entryB.mode() = S_IFREG | 0644;
   entryB.inodeNumber() = bundle.overlay->allocateInodeNumber().get();
@@ -1731,7 +1915,7 @@ TEST(OverlayLoadWalTest, collapsedAddOverwritesBaseEntry) {
   auto it = loaded.find("foo"_pc);
   ASSERT_NE(loaded.end(), it);
   // Without insert_or_assign, this would still report baseChild because
-  // PathMapMutator::emplace silently drops collisions.
+  // PathMap::emplace leaves existing entries alone.
   EXPECT_EQ(walChild, it->second.getInodeNumber());
 
   bundle.overlay->close();

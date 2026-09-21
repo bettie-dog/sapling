@@ -223,6 +223,7 @@ mod tests {
             err: SaplingRemoteApiServerErrorKind::PermissionDenied {
                 tree_id: key.hgid,
                 request_acl: "test-acl".to_string(),
+                denial_message: None,
             },
             key: Some(key.clone()),
         }
@@ -503,6 +504,34 @@ mod tests {
         assert!(!has_permission_denied(
             missing.get(&missing_key).expect("missing omitted key")
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_stats_error_does_not_fail_fetch() -> Result<()> {
+        let k = key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2");
+        let data = delta("1234", None, k.clone()).data;
+
+        let client = FakeSaplingRemoteApi::new()
+            .trees(hashmap! { k.clone() => data })
+            .tree_stats_error()
+            .into_arc();
+        let remote_trees = SaplingRemoteApiRemoteStore::<Tree>::new(client);
+
+        let mut store = TreeStore::empty();
+        store.edenapi = Some(remote_trees);
+
+        let fetched = store.fetch_batch(
+            FetchContext::default(),
+            std::iter::once(k.clone()),
+            TreeAttributes::CONTENT,
+        );
+        let (found, missing, errors) = fetched.consume();
+
+        assert!(found.contains_key(&k));
+        assert!(missing.is_empty());
+        assert!(errors.is_empty());
 
         Ok(())
     }

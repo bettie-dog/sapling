@@ -1,9 +1,5 @@
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
-# wezterm-dynamic 0.2.1 on crates.io predates the "std" feature that
-# sapling-io and friends require; the feature exists (at the same version
-# number) only in the wezterm git repo so far.
-wezterm-dynamic = { git = "https://github.com/wezterm/wezterm", rev = "4b1c3c151eb530e569f867e1461693c56fe89695" }
 
 [workspace]
 members = [
@@ -25,6 +21,7 @@ members = [
   "lib/blackbox",
   "lib/blackbox/serde_alt",
   "lib/blob",
+  "lib/cas-client",
   "lib/cats",
   "lib/cats/constants",
   "lib/checkout",
@@ -117,6 +114,7 @@ members = [
   "lib/edenfs_ffi/cxxerror",
   "lib/encoding",
   "lib/exchange",
+  "lib/filelint",
   "lib/filewalk",
   "lib/filters",
   "lib/formatter",
@@ -221,6 +219,7 @@ members = [
   "lib/util/redacted",
   "lib/util/rewrite-macros",
   "lib/util/rewrite-macros/tree-pattern-match",
+  "lib/util/sigbus-memops",
   "lib/util/sysutil",
   "lib/util/testutil",
   "lib/util/time-interval",
@@ -273,6 +272,7 @@ members = [
   "saplingnative/bindings/modules/pyerror",
   "saplingnative/bindings/modules/pyexchange",
   "saplingnative/bindings/modules/pyfail",
+  "saplingnative/bindings/modules/pyfilelint",
   "saplingnative/bindings/modules/pyfilewalk",
   "saplingnative/bindings/modules/pyformatutil",
   "saplingnative/bindings/modules/pyfs",

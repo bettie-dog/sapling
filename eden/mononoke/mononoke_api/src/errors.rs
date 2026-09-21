@@ -103,6 +103,8 @@ pub enum MononokeError {
     HookFailure(Vec<HookRejection>),
     #[error("not available: {0}")]
     NotAvailable(String),
+    #[error("manifest not derived for {0}")]
+    ManifestNotDerived(ChangesetId),
     #[error("permission denied: {0}")]
     AuthorizationError(String),
     #[error("permission denied: {0}")]
@@ -111,6 +113,8 @@ pub enum MononokeError {
     InternalError(#[source] InternalError),
     #[error("The blob {key} was redacted due to {reason}")]
     RedactionError { key: String, reason: String },
+    #[error("Bookmark move already processed")]
+    BookmarkMoveAlreadyProcessed,
 }
 
 impl From<Error> for MononokeError {
@@ -171,6 +175,7 @@ impl From<BookmarkMovementError> for MononokeError {
                 MononokeError::NonFastForwardMove { bookmark, from, to }
             }
             BookmarkMovementError::Error(e) => MononokeError::InternalError(InternalError::from(e)),
+            BookmarkMovementError::AlreadyProcessed => MononokeError::BookmarkMoveAlreadyProcessed,
             _ => MononokeError::InvalidRequest(e.to_string()),
         }
     }

@@ -40,14 +40,14 @@ GlobNodeImpl::GlobNodeImpl(
     bool includeDotfiles,
     bool hasSpecials,
     CaseSensitivity caseSensitive,
-    bool prefetchOptimizations,
-    uint32_t recursiveAsyncDepth)
+    uint32_t recursiveAsyncDepth,
+    std::shared_ptr<const GlobMatchOptions> matchOptions)
     : pattern_(pattern.str()),
       caseSensitive_(caseSensitive),
       includeDotfiles_(includeDotfiles),
       hasSpecials_(hasSpecials),
-      prefetchOptimizations_(prefetchOptimizations),
-      recursiveAsyncDepth_(recursiveAsyncDepth) {
+      recursiveAsyncDepth_(recursiveAsyncDepth),
+      matchOptions_{std::move(matchOptions)} {
   if (includeDotfiles && (pattern == "**" || pattern == "*")) {
     alwaysMatch_ = true;
   } else {
@@ -112,8 +112,8 @@ void GlobNodeImpl::parse(StringPiece pattern) {
               includeDotfiles_,
               hasSpecials,
               caseSensitive_,
-              prefetchOptimizations_,
-              recursiveAsyncDepth_));
+              recursiveAsyncDepth_,
+              matchOptions_));
       node = container->back().get();
     }
 

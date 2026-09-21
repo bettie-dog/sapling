@@ -119,6 +119,7 @@ impl ServiceError {
                 reason,
                 access,
                 permission_request_group,
+                denial_message,
                 ..
             }) => {
                 let reason = format!("{context}: {reason}");
@@ -126,6 +127,7 @@ impl ServiceError {
                     reason,
                     access,
                     permission_request_group,
+                    denial_message,
                     ..Default::default()
                 })
             }
@@ -296,11 +298,17 @@ impl From<MononokeError> for ServiceError {
                     reason,
                     access,
                     permission_request_group,
+                    denial_message: err.denial_message().map(str::to_string),
                     ..Default::default()
                 })
             }
             error @ MononokeError::NotAvailable(_) => Self::Request(thrift::RequestError {
                 kind: thrift::RequestErrorKind::NOT_AVAILABLE,
+                reason: error.to_string(),
+                ..Default::default()
+            }),
+            error @ MononokeError::ManifestNotDerived(_) => Self::Request(thrift::RequestError {
+                kind: thrift::RequestErrorKind::MANIFEST_NOT_DERIVED,
                 reason: error.to_string(),
                 ..Default::default()
             }),
@@ -327,6 +335,11 @@ impl From<MononokeError> for ServiceError {
                     reason: error.to_string(),
                     ..Default::default()
                 })
+            }
+            error @ MononokeError::BookmarkMoveAlreadyProcessed => {
+                // Only modern_sync mirror moves produce this, and SCS never
+                // sends them. Treat an unexpected leak as an internal error.
+                Self::Internal(internal_error(error))
             }
             MononokeError::InternalError(error) => {
                 let reason = format!("{error:#}");
@@ -402,6 +415,7 @@ macro_rules! impl_into_thrift_error {
 }
 
 impl_into_thrift_error!(service::ListReposExn);
+impl_into_thrift_error!(service::RepoExistsExn);
 impl_into_thrift_error!(service::RepoInfoExn);
 impl_into_thrift_error!(service::GitRepoStateExn);
 impl_into_thrift_error!(service::RepoResolveBookmarkExn);
@@ -415,6 +429,7 @@ impl_into_thrift_error!(service::RepoMoveBookmarkExn);
 impl_into_thrift_error!(service::RepoMultipleCommitLookupExn);
 impl_into_thrift_error!(service::RepoDeleteBookmarkExn);
 impl_into_thrift_error!(service::RepoLandStackExn);
+impl_into_thrift_error!(service::RepoRebaseStackExn);
 impl_into_thrift_error!(service::RepoBookmarkInfoExn);
 impl_into_thrift_error!(service::RepoStackInfoExn);
 impl_into_thrift_error!(service::RepoStackGitBundleStoreExn);

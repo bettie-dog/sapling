@@ -7,10 +7,16 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include <folly/CancellationToken.h>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <variant>
 
 #include <folly/Executor.h>
 #include <folly/executors/QueuedImmediateExecutor.h>
@@ -24,6 +30,7 @@
 namespace facebook::eden {
 
 class ObjectId;
+class SourceLocation;
 
 class ObjectFetchContext;
 
@@ -104,10 +111,89 @@ class ObjectFetchContext : public RefCounted {
     Unknown = 0,
     /** The request originated from a Thrift prefetch endpoint */
     Prefetch = 1,
+    /** The request originated from a Thrift glob endpoint */
+    Glob = 2,
     /** The request originated from a Thrift endpoint */
-    Thrift = 2,
+    Thrift = 3,
     /** Highest Priority - The request originated from FUSE/NFS/PrjFS */
-    Fs = 3,
+    Fs = 4,
+  };
+
+  static constexpr bool shouldTriggerWalkDetection(Cause cause) {
+    return cause != Cause::Prefetch && cause != Cause::Glob;
+  }
+
+  /**
+   * A string whose backing storage is guaranteed to have static lifetime.
+   * Use fromLiteral() for string literals, or fromSourceLocation() for function
+   * names supplied by EDEN_CURRENT_SOURCE_LOCATION.
+   */
+  class StaticCauseDetail {
+   public:
+    template <size_t Size>
+    static consteval StaticCauseDetail fromLiteral(
+        const char (&detail)[Size]) noexcept {
+      return StaticCauseDetail{detail, Size - 1};
+    }
+
+    static StaticCauseDetail fromSourceLocation(
+        SourceLocation sourceLocation) noexcept;
+
+    constexpr std::string_view asStringView() const noexcept {
+      return detail_;
+    }
+
+   private:
+    constexpr StaticCauseDetail(const char* detail, size_t size) noexcept
+        : detail_{detail, size} {}
+
+    explicit constexpr StaticCauseDetail(std::string_view detail) noexcept
+        : detail_{detail} {}
+
+    std::string_view detail_;
+  };
+
+  /**
+   * Optional detail associated with a fetch cause.
+   *
+   * Static details are allocation-free. Dynamic details use shared immutable
+   * storage, so this type is intentionally not usable in constant expressions.
+   */
+  class CauseDetail {
+   public:
+    constexpr CauseDetail() noexcept = default;
+    /* implicit */ CauseDetail(std::nullopt_t) noexcept {}
+    /* implicit */ CauseDetail(StaticCauseDetail detail) noexcept
+        : detail_{detail.asStringView()} {}
+
+    static CauseDetail fromOwnedString(std::string detail) {
+      return CauseDetail{
+          std::make_shared<const std::string>(std::move(detail))};
+    }
+
+    std::optional<std::string_view> asStringView() const& noexcept {
+      if (const auto* ownedDetail =
+              std::get_if<std::shared_ptr<const std::string>>(&detail_);
+          ownedDetail && *ownedDetail) {
+        return std::string_view{**ownedDetail};
+      }
+      if (const auto* staticDetail = std::get_if<std::string_view>(&detail_)) {
+        return *staticDetail;
+      }
+      return std::nullopt;
+    }
+
+    std::optional<std::string_view> asStringView() const&& = delete;
+
+   private:
+    explicit CauseDetail(std::shared_ptr<const std::string> detail) noexcept
+        : detail_{std::move(detail)} {}
+
+    std::variant<
+        std::monostate,
+        std::string_view,
+        std::shared_ptr<const std::string>>
+        detail_;
   };
 
   ObjectFetchContext() = default;
@@ -126,12 +212,41 @@ class ObjectFetchContext : public RefCounted {
   }
 
   /**
+   * The uid/gid claimed by the client that triggered this request, when
+   * known. Currently only populated for NFS requests, from the AUTH_SYS
+   * credential; note that AUTH_SYS credentials are client-asserted and
+   * spoofable, so these are suitable for telemetry and coarse policy only.
+   */
+  virtual std::optional<uint32_t> getClientUid() const {
+    return std::nullopt;
+  }
+
+  virtual std::optional<uint32_t> getClientGid() const {
+    return std::nullopt;
+  }
+
+  /**
    * If known, returns the reason these objects were fetched.
    */
   virtual Cause getCause() const = 0;
 
+  /**
+   * If known, returns additional detail about why these objects were fetched.
+   * The returned view remains valid only while this context is alive.
+   */
   virtual std::optional<std::string_view> getCauseDetail() const {
     return std::nullopt;
+  }
+
+  /**
+   * Return an owned copy that remains valid after this context is destroyed.
+   * Use getCauseDetail() when the result is consumed immediately.
+   */
+  CauseDetail copyCauseDetail() const {
+    if (const auto detail = getCauseDetail()) {
+      return CauseDetail::fromOwnedString(std::string{*detail});
+    }
+    return {};
   }
 
   /**
@@ -172,15 +287,15 @@ class ObjectFetchContext : public RefCounted {
       ObjectType type,
       EdenStatsPtr stats) {
     // There is no stat increment for FetchedSource::Unknown
-    if (saplingStatsMap_.find({fetchedSource, type}) !=
-        saplingStatsMap_.end()) {
-      stats->increment(saplingStatsMap_[{fetchedSource, type}]);
+    const auto counterIt = saplingStatsMap_.find({fetchedSource, type});
+    if (counterIt != saplingStatsMap_.end()) {
+      stats->increment(counterIt->second);
     }
-    fetchedSource_ = fetchedSource;
+    fetchedSource_.store(fetchedSource, std::memory_order_relaxed);
   }
 
   FetchedSource getFetchedSource() const {
-    return fetchedSource_;
+    return fetchedSource_.load(std::memory_order_relaxed);
   }
 
   // RequestInfo keys used by ReCasBackingStore
@@ -226,7 +341,7 @@ class ObjectFetchContext : public RefCounted {
    * auto ptr = ObjectFetchContext::getNullContextWithCauseDetail("someval");
    */
   static ObjectFetchContextPtr getNullContextWithCauseDetail(
-      std::string_view causeDetail);
+      CauseDetail causeDetail);
 
   /**
    * Return a no-op fetch context with Cause::Fs for tests.
@@ -283,7 +398,7 @@ class ObjectFetchContext : public RefCounted {
   ObjectFetchContext(const ObjectFetchContext&) = delete;
   ObjectFetchContext& operator=(const ObjectFetchContext&) = delete;
 
-  FetchedSource fetchedSource_{FetchedSource::Unknown};
+  std::atomic<FetchedSource> fetchedSource_{FetchedSource::Unknown};
 
   // Time tracer for instrumentation (may be nullptr)
   std::shared_ptr<MiniTracer> timeTracer_{nullptr};

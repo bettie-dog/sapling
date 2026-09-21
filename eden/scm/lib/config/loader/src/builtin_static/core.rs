@@ -26,6 +26,9 @@ ignorerevnum=True
 [checkout]
 resumable=true
 
+[filelint]
+max-file-size=10MB
+
 [tracing]
 stderr=false
 threshold=10
@@ -341,9 +344,6 @@ maxheadstobackup=-1
 
 [infinitepush]
 httpbookmarks=True
-
-[grep]
-command=xargs -0 grep
 
 [globalrevs]
 onlypushrebase=True

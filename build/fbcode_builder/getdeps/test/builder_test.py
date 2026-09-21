@@ -3,7 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
 
 import os
 import unittest
@@ -13,7 +12,6 @@ from .. import builder as builder_module
 from ..builder import CMakeBuilder
 from ..envfuncs import Env
 from ..manifest import ManifestContext, ManifestParser
-
 
 MINIMAL_MANIFEST = """
 [manifest]
@@ -42,6 +40,7 @@ def make_cmake_builder() -> CMakeBuilder:
                 "os": None,
                 "distro": None,
                 "distro_vers": None,
+                "distro_family": None,
                 "fb": "off",
                 "fbsource": "off",
                 "test": "off",

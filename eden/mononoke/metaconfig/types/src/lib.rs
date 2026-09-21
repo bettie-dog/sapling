@@ -164,6 +164,9 @@ pub struct CommonConfig {
     pub async_requests_config: AsyncRequestsConfig,
     /// Repo name prefix for RL Land Service push diversion.
     pub rl_land_service_repo_prefix: Option<String>,
+    /// Repo-name marker -> manifest repo, routing diverted pushes to the
+    /// manifest repo named in their submit_manifest_land request.
+    pub multi_repo_land_manifest_repos: BTreeMap<String, String>,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -211,6 +214,11 @@ pub struct RepoConfig {
     pub readonly: RepoReadOnly,
     /// Should files be checked for redaction
     pub redaction: Redaction,
+    /// When true, an upload to this repo may bypass redaction (log-only, not
+    /// blocked) if the caller holds the mirror_upload permission. Set only on
+    /// AWS Operational Shadow replica repos, which modern_sync keeps identical
+    /// to a source repo. Defaults to false: redaction is enforced.
+    pub mirror_upload_redaction_bypass_enabled: bool,
     /// Params for the hook manager
     pub hook_manager_params: Option<HookManagerParams>,
     /// Max number of results in listkeyspatterns.
@@ -298,6 +306,13 @@ pub struct RepoConfig {
     pub remote_diff_config: Option<RemoteDiffConfig>,
     /// Configuration for commit rate limiting.
     pub commit_rate_limit_config: Option<CommitRateLimitConfig>,
+    /// Version of the per-repo config snapshot this config was parsed from
+    /// (the last content-changing parse); `None` unless loaded via a
+    /// per-repo config handle.
+    pub config_version: Option<String>,
+    /// Mutation ID of the per-repo config snapshot; always `None` until the
+    /// configerator client exposes mutationId.
+    pub config_mutation_id: Option<i64>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -486,18 +501,6 @@ impl DerivationPipelineConfig {
     pub fn validate(&self) -> Result<()> {
         if self.types.is_empty() {
             bail!("Derivation pipeline config must have at least one derivable type");
-        }
-
-        // TODO: remove this guard once augmented manifests v2 implements
-        // `PipelineDerivable`. Until then v2 is configurable but not
-        // pipeline-derivable, so accepting it here would defer the failure to
-        // runtime (and only for v2, while v1 succeeds). Reject it at config load.
-        if self.types.contains(&DerivableType::HgAugmentedManifestsV2) {
-            bail!(
-                "pipeline_config.types cannot contain hg_augmented_manifests_v2: \
-                 augmented manifests v2 does not support derivation pipelines; \
-                 use hg_augmented_manifests instead"
-            );
         }
 
         for (stage_path, config) in &self.stages {
@@ -1053,7 +1056,7 @@ pub struct PushrebaseFlags {
     pub merge_resolution_override: MergeResolutionOverride,
     /// Per-request Sandcastle land instance id (`LAND_INSTANCE_ID` pushvar); stamped on Scuba to group a land's attempts. Observability only.
     pub land_instance_id: Option<String>,
-    /// Per-request Phabricator diff FBID (`PHAB_DIFF_ID` pushvar); the QE bucketing key, stamped on Scuba for per-diff dedup. Observability only.
+    /// Per-request Phabricator diff FBID (`PHAB_DIFF_ID` pushvar); stamped on Scuba for per-diff attribution (join key back to Landcastle/Phabricator datasets). Observability only.
     pub phab_diff_id: Option<String>,
 }
 
@@ -1066,8 +1069,16 @@ pub const PHAB_DIFF_ID_PUSHVAR_KEY: &str = "PHAB_DIFF_ID";
 /// Per-request override for the `pushrebase_enable_merge_resolution` JustKnob.
 ///
 /// `UseJk` (the default) consults the JK as before. `ForceOn`/`ForceOff`
-/// wins over the JK and is used by the QE rollout to assign requests to
-/// a treatment or control arm independent of the global flag.
+/// wins over the JK. This is the permanent per-land control surface for
+/// merge resolution:
+/// - `rebase_stack_onto` honors whatever the caller sets; the
+///   multi-repo-land manifest-land path built on it gates that on
+///   `scm/mononoke:sslv2_merge_resolution_enabled`;
+/// - the author-facing opt-out (`@no-merge-resolution` pragma ->
+///   Landcastle sends the pushvar as `"false"`) is tracked in T285699818,
+///   and exposure through checkout-less land APIs in T285699837.
+///
+/// Batched pushrebase does not honor the per-request override.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum MergeResolutionOverride {
     /// Defer to the `pushrebase_enable_merge_resolution` JustKnob (default).
@@ -1096,22 +1107,6 @@ impl MergeResolutionOverride {
             Some(b"true" | b"1") => Self::ForceOn,
             Some(b"false" | b"0") => Self::ForceOff,
             _ => Self::UseJk,
-        }
-    }
-
-    /// Stable Scuba label for the `mr_qe_arm` column, identifying which QE
-    /// arm a request was assigned to: `ForceOn` -> `"test"`, `ForceOff` ->
-    /// `"control"`, `UseJk` -> `"bypass"`. `"bypass"` covers both
-    /// out-of-experiment traffic and any path that does not honor the
-    /// per-request override (e.g. batched pushrebase), so `test`/`control`
-    /// rows always reflect lands that actually received their assigned
-    /// treatment. Never rename these literals without coordinating with the
-    /// QE readout/dashboards that bucket on `mr_qe_arm`.
-    pub fn qe_arm_str(&self) -> &'static str {
-        match self {
-            Self::ForceOn => "test",
-            Self::ForceOff => "control",
-            Self::UseJk => "bypass",
         }
     }
 }
@@ -1176,13 +1171,6 @@ mod merge_resolution_override_tests {
             MergeResolutionOverride::from_pushvar_value(Some(b"\xff\xfe")),
             MergeResolutionOverride::UseJk,
         );
-    }
-
-    #[mononoke::test]
-    fn qe_arm_str_maps_each_variant() {
-        assert_eq!(MergeResolutionOverride::ForceOn.qe_arm_str(), "test");
-        assert_eq!(MergeResolutionOverride::ForceOff.qe_arm_str(), "control");
-        assert_eq!(MergeResolutionOverride::UseJk.qe_arm_str(), "bypass");
     }
 }
 
@@ -2362,15 +2350,6 @@ pub enum UriGeneratorType {
     LocalFS,
 }
 
-/// Information on a loaded config
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub struct ConfigInfo {
-    /// A hash of the raw config content
-    pub content_hash: String,
-    /// The time when the config was last updated
-    pub last_updated_at: u64,
-}
-
 /// The concurrency setting to be used during git protocol
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct GitConcurrencyParams {
@@ -2603,15 +2582,39 @@ pub struct EnforcementConditionSet {
     /// Empty = don't filter on this dimension. Substring semantics
     /// (`Regex::is_match`). Invalid regexes are rejected at config parse time.
     pub client_identity_regexes: Vec<ComparableRegex>,
+    /// `None` = don't filter on this dimension; `Some(want)` = match only callers
+    /// whose `Metadata::likely_an_agent()` equals `want`.
+    pub is_agent: Option<bool>,
+}
+
+/// Parse a bare AMP group name into a `GROUP:` identity.
+///
+/// Restricted-path configs and `.slacl` files spell rollout allowlist groups as
+/// bare names, the same way `admin_bypass_group` does. Every rejection here is
+/// deliberate and fail-closed: silently accepting a malformed or already
+/// prefixed value would produce an identity that never matches any caller,
+/// leaving a tent owner believing an allowlist is active when it is not.
+pub fn parse_bare_group_name(value: &str) -> Result<MononokeIdentity> {
+    if value.is_empty() {
+        bail!("group name must not be empty");
+    }
+    if value.trim() != value {
+        bail!("group name `{value}` must not have leading or trailing whitespace");
+    }
+    if value.contains(':') {
+        bail!("expected a bare group name, got `{value}`: omit the `GROUP:` prefix");
+    }
+    MononokeIdentity::from_str(&format!("GROUP:{value}"))
+        .with_context(|| format!("Failed to parse group name `{value}`"))
 }
 
 /// Restriction metadata for a single restricted path.
 ///
-/// Supersedes the bare path -> ACL mapping that `path_acls` used to carry: it
-/// holds the REPO_REGION ACL, an optional permission-request group, and a
-/// `read_only` flag. When `read_only` is true, derivation stops recording new
-/// manifest-id-store entries for the path; enforcement on existing entries and
-/// config-based authorization are unaffected.
+/// Holds the REPO_REGION ACL, an optional permission-request group, an optional
+/// rollout allowlist group, and a `read_only` flag. When `read_only` is true,
+/// derivation stops recording new manifest-id-store entries for the path;
+/// enforcement on existing entries and config-based authorization are
+/// unaffected.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PathRestrictionMetadata {
     /// REPO_REGION ACL protecting this path.
@@ -2619,6 +2622,12 @@ pub struct PathRestrictionMetadata {
     /// AMP group clients are redirected to when requesting access, instead of
     /// exposing the REPO_REGION ACL. If `None`, defaults to `repo_region_acl`.
     pub permission_request_group: Option<MononokeIdentity>,
+    /// AMP group whose members are temporarily allowlisted to read this path
+    /// during rollout, so the tent owner can triage them before granting real
+    /// access in the REPO_REGION ACL. `None` means no rollout allowlist, which
+    /// is *not* the same as an empty group: a caller must be allowlisted for
+    /// every restricted path in a request for the allowlist to grant access.
+    pub rollout_allowlist_group: Option<MononokeIdentity>,
     /// When true, no new manifest-id-store entries are derived for this path.
     pub read_only: bool,
 }
@@ -2644,9 +2653,6 @@ pub struct RestrictedPathsConfig {
     pub soft_path_acls: Vec<SoftRestrictedPathConfig>,
     /// Group name for tooling that should be allowlisted for all restricted paths.
     pub tooling_allowlist_group: Option<String>,
-    /// Group name for tooling that is allowlisted during rollout for all restricted paths.
-    /// Used during rollout for tooling that will likely be permanently allowlisted.
-    pub rollout_allowlist_group: Option<String>,
     /// Group identity whose members may bypass all Path ACL enforcement — both
     /// read access to restricted paths and maintainer-gated `.slacl`
     /// modifications. Intended for admins fighting SEVs or debugging issues.
@@ -2661,6 +2667,8 @@ pub struct RestrictedPathsConfig {
     pub enforcement_enabled: bool,
     /// 4-stage rollout state for AclManifest. Defaults to `Disabled`.
     pub acl_manifest_mode: AclManifestMode,
+    /// Free text appended to restricted-path denial errors.
+    pub denial_message: Option<String>,
 }
 
 const DEFAULT_ACL_FILE_NAME: &str = ".slacl";
@@ -2672,12 +2680,12 @@ impl Default for RestrictedPathsConfig {
             manifest_id_store_config: RestrictedPathsManifestIdStoreConfig::default(),
             soft_path_acls: Vec::new(),
             tooling_allowlist_group: None,
-            rollout_allowlist_group: None,
             admin_bypass_group: None,
             acl_file_name: DEFAULT_ACL_FILE_NAME.to_string(),
             enforcement_condition_sets: Vec::new(),
             enforcement_enabled: false,
             acl_manifest_mode: AclManifestMode::Disabled,
+            denial_message: None,
         }
     }
 }
@@ -2732,6 +2740,12 @@ pub struct RestrictedPathsAclFile {
     /// that transitively provides access to the ACL.
     /// If not specified, will default to `repo_region_acl`.
     permission_request_group: Option<MononokeIdentity>,
+    /// AMP group whose members are temporarily allowlisted to read this
+    /// directory during rollout, so the tent owner can triage them before
+    /// granting real access in the REPO_REGION ACL. `None` means no rollout
+    /// allowlist: a caller must be allowlisted for every restricted path in a
+    /// request for the allowlist to grant access.
+    rollout_allowlist_group: Option<MononokeIdentity>,
     // TODO(T248660053): possibly add dry-run mode
 }
 
@@ -2740,10 +2754,12 @@ impl RestrictedPathsAclFile {
     pub fn new(
         repo_region_acl: MononokeIdentity,
         permission_request_group: Option<MononokeIdentity>,
+        rollout_allowlist_group: Option<MononokeIdentity>,
     ) -> Result<Self> {
         Self {
             repo_region_acl,
             permission_request_group,
+            rollout_allowlist_group,
         }
         .validate()
     }
@@ -2760,6 +2776,11 @@ impl RestrictedPathsAclFile {
     /// If not specified, will default to `repo_region_acl`.
     pub fn permission_request_group(&self) -> Option<&MononokeIdentity> {
         self.permission_request_group.as_ref()
+    }
+
+    /// AMP group temporarily allowlisted to read this directory during rollout.
+    pub fn rollout_allowlist_group(&self) -> Option<&MononokeIdentity> {
+        self.rollout_allowlist_group.as_ref()
     }
 
     /// Run all the necessary validations on the ACL file
@@ -2781,6 +2802,19 @@ mod tests {
 
     fn mp(s: &str) -> MPath {
         MPath::new(s.as_bytes()).unwrap()
+    }
+
+    #[mononoke::test]
+    fn test_repo_config_default_has_no_provenance() {
+        let config = RepoConfig::default();
+        assert_eq!(
+            config.config_version, None,
+            "a default RepoConfig must carry no config version"
+        );
+        assert_eq!(
+            config.config_mutation_id, None,
+            "a default RepoConfig must carry no config mutation id"
+        );
     }
 
     /// Build a stage with the given dependency paths.
@@ -2833,19 +2867,18 @@ mod tests {
     }
 
     #[mononoke::test]
-    fn test_pipeline_config_rejects_hg_augmented_manifests_v2() {
-        // Given an otherwise-valid pipeline config whose only deviation is that
-        // it enables augmented manifests v2 — a type that is configurable but
-        // does not implement `PipelineDerivable`, so it would otherwise fail at
-        // runtime in a pipeline while v1 succeeds.
+    fn test_pipeline_config_accepts_hg_augmented_manifests_v2() {
+        // Given: an otherwise-valid pipeline config enabling augmented
+        // manifests v2.
         let config = DerivationPipelineConfig {
             types: BTreeSet::from([DerivableType::HgAugmentedManifestsV2]),
             ..pipeline_config(vec![("", stage(vec![]))])
         };
 
-        // When validating the pipeline config, then it is rejected at
-        // config-load time instead of deferring the failure to runtime.
-        assert_rejects(config, "hg_augmented_manifests_v2");
+        // When/Then: validation accepts the pipeline-derivable type.
+        config
+            .validate()
+            .expect("augmented manifests v2 should support derivation pipelines");
     }
 
     #[mononoke::test]

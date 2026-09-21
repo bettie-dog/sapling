@@ -403,48 +403,6 @@ def get_home_dir() -> Path:
     return Path(home_dir)
 
 
-def get_arcrc_path() -> Path:
-    # `jf authenticate` writes .arcrc to %APPDATA% on Windows, $HOME elsewhere.
-    if sys.platform == "win32":
-        appdata = os.getenv("APPDATA")
-        if appdata:
-            return Path(appdata) / ".arcrc"
-    return get_home_dir() / ".arcrc"
-
-
-def check_arcrc_auth(arcrc_path: Optional[Path] = None) -> Optional[str]:
-    """Check that .arcrc holds usable Phabricator credentials.
-
-    Returns None when it looks usable, otherwise a short description of the
-    problem suitable for showing to the user.
-    """
-    if arcrc_path is None:
-        arcrc_path = get_arcrc_path()
-
-    try:
-        contents = arcrc_path.read_text()
-    except FileNotFoundError:
-        return f"{arcrc_path} does not exist"
-    except OSError as ex:
-        return f"{arcrc_path} could not be read: {ex}"
-
-    if not contents.strip():
-        return f"{arcrc_path} is empty"
-
-    try:
-        parsed = json.loads(contents)
-    except ValueError as ex:
-        return f"{arcrc_path} does not contain valid JSON: {ex}"
-
-    if not isinstance(parsed, dict):
-        return f"{arcrc_path} does not contain a JSON object"
-
-    if not parsed.get("hosts"):
-        return f"{arcrc_path} has no `hosts` credentials"
-
-    return None
-
-
 def mkdir_p(path: str) -> str:
     """Performs `mkdir -p <path>` and returns the path."""
     try:
@@ -904,13 +862,6 @@ def is_atlas() -> bool:
     return "ATLAS" in os.environ
 
 
-def is_apple_silicon() -> bool:
-    if sys.platform == "darwin":
-        return "ARM64" in os.uname().version
-    else:
-        return False
-
-
 def get_platform_default_mount_protocol() -> str:
     if sys.platform == "win32":
         return PRJFS_MOUNT_PROTOCOL_STRING
@@ -1138,7 +1089,15 @@ def maybe_edensparse_migration(
         """
         SL_CONFIG_TO_ALLOW_MIGRATION = "experimental.allow-edensparse-migration"
         sl_args = ["config", "-Tjson", SL_CONFIG_TO_ALLOW_MIGRATION]
-        output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        try:
+            output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        except Exception as ex:
+            log(
+                f"failed to determine whether to migrate {checkout.name}: {ex}; "
+                "skipping migration"
+            )
+            return False
+
         if len(output) == 0:
             log(
                 f"{SL_CONFIG_TO_ALLOW_MIGRATION} not set for {checkout.name}, skipping migration"

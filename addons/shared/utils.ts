@@ -51,6 +51,67 @@ export function defer<T>(): Deferred<T> {
   return deferred;
 }
 
+export class CancelledError extends Error {
+  constructor() {
+    super('cancelled');
+    this.name = 'CancelledError';
+  }
+}
+
+export type CancellablePromise<T> = Promise<T> & {dispose(): void};
+
+/**
+ * `setTimeout` as an awaitable promise, resolving once `timeMs` has elapsed.
+ * `dispose()` cancels the timer and rejects with `CancelledError`; it is a
+ * no-op once the timer has already fired.
+ */
+export function sleep(timeMs: number): CancellablePromise<void> {
+  let cancel!: () => void;
+  const promise = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, timeMs);
+    cancel = () => {
+      clearTimeout(timer);
+      reject(new CancelledError());
+    };
+  }) as CancellablePromise<void>;
+  promise.dispose = cancel;
+  // Fire-and-forget callers never await, so a dispose() would otherwise surface
+  // as an unhandled rejection. Awaiting callers still observe the rejection.
+  promise.catch(() => {});
+  return promise;
+}
+
+/**
+ * Run `callback` after `timeMs`, resolving with its result. `dispose()` cancels
+ * the timer so the callback never runs, and rejects with `CancelledError`.
+ */
+export function timeout<T>(
+  callback: () => T | PromiseLike<T>,
+  timeMs: number,
+): CancellablePromise<T> {
+  const timer = sleep(timeMs);
+  let isDisposed = false;
+  const promise = timer.then(() => {
+    if (isDisposed) {
+      throw new CancelledError();
+    }
+    return callback();
+  }) as CancellablePromise<T>;
+  promise.dispose = () => {
+    timer.dispose();
+    isDisposed = true;
+  };
+  promise.catch(() => {});
+  return promise;
+}
+
+/**
+ * Returns a Promise which resolves after the current async tick is finished.
+ */
+export function nextTick(): Promise<void> {
+  return sleep(0);
+}
+
 /**
  * Returns the part of the string after the last occurrence of delimiter,
  * or the entire string if no matches are found.
@@ -105,6 +166,17 @@ export function dirname(s: string, delimiter = '/'): string {
  */
 export function firstLine(s: string): string {
   return s.split('\n', 1)[0];
+}
+
+/**
+ * Split a serialized commit message into its title and description.
+ *
+ * The title and description are normally separated by a blank line. Remove that structural
+ * separator while preserving any additional leading blank lines that are part of the description.
+ */
+export function splitCommitMessage(message: string): [title: string, description: string] {
+  const title = firstLine(message);
+  return [title, message.slice(title.length).replace(/^\n\n?/, '')];
 }
 
 /**
@@ -233,4 +305,43 @@ export function base64Decode(data: string): ArrayBuffer {
 /** Deduplicate items in an array. */
 export function dedup<T>(arr: Array<T>): Array<T> {
   return Array.from(new Set(arr));
+}
+
+/** Normalize a filesystem path for comparison (slash, trailing slash). */
+export function normalizeForComparison(p: string): string {
+  // Drive root `C:/` must stay `C:/` (or `C:\`) — not `C:` — so Windows
+  // detection `^[A-Za-z]:/` still matches after trailing-slash removal.
+  const slashed = p.replace(/\\/g, '/');
+  if (/^[A-Za-z]:\/$/.test(slashed)) {
+    return slashed;
+  }
+  return slashed.replace(/\/+$/, '') || '/';
+}
+
+/**
+ * Compare two filesystem paths for equality, tolerating '/' vs '\\' separators,
+ * trailing slashes, and (on Windows-style absolute paths only) drive-letter
+ * case differences.
+ */
+export function pathsAreIdentical(path1: string, path2: string): boolean {
+  const normalizedPath1 = normalizeForComparison(path1);
+  const normalizedPath2 = normalizeForComparison(path2);
+
+  const isWindowsAbsolutePath = (path: string) => /^[A-Za-z]:\//.test(path);
+  if (isWindowsAbsolutePath(normalizedPath1) && isWindowsAbsolutePath(normalizedPath2)) {
+    return normalizedPath1.toLowerCase() === normalizedPath2.toLowerCase();
+  }
+
+  return normalizedPath1 === normalizedPath2;
+}
+
+/** Whether a string looks like a Sapling commit hash (hex, 6-40 chars). */
+export const HEX_HASH_RE = /^[0-9a-f]{6,40}$/i;
+export function isHexHash(s: string): boolean {
+  return HEX_HASH_RE.test(s);
+}
+
+/** Guess whether a path uses '/' or '\\' as its separator, based on its contents. */
+export function guessPathSep(path: string): '/' | '\\' {
+  return path.includes('\\') ? '\\' : '/';
 }

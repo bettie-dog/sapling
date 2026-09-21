@@ -17,6 +17,7 @@ use clientinfo::ClientInfo;
 use clientinfo::ClientRequestInfo;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
+use permission_checker::ClientCategory;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
 use permission_checker::TenantInfo;
@@ -225,6 +226,13 @@ impl Metadata {
         self.client_hostname.as_deref()
     }
 
+    pub fn client_region(&self) -> Option<&str> {
+        self.client_hostname()?
+            .split('.')
+            .nth(1)
+            .filter(|region| !region.is_empty())
+    }
+
     pub fn set_client_hostname(mut self, client_hostname: Option<String>) -> Self {
         self.client_hostname = client_hostname;
         self
@@ -283,15 +291,46 @@ impl Metadata {
     }
 
     pub fn tenant_info(&self) -> TenantInfo {
-        TenantInfo {
-            client_id: self
-                .client_request_info()
-                .and_then(|cri| cri.main_id.clone()),
-            category: self.identities.client_category(),
-            ci_purpose: self.ci_purpose().map(str::to_owned),
-            atlas_env_id: self.clientinfo_atlas_env_id().map(str::to_owned),
-            atlas_rl: self.clientinfo_atlas_rl(),
-            faas_job_name: self.clientinfo_faas_job_name().map(str::to_owned),
+        let client_id = self
+            .client_request_info()
+            .and_then(|cri| cri.main_id.clone());
+
+        match self.identities.client_category(self.sandcastle_alias()) {
+            ClientCategory::HealthCheck => TenantInfo::HealthCheck { client_id },
+            ClientCategory::InteractiveDev => TenantInfo::InteractiveDev { client_id },
+            ClientCategory::DevEnv => TenantInfo::DevEnv {
+                client_id,
+                on_demand_type: self.identities.on_demand_type().map(str::to_owned),
+                client_region: self.client_region().map(str::to_owned),
+                client_hostname: self.client_hostname().map(str::to_owned),
+            },
+            ClientCategory::CiSandcastle => TenantInfo::CiSandcastle {
+                client_id,
+                ci_purpose: self.ci_purpose().map(str::to_owned),
+                sandcastle_job_id: self.identities.sandcastle_job_id().map(str::to_owned),
+            },
+            ClientCategory::SandcastleAutomation => TenantInfo::SandcastleAutomation { client_id },
+            ClientCategory::Mast => TenantInfo::Mast {
+                client_id,
+                data_project: self
+                    .identities
+                    .identity_type_filtered_concat("DATA_PROJECT"),
+                offline_job_root_run_id: self
+                    .identities
+                    .identity_type_filtered_concat("OFFLINE_JOB_ROOT_RUN_ID"),
+                offline_job_leaf_run_id: self
+                    .identities
+                    .identity_type_filtered_concat("OFFLINE_JOB_LEAF_RUN_ID"),
+            },
+            ClientCategory::FaaS => TenantInfo::FaaS {
+                client_id,
+                atlas_env_id: self.clientinfo_atlas_env_id().map(str::to_owned),
+                atlas_rl: self.clientinfo_atlas_rl(),
+                atlas_purpose: self.clientinfo_atlas_purpose().map(str::to_owned),
+                faas_job_name: self.clientinfo_faas_job_name().map(str::to_owned),
+            },
+            ClientCategory::Automation => TenantInfo::Automation { client_id },
+            ClientCategory::Unknown => TenantInfo::Unknown { client_id },
         }
     }
 
@@ -309,6 +348,12 @@ impl Metadata {
 
     pub fn clientinfo_atlas_rl(&self) -> Option<bool> {
         self.client_info.as_ref().and_then(|ci| ci.fb.is_atlas_rl())
+    }
+
+    pub fn clientinfo_atlas_purpose(&self) -> Option<&str> {
+        self.client_info
+            .as_ref()
+            .and_then(|ci| ci.fb.atlas_purpose())
     }
 
     pub fn clientinfo_atlas_env_id(&self) -> Option<&str> {

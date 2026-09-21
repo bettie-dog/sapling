@@ -179,7 +179,6 @@ def extsetup(ui) -> None:
     _setupdirstate(ui)
     _setupdiff(ui)
     _setupcat(ui)
-    _setupgrep(ui)
 
 
 def reposetup(ui, repo) -> None:
@@ -505,28 +504,24 @@ def _setupcat(ui) -> None:
     def _cat(orig, ui, repo, ctx, matcher, basefm, fntemplate, prefix, **opts):
         # Enforce sparse matcher check for edensparse repos. Disallows access
         # to filtered file content.
-        if _isedensparse(repo) and not repo.ui.configbool("sparse", "killsparsecat"):
+        # The edensparse requirement does not guarantee sparsematch() exists:
+        # this extension's reposetup returns early for eden checkouts, and
+        # edensparse's reposetup never runs when that extension is not loaded.
+        # Checking the requirement alone makes every revision read raise
+        # AttributeError on such a repo. Do not swap in _hassparse() here -- it
+        # also matches legacy non-eden sparse repos, which this wrapper is not
+        # meant to filter.
+        if (
+            _isedensparse(repo)
+            and hasattr(repo, "sparsematch")
+            and not repo.ui.configbool("sparse", "killsparsecat")
+        ):
             sparsematch = repo.sparsematch()
             matcher = matchmod.intersectmatchers(matcher, sparsematch)
 
         return orig(ui, repo, ctx, matcher, basefm, fntemplate, prefix, **opts)
 
     extensions.wrapfunction(cmdutil, "cat", _cat)
-
-
-def _setupgrep(ui) -> None:
-    def _grep(orig, ui, repo, table, matcher, pattern, *pats, **opts):
-        # Enforce sparse matcher check for edensparse repos. Disallows access
-        # to filtered file content.
-        if _hassparse(repo) and not repo.ui.configbool("sparse", "killsparsegrep"):
-            sparsematch = repo.sparsematch()
-            # Note: Matcher order matters! Second matcher loses root/cwd info.
-            # Relative grep queries won't work if sparsematch is supplied first
-            matcher = matchmod.intersectmatchers(matcher, sparsematch)
-
-        return orig(ui, repo, table, matcher, pattern, *pats, **opts)
-
-    extensions.wrapfunction(cmdutil, "grep", _grep)
 
 
 def _tracktelemetry(

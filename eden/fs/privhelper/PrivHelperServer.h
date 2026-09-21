@@ -8,16 +8,20 @@
 #pragma once
 
 #include <eden/common/utils/SpawnedProcess.h>
-#ifndef __APPLE__
 #include <folly/File.h>
-#endif
 #include <sys/types.h>
+#include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/UnixSocket.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
+#include "eden/fs/privhelper/RestartSentinel.h"
 
 namespace folly {
 class EventBase;
@@ -47,6 +51,24 @@ struct FileAccessMonitorProcess {
         specifiedOutputPath(std::move(specifiedOutputPath)),
         shouldUpload(shouldUpload) {}
 };
+
+/**
+ * Move the calling process into its own session (and therefore its own
+ * process group), away from the process group it was spawned into.
+ *
+ * The privhelper must only exit when the EdenFS daemon's connection
+ * closes: it unmounts the daemon's mounts on the way out. The daemon
+ * detaches itself into a new process group during startup, but the
+ * privhelper is spawned earlier and would otherwise remain in the group
+ * of whatever launched `eden start`/`eden restart`. Tools that clean up
+ * by killing the process group they spawned (e.g. agent command runners)
+ * would then SIGKILL the privhelper — which cannot be caught — while the
+ * daemon survives, leaving EdenFS unable to mount or unmount.
+ *
+ * Failure (e.g. the process is already a process-group leader, so there
+ * is no foreign group to escape from) is logged and ignored.
+ */
+void detachFromParentProcessGroup();
 
 /*
  * PrivHelperServer runs the main loop for the privhelper server process.
@@ -84,8 +106,6 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   void run();
 
  private:
-  void cleanupMountPoints();
-
   // UnixSocket::ReceiveCallback methods
   void messageReceived(UnixSocket::Message&& message) noexcept override;
   void eofReceived() noexcept override;
@@ -162,30 +182,86 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       bool isHardMount);
 
   /**
+   * How detectAndUnmountStaleMount probes the mount point.
+   */
+  struct StaleMountCheck {
+    bool isNFS;
+    bool isHardMount;
+  };
+
+  /**
+   * What sanityCheckMountPoint and openAndSanityCheckMountPoint do around the
+   * ownership and access checks. Only the factories can build one, so every
+   * call site names the kind of mount it is checking.
+   */
+  class SanityCheckOptions {
+   public:
+    /**
+     * The mount the daemon inherited across a graceful restart. No stale
+     * mount probe: the daemon is already serving the mount when it sends the
+     * takeover startup request, so there is nothing stale to detect.
+     * Redirection bind mounts are left alone: the kernel preserves live ones
+     * (e.g. buck-out) across the restart, so detaching them would unmount
+     * user state.
+     */
+    static SanityCheckOptions forTakeover() {
+      return SanityCheckOptions(
+          /*staleMountCheck=*/std::nullopt,
+          /*performBindMountCleanup=*/false);
+    }
+
+    /** A fresh FUSE mount. */
+    static SanityCheckOptions forFuseMount() {
+      return SanityCheckOptions(
+          StaleMountCheck{/*isNFS=*/false, /*isHardMount=*/false},
+          /*performBindMountCleanup=*/true);
+    }
+
+    /** A fresh NFS mount. Hard mounts skip the probes that can hang. */
+    static SanityCheckOptions forNfsMount(bool isHardMount) {
+      return SanityCheckOptions(
+          StaleMountCheck{/*isNFS=*/true, isHardMount},
+          /*performBindMountCleanup=*/true);
+    }
+
+    /** The stale mount probe to run first, or nullopt to run none. */
+    const std::optional<StaleMountCheck>& staleMountCheck() const {
+      return staleMountCheck_;
+    }
+
+    /**
+     * Whether stale redirection bind mounts under the checkout are detached
+     * after the checkout path passes the ownership and access checks.
+     */
+    bool performBindMountCleanup() const {
+      return performBindMountCleanup_;
+    }
+
+   private:
+    SanityCheckOptions(
+        std::optional<StaleMountCheck> staleMountCheck,
+        bool performBindMountCleanup)
+        : staleMountCheck_(staleMountCheck),
+          performBindMountCleanup_(performBindMountCleanup) {}
+
+    std::optional<StaleMountCheck> staleMountCheck_;
+    bool performBindMountCleanup_;
+  };
+
+  /**
    * Verify that the user has the right credentials to mount/unmount this path.
    *
    * This will check that the user has RW access to every path component
    * leading to the mount point. A std::domain_error exception will be raised
    * if the user doesn't have access to the mount point.
-   *
-   * When performBindMountCleanup is true (the default), stale redirection
-   * bind mounts under the checkout are detached after the checkout path passes
-   * the ownership and access checks. The takeover path passes false because
-   * the kernel preserves legitimate bind mounts (e.g. Sapling redirections like
-   * buck-out) across a graceful restart, and running cleanup there would
-   * unmount live user state.
    */
   SanityCheckResult sanityCheckMountPoint(
       const std::string& mountPoint,
-      bool isNFS = false,
-      bool isHardMount = false,
-      bool performBindMountCleanup = true);
+      const SanityCheckOptions& options);
 #ifndef __APPLE__
   CheckedMountPoint openAndSanityCheckMountPoint(
       const std::string& mountPoint,
-      bool isNFS = false,
-      bool isHardMount = false,
-      bool performBindMountCleanup = true);
+      const SanityCheckOptions& options);
 #endif
 
   // These methods are virtual so we can override them during unit tests
@@ -217,6 +293,85 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       folly::StringPiece mountRoot,
       folly::StringPiece mountPath);
 
+  // The daemon's credentials, as supplied to init().
+  uid_t uid_{std::numeric_limits<uid_t>::max()};
+  gid_t gid_{std::numeric_limits<gid_t>::max()};
+
+  // Virtual so that a test can observe whether a code path skipped it.
+  virtual void cleanupMountPoints();
+
+#ifdef __APPLE__
+  /** Everything prepareRestart() resolved as root. */
+  struct RestartPlan {
+    AbsolutePath binary;
+    RestartSentinel::RelaunchCommand command;
+    // The restart budget already charged for this attempt.
+    uint32_t restartCount{0};
+    uint64_t firstRestartEpochSec{0};
+  };
+
+  /**
+   * Spawns a new edenfs. Overridable so that tests can exercise the restart
+   * decision without launching anything. Returns false unless the daemon's
+   * startup process exits successfully.
+   */
+  using SpawnEdenFsFn = std::function<bool(
+      const AbsolutePath& binary,
+      const std::vector<std::string>& argv,
+      const std::vector<std::pair<std::string, std::string>>& env)>;
+  SpawnEdenFsFn spawnEdenFs_;
+
+  // Seconds since the epoch. Overridable so that tests can age the restart
+  // window without sleeping.
+  std::function<uint64_t()> now_;
+
+  // Whether edenfs should be relaunched, and what to relaunch. Constructed by
+  // initPartial(), which is where the daemon's uid becomes known.
+  std::optional<RestartSentinel> sentinel_;
+
+  UnixSocket::Message processSetRestartArgsMsg(folly::io::Cursor& cursor);
+  UnixSocket::Message processNotifyCleanShutdownMsg(folly::io::Cursor& cursor);
+
+  /**
+   * Decide whether this exit looks like a crash worth answering with a
+   * relaunch, and do everything about it that needs root: taking the relaunch
+   * command, resolving the binary and charging the circuit breaker.
+   *
+   * Returns the plan to launch, or nullopt to leave edenfs down.
+   */
+  std::optional<RestartPlan> prepareRestart();
+
+  /**
+   * Validate the child credentials and relaunch edenfs from a plan. Returns
+   * whether the replacement daemon finished starting.
+   */
+  bool launchRestart(const RestartPlan& plan) const;
+
+  /**
+   * The edenfs binary installed in `dir`, or nullopt when there is none: it
+   * must be a regular, executable file, so a symlinked leaf is rejected.
+   */
+  static std::optional<AbsolutePath> findSiblingEdenFs(AbsolutePathPiece dir);
+
+  /**
+   * Path to the edenfs binary to relaunch: the one installed next to this
+   * privhelper, which keeps both on the same version, falling back to argv[0]
+   * of `command` when there is no sibling. Throws when neither is usable.
+   *
+   * Virtual because a unit test has no sibling edenfs to point at.
+   */
+  virtual AbsolutePath resolveEdenFsBinary(
+      const RestartSentinel::RelaunchCommand& command) const;
+
+  /**
+   * Verify that resetting the child IDs will select the privhelper's owner.
+   * Throws when the real IDs are root or do not match that owner.
+   *
+   * Virtual so tests can supply controlled credentials.
+   */
+  virtual void validateRestartOwner() const;
+#endif // __APPLE__
+
  private:
 #ifndef __APPLE__
   enum class BindUnmountResult {
@@ -237,9 +392,14 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   std::unique_ptr<folly::EventBase> eventBase_;
   UnixSocket::UniquePtr conn_;
-  uid_t uid_{std::numeric_limits<uid_t>::max()};
-  gid_t gid_{std::numeric_limits<gid_t>::max()};
   std::unique_ptr<FileAccessMonitorProcess> famProcess_;
+  // Whether the daemon closed the socket, as opposed to the loop ending for
+  // another reason: a receive error also ends the loop but leaves the daemon
+  // running, and relaunching then would put two daemons on the same mounts.
+  //
+  // Written from eofReceived() and read after the loop exits, both on the
+  // EventBase thread, so it needs no synchronization.
+  bool peerExited_{false};
 
   // The privhelper server only has a single thread,
   // so we don't need to lock the following state

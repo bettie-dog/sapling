@@ -8,14 +8,20 @@
 import type {RenderGlyphResult} from './RenderDag';
 import type {DagCommitInfo} from './dag/dag';
 import type {ExtendedGraphRow} from './dag/render';
+import type {CommitTreeWidth} from './responsive';
 import type {Hash} from './types';
 
 import {Button} from 'isl-components/Button';
 import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {ErrorShortMessages} from 'isl-server/src/constants';
 import {atom, useAtom, useAtomValue, useSetAtom} from 'jotai';
-import {Commit, InlineProgressSpan} from './Commit';
-import {commitTreeSearchFilter} from './CommitTreeSearchFilter';
+import {useEffect, useRef} from 'react';
+import {normalizeForComparison} from 'shared/utils';
+import {currentWorktreeName, otherWorktreeCheckoutsByHash} from './CheckedOutElsewhere';
+import {CheckedOutElsewhereBadge, Commit, InlineProgressSpan} from './Commit';
+import {appliedCommitTreeSearchFilter, commitTreeSearchFilter} from './CommitTreeSearchFilter';
 import {Center, LargeSpinner} from './ComponentUtils';
 import {EmptyState} from './EmptyState';
 import {FetchingAdditionalCommitsRow} from './FetchAdditionalCommitsButton';
@@ -23,14 +29,17 @@ import {isHighlightedCommit} from './HighlightedCommits';
 import {RegularGlyph, RenderDag, YouAreHereGlyph} from './RenderDag';
 import {StackActions} from './StackActions';
 import {latestCommitMessageTitle} from './codeReview/CodeReviewInfo';
-import {YOU_ARE_HERE_VIRTUAL_COMMIT} from './dag/virtualCommit';
+import {
+  makeCheckedOutElsewhereVirtualCommit,
+  YOU_ARE_HERE_VIRTUAL_COMMIT,
+} from './dag/virtualCommit';
 import {T, t} from './i18n';
 import {atomFamilyWeak, localStorageBackedAtom} from './jotaiUtils';
 import {CreateEmptyInitialCommitOperation} from './operations/CreateEmptyInitialCommitOperation';
 import {inlineProgressByHash, useRunOperation} from './operationsState';
 import {dagWithPreviews, treeWithPreviews, useMarkOperationsCompleted} from './previews';
 import {hideIrrelevantCwdStacks, isIrrelevantToCwd, repoRelativeCwd} from './repositoryData';
-import {isNarrowCommitTree} from './responsive';
+import {commitTreeWidth} from './responsive';
 import {
   selectedCommits,
   useArrowKeysToChangeSelection,
@@ -41,21 +50,57 @@ import {
 import {commitFetchError, latestUncommittedChangesData} from './serverAPIState';
 import {MaybeEditStackModal} from './stackEdit/ui/EditStackModal';
 
-import {Icon} from 'isl-components/Icon';
 import './CommitTreeList.css';
 import {tracker} from './analytics';
 import {focusMode} from './atoms/FocusModeState';
 
 type DagCommitListProps = {
-  isNarrow: boolean;
+  width: CommitTreeWidth;
 };
 
-const dagWithYouAreHere = atom(get => {
+const YOU_ARE_HERE_ANCHOR_ID = 'isl-you-are-here-anchor';
+
+/**
+ * Where the "You are here" row is relative to the scroll viewport: visible, or
+ * scrolled off the top ('above') / bottom ('below'). Drives the floating button.
+ */
+type YouAreHerePosition = 'visible' | 'above' | 'below';
+const youAreHerePosition = atom<YouAreHerePosition>('visible');
+
+/**
+ * Scroll the commit graph so the "You are here" row is visible.
+ * Returns false if the anchor is not in the DOM yet (nothing scrolled).
+ */
+function scrollToYouAreHere(behavior: ScrollBehavior = 'smooth'): boolean {
+  // ponytail: getElementById avoids threading a ref from the DAG row up to the scroll controls.
+  const anchor = document.getElementById(YOU_ARE_HERE_ANCHOR_ID);
+  // The anchor is a zero-height span trailing the badge; scroll the container so the
+  // badge above it isn't clipped at the top edge.
+  const container = anchor?.parentElement;
+  if (container == null) {
+    return false;
+  }
+  container.scrollIntoView({behavior, block: 'start'});
+  return true;
+}
+
+const dagWithVirtualCommits = atom(get => {
   let dag = get(dagWithPreviews);
+  const virtualCommits = [];
   // Insert a virtual "You are here" as a child of ".".
   const dot = dag.resolve('.');
   if (dot != null) {
-    dag = dag.add([YOU_ARE_HERE_VIRTUAL_COMMIT.set('parents', [dot.hash])]);
+    virtualCommits.push(YOU_ARE_HERE_VIRTUAL_COMMIT.set('parents', [dot.hash]));
+  }
+  // Insert a virtual "checked out elsewhere" commit as a child of each hash
+  // that has sibling worktree checkouts, skipping hashes not present in the dag.
+  for (const hash of get(otherWorktreeCheckoutsByHash).keys()) {
+    if (dag.has(hash)) {
+      virtualCommits.push(makeCheckedOutElsewhereVirtualCommit(hash));
+    }
+  }
+  if (virtualCommits.length > 0) {
+    dag = dag.add(virtualCommits);
   }
   return dag;
 });
@@ -65,8 +110,14 @@ export const condenseObsoleteStacks = localStorageBackedAtom<boolean | null>(
   true,
 );
 
+/** Opt-in because auto-scrolling on open can be intrusive. */
+export const scrollToYouAreHereOnOpen = localStorageBackedAtom<boolean>(
+  'isl.scroll-to-you-are-here-on-open',
+  false,
+);
+
 const renderSubsetUnionSelection = atom(get => {
-  const dag = get(dagWithYouAreHere);
+  const dag = get(dagWithVirtualCommits);
   const condense = get(condenseObsoleteStacks);
   let subset = dag.subsetForRendering(undefined, /* condenseObsoleteStacks */ condense !== false);
   // If selectedCommits includes commits unknown to dag (ex. in tests), ignore them to avoid errors.
@@ -78,10 +129,12 @@ const renderSubsetUnionSelection = atom(get => {
     subset = dag.filter(commit => commit.isDot || !isIrrelevantToCwd(commit, cwd), subset);
   }
 
-  const searchFilter = get(commitTreeSearchFilter).trim().toLowerCase();
+  // Deliberately the debounced atom, not `commitTreeSearchFilter`: recomputing this walks
+  // the whole dag, so reading the per-keystroke one costs a full pass per character typed.
+  const searchFilter = get(appliedCommitTreeSearchFilter).trim().toLowerCase();
   if (searchFilter.length > 0) {
     const matchesSearch = (commit: DagCommitInfo) => {
-      if (commit.isYouAreHere) {
+      if (commit.isYouAreHere || commit.isCheckedOutElsewhere) {
         return true;
       }
       const renderedTitle = get(latestCommitMessageTitle(commit.hash));
@@ -100,21 +153,24 @@ const renderSubsetUnionSelection = atom(get => {
 });
 
 function DagCommitList(props: DagCommitListProps) {
-  const {isNarrow} = props;
+  const {width} = props;
 
-  const dag = useAtomValue(dagWithYouAreHere);
+  const dag = useAtomValue(dagWithVirtualCommits);
   const subset = useAtomValue(renderSubsetUnionSelection);
-  const searchFilter = useAtomValue(commitTreeSearchFilter);
+  // `hasNoResults` below describes `subset`, so it reads the same filter `subset` was built
+  // from rather than whatever has been typed since. Clearing, though, writes the atom the
+  // text box is bound to.
+  const appliedSearchFilter = useAtomValue(appliedCommitTreeSearchFilter);
   const setSearchFilter = useSetAtom(commitTreeSearchFilter);
 
   // Check if filter is active and no commits (excluding "You are here") match
-  const filter = searchFilter.trim().toLowerCase();
+  const filter = appliedSearchFilter.trim().toLowerCase();
   let hasNoResults = false;
   if (filter.length > 0) {
     let hasMatchingCommit = false;
     for (const hash of subset) {
       const commit = dag.get(hash);
-      if (commit && !commit.isYouAreHere) {
+      if (commit && !commit.isYouAreHere && !commit.isCheckedOutElsewhere) {
         hasMatchingCommit = true;
         break;
       }
@@ -137,7 +193,11 @@ function DagCommitList(props: DagCommitListProps) {
     <RenderDag
       dag={dag}
       subset={subset}
-      className={'commit-tree-root ' + (isNarrow ? ' commit-tree-narrow' : '')}
+      className={
+        'commit-tree-root ' +
+        (width !== 'wide' ? ' commit-tree-narrow' : '') +
+        (width === 'very-narrow' ? ' commit-tree-very-narrow' : '')
+      }
       data-testid="commit-tree-root"
       renderCommit={renderCommit}
       renderCommitExtras={renderCommitExtras}
@@ -165,7 +225,10 @@ function FocusModeIndicator() {
   );
 }
 
-function renderCommit(info: DagCommitInfo) {
+function renderCommit(info: DagCommitInfo): React.JSX.Element | null {
+  if (info.isCheckedOutElsewhere) {
+    return null;
+  }
   return <DagCommitBody info={info} />;
 }
 
@@ -192,6 +255,8 @@ function CommitExtras({info, row}: {info: DagCommitInfo; row: ExtendedGraphRow})
 function renderGlyph(info: DagCommitInfo): RenderGlyphResult {
   if (info.isYouAreHere) {
     return ['replace-tile', <YouAreHereGlyphWithProgress key="glyph" info={info} />];
+  } else if (info.isCheckedOutElsewhere) {
+    return ['replace-tile', <CheckedOutElsewhereGlyph key="glyph" info={info} />];
   } else {
     return ['inside-tile', <HighlightedGlyph key="glyph" info={info} />];
   }
@@ -209,10 +274,136 @@ function useExtraCommitRowProps(info: DagCommitInfo): React.HTMLAttributes<HTMLD
 
 function YouAreHereGlyphWithProgress({info}: {info: DagCommitInfo}) {
   const inlineProgress = useAtomValue(inlineProgressByHash(info.hash));
+  const setPosition = useSetAtom(youAreHerePosition);
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    // Observe the badge container (the anchor's parent has real height) to drive the
+    // floating "scroll to here" button, which shows when the row is off-screen and
+    // points toward wherever it scrolled off.
+    const el = anchorRef.current?.parentElement;
+    if (el == null) {
+      return;
+    }
+    const scrollRoot = el.closest<HTMLElement>('.main-content-area');
+    if (scrollRoot == null) {
+      return;
+    }
+
+    const recalculatePosition = () => {
+      if (scrollRoot.scrollHeight <= scrollRoot.clientHeight) {
+        setPosition('visible');
+        return;
+      }
+
+      const bounds = scrollRoot.getBoundingClientRect();
+      const scaleY = scrollRoot.offsetHeight === 0 ? 1 : bounds.height / scrollRoot.offsetHeight;
+      const viewportTop = bounds.top + scrollRoot.clientTop * scaleY;
+      const viewportBottom = viewportTop + scrollRoot.clientHeight * scaleY;
+      const targetBounds = el.getBoundingClientRect();
+      if (targetBounds.bottom < viewportTop) {
+        setPosition('above');
+      } else if (targetBounds.top > viewportBottom) {
+        setPosition('below');
+      } else {
+        // IntersectionObserver also reports horizontal clipping, which cannot be fixed by scrolling.
+        setPosition('visible');
+      }
+    };
+
+    const intersectionObserver = new IntersectionObserver(recalculatePosition, {
+      root: scrollRoot,
+      // Track vertical visibility even when a narrow commit graph is horizontally clipped.
+      rootMargin: '0px 100000px',
+      threshold: 0,
+    });
+    intersectionObserver.observe(el);
+
+    const resizeObserver = new ResizeObserver(recalculatePosition);
+    resizeObserver.observe(scrollRoot);
+    const commitTree = el.closest<HTMLElement>('.commit-tree-root');
+    if (commitTree != null) {
+      resizeObserver.observe(commitTree);
+    }
+
+    return () => {
+      intersectionObserver.disconnect();
+      resizeObserver.disconnect();
+      // No "You are here" row rendered -> nothing to scroll to, so hide the button.
+      setPosition('visible');
+    };
+  }, [setPosition]);
+  const worktreeName = useAtomValue(currentWorktreeName);
   return (
-    <YouAreHereGlyph info={info}>
+    <YouAreHereGlyph
+      info={info}
+      badgeChildren={
+        worktreeName != null && (
+          <Tooltip title={t('Current worktree')}>
+            <span className="current-worktree-label">
+              <Icon icon="worktree" aria-hidden="true" />
+              {worktreeName}
+            </span>
+          </Tooltip>
+        )
+      }>
+      <span id={YOU_ARE_HERE_ANCHOR_ID} ref={anchorRef} />
       {inlineProgress && <InlineProgressSpan message={inlineProgress} />}
     </YouAreHereGlyph>
+  );
+}
+
+// Sticky (not fixed) so it centers over the commit-tree column (`.main-content-area`)
+// rather than the whole panel — the commit-info sidebar is a separate drawer outside it.
+// Rendered in the 'above' slot (first child, sticks to top) or 'below' slot (last child,
+// sticks to bottom) so it points toward wherever the current commit scrolled off.
+function ScrollToCurrentCommitButton({slot}: {slot: 'above' | 'below'}) {
+  const position = useAtomValue(youAreHerePosition);
+  if (position !== slot) {
+    return null;
+  }
+  const atTop = slot === 'above';
+  return (
+    <div className={'scroll-to-current-commit ' + (atTop ? 'floating-top' : 'floating-bottom')}>
+      <Tooltip
+        delayMs={DOCUMENTATION_DELAY}
+        placement={atTop ? 'bottom' : 'top'}
+        title={<T>Scroll to your current commit ("You are here")</T>}>
+        <Button
+          primary
+          className="scroll-to-current-commit-pill"
+          onClick={() => scrollToYouAreHere('smooth')}
+          data-testid="scroll-to-current-commit-button">
+          <Icon icon={atTop ? 'arrow-up' : 'arrow-down'} />
+          <T>Scroll to current commit</T>
+        </Button>
+      </Tooltip>
+    </div>
+  );
+}
+
+function CheckedOutElsewhereGlyph({info}: {info: DagCommitInfo}) {
+  const map = useAtomValue(otherWorktreeCheckoutsByHash);
+  const worktrees = info.parents.flatMap(p => map.get(p) ?? []);
+  if (worktrees.length === 0) {
+    return null;
+  }
+  const dedupeKey = (p: string) => {
+    // Case-fold Windows absolute paths so drive-letter case differences dedupe,
+    // matching pathsAreIdentical's comparison semantics.
+    const normalized = normalizeForComparison(p);
+    return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  };
+  const seen = new Set<string>();
+  const deduped = worktrees.filter(wt => {
+    const k = dedupeKey(wt.path);
+    return seen.has(k) ? false : (seen.add(k), true);
+  });
+  return (
+    <div className="checked-out-elsewhere-container">
+      {deduped.map(wt => (
+        <CheckedOutElsewhereBadge key={wt.path} wt={wt} />
+      ))}
+    </div>
   );
 }
 
@@ -286,10 +477,20 @@ export function CommitTreeList() {
   useBackspaceToHideSelected();
   useShortcutToRebaseSelected();
 
-  const isNarrow = useAtomValue(isNarrowCommitTree);
+  const treeWidth = useAtomValue(commitTreeWidth);
 
   const {trees} = useAtomValue(treeWithPreviews);
   const fetchError = useAtomValue(commitFetchError);
+  const shouldScrollToYouAreHereOnOpen = useAtomValue(scrollToYouAreHereOnOpen);
+
+  const hasAutoScrolled = useRef(false);
+  useEffect(() => {
+    if (!shouldScrollToYouAreHereOnOpen || hasAutoScrolled.current || trees.length === 0) {
+      return;
+    }
+    hasAutoScrolled.current = scrollToYouAreHere('auto');
+  }, [trees, shouldScrollToYouAreHereOnOpen]);
+
   return fetchError == null && trees.length === 0 ? (
     <Center>
       <LargeSpinner />
@@ -297,7 +498,9 @@ export function CommitTreeList() {
   ) : (
     <>
       {fetchError ? <CommitFetchError error={fetchError} /> : null}
-      <DagCommitList isNarrow={isNarrow} />
+      <ScrollToCurrentCommitButton slot="above" />
+      <DagCommitList width={treeWidth} />
+      <ScrollToCurrentCommitButton slot="below" />
       <MaybeEditStackModal />
     </>
   );
@@ -320,6 +523,17 @@ function CommitFetchError({error}: {error: Error}) {
             <T>Create empty initial commit</T>
           </Button>,
         ]}
+      />
+    );
+  }
+  if (error.message === ErrorShortMessages.TooManyCommits) {
+    return (
+      <ErrorNotice
+        title={t('Too many commits to render')}
+        description={t(
+          'Check your public branch configuration, or run `sl doctor` to hide unrelated commits.',
+        )}
+        error={error}
       />
     );
   }

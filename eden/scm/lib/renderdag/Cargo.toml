@@ -14,12 +14,12 @@ license = "MIT"
 name = "renderdag"
 
 [dependencies]
-bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
+bitflags = { version = "2.13.2", features = ["serde", "std"], default-features = false }
 serde = { version = "1.0.229", features = ["derive", "rc"], optional = true }
 
 [dev-dependencies]
 sapling-drawdag = { version = "0.1.0", path = "../drawdag" }
-unicode-width = "0.1.14"
+unicode-width = "0.2.2"
 
 [features]
 default = []

@@ -8,11 +8,14 @@
 #include <folly/String.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
+#include <thread>
 
 #include "eden/common/utils/Bug.h"
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
@@ -121,6 +124,219 @@ void RenameTest::renameFile(
   EXPECT_THROW_ERRNO(mount_->getFileInode(srcPath), ENOENT);
 }
 
+// Renaming a loaded directory over an existing directory whose inode has
+// never been loaded. The destination has to be loaded to check whether it is
+// empty; the rename must not assume its inode is in memory.
+class RenameUnloadedDestTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    FakeTreeBuilder builder;
+    builder.setFile("src/file.txt", "contents\n");
+    builder.mkdir("empty");
+    builder.setFile("full/other.txt", "contents\n");
+    mount_ = std::make_unique<TestMount>(builder);
+    root_ = mount_->getEdenMount()->getRootInode();
+    src_ = mount_->getTreeInode("src");
+  }
+
+  folly::Future<folly::Unit> renameSrcTo(PathComponentPiece destName) {
+    auto future = root_
+                      ->rename(
+                          "src"_pc,
+                          root_,
+                          destName,
+                          InvalidationRequired::No,
+                          ObjectFetchContext::getNullContext())
+                      .semi()
+                      .via(mount_->getServerExecutor().get());
+    mount_->drainServerExecutor();
+    return future;
+  }
+
+  std::unique_ptr<TestMount> mount_;
+  TreeInodePtr root_;
+  TreeInodePtr src_;
+};
+
+TEST_F(RenameUnloadedDestTest, replacesUnloadedEmptyDir) {
+  renameSrcTo("empty"_pc).get(0ms);
+
+  EXPECT_EQ(src_, mount_->getTreeInode("empty"));
+  EXPECT_TRUE(mount_->hasFileAt("empty/file.txt"));
+  EXPECT_THROW_ERRNO(mount_->getTreeInode("src"), ENOENT);
+}
+
+TEST_F(RenameUnloadedDestTest, refusesUnloadedNonEmptyDir) {
+  EXPECT_THROW_ERRNO(renameSrcTo("full"_pc).get(0ms), ENOTEMPTY);
+
+  EXPECT_EQ(src_, mount_->getTreeInode("src"));
+  EXPECT_TRUE(mount_->hasFileAt("full/other.txt"));
+}
+
+// Renaming over an entry whose name differs only in case on a
+// case-insensitive mount. The moved entry should end up under the requested
+// spelling everywhere it is recorded: the parent's listing, the inode's own
+// location, and the overlay record.
+class RenameCaseVariantTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    FakeTreeBuilder builder;
+    builder.setFile("src/file.txt", "new\n");
+    builder.setFile("b", "old\n");
+    // With the WAL the overlay records the rename as a delta keyed by the
+    // requested name rather than rewriting the directory from memory.
+    mount_ = std::make_unique<TestMount>(
+        /*enableActivityBuffer=*/false,
+        CaseSensitivity::Insensitive,
+        /*errorLogger=*/nullptr,
+        [](EdenConfig& config) {
+          config.overlayUseWal.setValue(true, ConfigSourceType::CommandLine);
+        });
+    mount_->initialize(builder);
+    root_ = mount_->getEdenMount()->getRootInode();
+  }
+
+  std::vector<std::string> rootNames() {
+    std::vector<std::string> names;
+    auto contents = root_->getContentsUnchecked().rlock();
+    for (const auto& [name, entry] : contents->entries.all()) {
+      if (name.view() != kDotEdenName) {
+        names.push_back(name.asString());
+      }
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+  }
+
+  std::vector<std::string> rootOverlayNames() {
+    std::vector<std::string> names;
+    auto dir = mount_->getEdenMount()->getOverlay()->loadOverlayDir(
+        root_->getNodeId());
+    for (const auto& [name, entry] : dir) {
+      if (name.view() != kDotEdenName) {
+        names.push_back(name.asString());
+      }
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+  }
+
+  std::unique_ptr<TestMount> mount_;
+  TreeInodePtr root_;
+};
+
+TEST_F(RenameCaseVariantTest, replaceTakesRequestedSpelling) {
+  auto src = mount_->getTreeInode("src");
+  auto file = mount_->getFileInode("src/file.txt");
+  auto future = src->rename(
+                       "file.txt"_pc,
+                       root_,
+                       "B"_pc,
+                       InvalidationRequired::No,
+                       ObjectFetchContext::getNullContext())
+                    .semi()
+                    .via(mount_->getServerExecutor().get());
+  mount_->drainServerExecutor();
+  std::move(future).get(0ms);
+
+  using Names = std::vector<std::string>;
+  EXPECT_EQ(RelativePath{"B"}, file->getPath().value());
+  EXPECT_EQ((Names{"B", "src"}), rootNames());
+  EXPECT_EQ((Names{"B", "src"}), rootOverlayNames());
+
+  src.reset();
+  file.reset();
+  root_.reset();
+  mount_->remount();
+  root_ = mount_->getEdenMount()->getRootInode();
+  EXPECT_EQ((Names{"B", "src"}), rootNames());
+  EXPECT_EQ("new\n", mount_->readFile("B"));
+}
+
+// Renaming a directory over an empty directory that another thread still
+// holds a reference to. The rename unlinks the destination while it holds
+// the destination's contents lock, and an unlinked inode is destroyed by
+// whoever drops the last reference, so the destination has to stay alive
+// until the rename has released its locks.
+class RenameOverReferencedDirTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    FakeTreeBuilder builder;
+    builder.setFile("src/file.txt", "contents\n");
+    builder.mkdir("dest");
+    mount_ = std::make_unique<TestMount>(builder);
+    root_ = mount_->getEdenMount()->getRootInode();
+  }
+
+  // A failed assertion must not leave the rename thread blocked and
+  // joinable, which would terminate the whole test binary.
+  void TearDown() override {
+    finishRename();
+  }
+
+  // Rename src over dest on another thread and block that thread right
+  // after it has unlinked the destination.
+  void startRename() {
+    faultInjector().injectBlock("TreeInode::doRename", "dest");
+    renamer_ = std::thread([this] {
+      root_
+          ->rename(
+              "src"_pc,
+              root_,
+              "dest"_pc,
+              InvalidationRequired::No,
+              ObjectFetchContext::getNullContext())
+          .get();
+    });
+    ASSERT_TRUE(faultInjector().waitUntilBlocked("TreeInode::doRename", 5s));
+  }
+
+  void finishRename() {
+    if (renamer_.joinable()) {
+      faultInjector().removeFault("TreeInode::doRename", "dest");
+      faultInjector().unblockAll();
+      renamer_.join();
+    }
+  }
+
+  FaultInjector& faultInjector() {
+    return mount_->getServerState()->getFaultInjector();
+  }
+
+  std::unique_ptr<TestMount> mount_;
+  TreeInodePtr root_;
+  std::thread renamer_;
+};
+
+TEST_F(RenameOverReferencedDirTest, sourceStaysReferencedDuringRename) {
+  auto src = mount_->getTreeInode("src");
+  ASSERT_NO_FATAL_FAILURE(startRename());
+
+  // The rename uses the source inode after releasing its contents locks, so
+  // it must hold its own reference rather than rely on the parent's entry.
+  EXPECT_GT(src->debugGetPtrRef(), 1u);
+
+  finishRename();
+  EXPECT_TRUE(mount_->hasFileAt("dest/file.txt"));
+}
+
+TEST_F(RenameOverReferencedDirTest, destinationOutlivesRenameLocks) {
+  auto* inodeMap = mount_->getEdenMount()->getInodeMap();
+  auto dest = mount_->getTreeInode("dest");
+  auto destIno = dest->getNodeId();
+  ASSERT_NO_FATAL_FAILURE(startRename());
+  EXPECT_TRUE(dest->isUnlinked());
+
+  // Dropping the last outside reference while the rename still holds the
+  // destination's contents lock must not destroy the inode.
+  dest.reset();
+  EXPECT_TRUE(inodeMap->isInodeLoadedOrRemembered(destIno));
+
+  finishRename();
+  EXPECT_FALSE(inodeMap->isInodeLoadedOrRemembered(destIno));
+  EXPECT_TRUE(mount_->hasFileAt("dest/file.txt"));
+}
+
 TEST_F(RenameTest, renameFileSameDirectory) {
   renameFile("a/b/c/doc.txt", "a/b/c/newdocs.txt", false);
 }
@@ -198,6 +414,31 @@ TEST_F(RenameTest, renameFileToSamePath) {
   EXPECT_EQ(origFile->getNodeId(), renamedInode->getNodeId());
   EXPECT_EQ(origFile.get(), renamedInode.get());
   EXPECT_EQ(path, origFile->getPath().value());
+}
+
+TEST_F(RenameTest, renameNoReplacePreservesExistingDestination) {
+  RelativePath srcPath{"a/b/c/doc.txt"};
+  RelativePath destPath{"a/b/c/readme.txt"};
+  auto srcInode = mount_->getFileInode(srcPath);
+  auto destInode = mount_->getFileInode(destPath);
+  auto parentDir = mount_->getTreeInode(srcPath.dirname());
+
+  auto renameFuture = parentDir
+                          ->rename(
+                              srcPath.basename(),
+                              parentDir,
+                              destPath.basename(),
+                              InvalidationRequired::No,
+                              ObjectFetchContext::getNullContext(),
+                              /*noReplace=*/true)
+                          .semi()
+                          .via(mount_->getServerExecutor().get());
+  mount_->drainServerExecutor();
+
+  ASSERT_TRUE(renameFuture.isReady());
+  EXPECT_THROW_ERRNO(std::move(renameFuture).get(0ms), EEXIST);
+  EXPECT_EQ(srcInode.get(), mount_->getFileInode(srcPath).get());
+  EXPECT_EQ(destInode.get(), mount_->getFileInode(destPath).get());
 }
 
 /*

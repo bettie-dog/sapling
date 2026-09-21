@@ -13,11 +13,14 @@
 #include <unistd.h>
 #endif
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include <folly/executors/ManualExecutor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 
 #include "eden/fs/nfs/NfsdRpc.h"
@@ -40,7 +43,8 @@ class TestFastPathProcessor : public RpcServerProcessor {
   }
 };
 
-std::unique_ptr<folly::IOBuf> buildRpcRequest(uint32_t xid, uint32_t proc) {
+std::unique_ptr<folly::IOBuf>
+buildRpcRequestWithCred(uint32_t xid, uint32_t proc, opaque_auth cred) {
   folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
   folly::io::QueueAppender ser(&queue, 256);
 
@@ -53,7 +57,7 @@ std::unique_ptr<folly::IOBuf> buildRpcRequest(uint32_t xid, uint32_t proc) {
           kNfsdProgNumber,
           kNfsd3ProgVersion,
           proc,
-          opaque_auth{auth_flavor::AUTH_NONE, {}},
+          std::move(cred),
           opaque_auth{auth_flavor::AUTH_NONE, {}},
       },
   };
@@ -61,9 +65,32 @@ std::unique_ptr<folly::IOBuf> buildRpcRequest(uint32_t xid, uint32_t proc) {
 
   auto len = static_cast<uint32_t>(queue.chainLength() - sizeof(uint32_t));
   auto buf = queue.move();
+  if (!buf) {
+    ADD_FAILURE() << "serialized RPC request is empty";
+    return nullptr;
+  }
   auto* header = reinterpret_cast<uint32_t*>(buf->writableData());
+  if (!header) {
+    ADD_FAILURE() << "serialized RPC request has no writable data";
+    return nullptr;
+  }
   *header = folly::Endian::big(len | 0x80000000);
   return buf;
+}
+
+std::unique_ptr<folly::IOBuf> buildRpcRequest(uint32_t xid, uint32_t proc) {
+  return buildRpcRequestWithCred(
+      xid, proc, opaque_auth{auth_flavor::AUTH_NONE, {}});
+}
+
+opaque_auth makeAuthSysCred(const authsys_parms& creds) {
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender ser(&queue, 256);
+  XdrTrait<authsys_parms>::serialize(ser, creds);
+  auto buf = queue.move();
+  auto bytes = buf->coalesce();
+  return opaque_auth{
+      auth_flavor::AUTH_SYS, OpaqueBytes{bytes.begin(), bytes.end()}};
 }
 
 std::unique_ptr<folly::IOBuf> buildNullRpcRequest(uint32_t xid) {
@@ -109,6 +136,10 @@ struct RpcServerTest : ::testing::Test {
    * thread pool.
    */
   void sendRequest(int clientFd, std::unique_ptr<folly::IOBuf> request) {
+    if (!request) {
+      ADD_FAILURE() << "RPC request must not be null";
+      return;
+    }
     auto bytes = request->coalesce();
     ASSERT_EQ(
         static_cast<ssize_t>(bytes.size()),
@@ -128,6 +159,63 @@ struct RpcServerTest : ::testing::Test {
     pfd.fd = clientFd;
     pfd.events = POLLIN;
     return poll(&pfd, 1, timeoutMs) > 0;
+  }
+
+  /**
+   * Bind the server to a unix socket under @p tmpDir and return the bound
+   * address. A unix socket exercises the same accept path as the TCP
+   * socket used in production, and unlike loopback TCP it works in
+   * sandboxed test environments.
+   */
+  folly::SocketAddress bindUnixSocket(
+      RpcServer& server,
+      const folly::test::TemporaryDirectory& tmpDir) {
+    folly::SocketAddress bindAddr;
+    bindAddr.setFromPath((tmpDir.path() / "rpc.sock").string());
+    server.initialize(bindAddr);
+    return server.getAddr();
+  }
+
+  /**
+   * Connect a new client socket to the server's listening address and
+   * return the fd. Caller must close the fd.
+   */
+  int connectToServer(const folly::SocketAddress& addr) {
+    int fd = ::socket(addr.getFamily(), SOCK_STREAM, 0);
+    EXPECT_GE(fd, 0) << folly::errnoStr(errno);
+    sockaddr_storage ss{};
+    auto len = addr.getAddress(&ss);
+    EXPECT_EQ(0, ::connect(fd, reinterpret_cast<sockaddr*>(&ss), len))
+        << "connect to " << addr.describe() << ": " << folly::errnoStr(errno);
+    return fd;
+  }
+
+  /**
+   * Pump the EventBase until done() holds or a bounded number of
+   * iterations elapse. The EventBase is driven manually by the test
+   * thread, so nothing else can make progress between pumps. The loop
+   * exits as soon as the predicate holds; the brief sleep only yields
+   * between non-blocking pumps, it does not gate correctness.
+   */
+  template <typename Done>
+  void drive(Done&& done) {
+    for (int i = 0; i < 1000 && !done(); ++i) {
+      evb.loopOnce(EVLOOP_NONBLOCK);
+      // @lint-ignore CLANGTIDY facebook-hte-BadCall-sleep_for
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  /**
+   * Returns true once the peer has closed the connection: the fd is
+   * readable and read() reports EOF.
+   */
+  bool sawEof(int fd) {
+    if (!pollForReply(fd, 0)) {
+      return false;
+    }
+    uint8_t byte;
+    return read(fd, &byte, 1) == 0;
   }
 
   /**
@@ -226,6 +314,120 @@ TEST_F(RpcServerTest, takeover_from_takeover) {
 
 #ifndef _WIN32
 // Tests below use Unix socketpair/poll APIs not available on Windows.
+
+class ShutdownRecordingProcessor : public RpcServerProcessor {
+ public:
+  void clientConnected() override {
+    clientCount_.fetch_add(1, std::memory_order_release);
+  }
+
+  void onExtraConnection() override {
+    extraConnectionCount_.fetch_add(1, std::memory_order_release);
+  }
+
+  void onExtraConnectionRefused() override {
+    extraConnectionRefusedCount_.fetch_add(1, std::memory_order_release);
+  }
+
+  void onShutdown(RpcStopData data) override {
+    lastReason_ = data.reason;
+    shutdownCount_.fetch_add(1, std::memory_order_release);
+  }
+
+  int clientCount() const {
+    return clientCount_.load(std::memory_order_acquire);
+  }
+
+  int extraConnectionCount() const {
+    return extraConnectionCount_.load(std::memory_order_acquire);
+  }
+
+  int extraConnectionRefusedCount() const {
+    return extraConnectionRefusedCount_.load(std::memory_order_acquire);
+  }
+
+  int shutdownCount() const {
+    return shutdownCount_.load(std::memory_order_acquire);
+  }
+
+  std::atomic<int> clientCount_{0};
+  std::atomic<int> extraConnectionCount_{0};
+  std::atomic<int> extraConnectionRefusedCount_{0};
+  std::atomic<int> shutdownCount_{0};
+  std::optional<RpcStopReason> lastReason_;
+};
+
+class SingleClientShutdownRecordingProcessor
+    : public ShutdownRecordingProcessor {
+ public:
+  bool acceptsMultipleConnections() const override {
+    return false;
+  }
+};
+
+TEST_F(RpcServerTest, extra_connection_is_refused_for_single_client_server) {
+  auto proc = std::make_shared<SingleClientShutdownRecordingProcessor>();
+  auto server = createTestServer(proc);
+
+  folly::test::TemporaryDirectory tmpDir;
+  auto addr = bindUnixSocket(*server, tmpDir);
+
+  // The kernel's connection, established once at mount time.
+  int kernelFd = connectToServer(addr);
+  drive([&] { return proc->clientCount() == 1; });
+  ASSERT_EQ(1, proc->clientCount());
+
+  // Some other local process — anything able to reach the socket — connects
+  // and immediately disconnects. The server refuses the connection (the
+  // client observes EOF), and the processor is not told to shut down: only
+  // the kernel's connection controls the server's lifetime.
+  int scannerFd = connectToServer(addr);
+  drive([&] { return sawEof(scannerFd); });
+  EXPECT_TRUE(sawEof(scannerFd)) << "extra connection should be refused";
+  close(scannerFd);
+  EXPECT_EQ(1, proc->clientCount());
+  EXPECT_EQ(1, proc->extraConnectionCount());
+  EXPECT_EQ(1, proc->extraConnectionRefusedCount());
+  EXPECT_EQ(0, proc->shutdownCount());
+
+  // EOF on the kernel's connection still stops the server: that is how a
+  // real unmount is detected.
+  close(kernelFd);
+  drive([&] { return proc->shutdownCount() > 0; });
+  EXPECT_EQ(1, proc->shutdownCount());
+  EXPECT_EQ(RpcStopReason::UNMOUNT, proc->lastReason_);
+
+  server.reset();
+  evb.loopOnce();
+}
+
+TEST_F(RpcServerTest, extra_connection_is_accepted_for_multi_client_server) {
+  // Mountd-style servers carry each exchange on its own connection, so a
+  // second connection must still be accepted and stay open.
+  auto proc = std::make_shared<ShutdownRecordingProcessor>();
+  auto server = createTestServer(proc);
+
+  folly::test::TemporaryDirectory tmpDir;
+  auto addr = bindUnixSocket(*server, tmpDir);
+
+  int first = connectToServer(addr);
+  drive([&] { return proc->clientCount() == 1; });
+  ASSERT_EQ(1, proc->clientCount());
+  int second = connectToServer(addr);
+  drive([&] { return proc->clientCount() == 2; });
+  ASSERT_EQ(2, proc->clientCount());
+  EXPECT_EQ(1, proc->extraConnectionCount());
+  EXPECT_EQ(0, proc->extraConnectionRefusedCount());
+
+  // Neither connection was closed by the server.
+  EXPECT_FALSE(pollForReply(first, 0));
+  EXPECT_FALSE(pollForReply(second, 0));
+
+  close(second);
+  close(first);
+  server.reset();
+  evb.loopOnce();
+}
 
 TEST_F(RpcServerTest, null_rpc_bypasses_thread_pool) {
   auto server = createTestServerWithManualExecutor(
@@ -566,6 +768,136 @@ TEST_F(RpcServerTest, phase_timing_records_all_phases) {
   EXPECT_LE(*t.dispatched, *t.handlerStart);
   EXPECT_LE(*t.handlerStart, *t.handlerDone);
   EXPECT_LE(*t.handlerDone, *t.responseSent);
+
+  cleanup(clientFd, server);
+}
+
+/**
+ * Records the parsed AUTH_SYS credentials that the RpcServer hands to
+ * checkAuthentication and dispatchRpc.
+ */
+class CredsRecordingProcessor : public RpcServerProcessor {
+ public:
+  explicit CredsRecordingProcessor(bool parseCreds = true)
+      : parseCreds_{parseCreds} {}
+
+  bool shouldParseAuthSysCreds() override {
+    return parseCreds_;
+  }
+
+  auth_stat checkAuthentication(
+      const call_body& callBody,
+      const std::optional<authsys_parms>& authSysCreds) override {
+    checkAuthCreds_ = authSysCreds;
+    return RpcServerProcessor::checkAuthentication(callBody, authSysCreds);
+  }
+
+  ImmediateFuture<folly::Unit> dispatchRpc(
+      folly::io::Cursor /*deser*/,
+      folly::io::QueueAppender ser,
+      uint32_t xid,
+      uint32_t /*progNumber*/,
+      uint32_t /*progVersion*/,
+      uint32_t /*procNumber*/,
+      const std::optional<authsys_parms>& authSysCreds) override {
+    dispatchCreds_ = authSysCreds;
+    serializeReply(ser, accept_stat::SUCCESS, xid);
+    return folly::unit;
+  }
+
+  std::optional<authsys_parms> checkAuthCreds_;
+  std::optional<authsys_parms> dispatchCreds_;
+
+ private:
+  bool parseCreds_;
+};
+
+struct RpcServerCredsTest : RpcServerTest {
+  /**
+   * Send a request and crank the ManualExecutor and EventBase until the
+   * reply arrives. Everything runs on the test thread, so the processor's
+   * recorded credentials can be read without synchronization.
+   */
+  std::vector<uint8_t> sendAndCrank(
+      int clientFd,
+      std::unique_ptr<folly::IOBuf> request) {
+    sendRequest(clientFd, std::move(request));
+    for (int i = 0; i < 20; ++i) {
+      manualExecutor_->run();
+      evb.loopOnce(EVLOOP_NONBLOCK);
+    }
+    EXPECT_TRUE(pollForReply(clientFd, 1000)) << "Expected an RPC reply";
+    return readReply(clientFd);
+  }
+};
+
+TEST_F(RpcServerCredsTest, authsys_creds_passed_to_processor) {
+  auto proc = std::make_shared<CredsRecordingProcessor>();
+  auto server = createTestServerWithManualExecutor(proc);
+  auto clientFd = connectClient(*server);
+
+  authsys_parms creds{/*stamp=*/7, "testhost", /*uid=*/0, /*gid=*/0, {0, 20}};
+  auto reply = sendAndCrank(
+      clientFd, buildRpcRequestWithCred(1, 1, makeAuthSysCred(creds)));
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+
+  ASSERT_TRUE(proc->checkAuthCreds_.has_value());
+  EXPECT_EQ(proc->checkAuthCreds_->uid, 0u);
+  ASSERT_TRUE(proc->dispatchCreds_.has_value());
+  EXPECT_EQ(proc->dispatchCreds_->uid, 0u);
+  EXPECT_EQ(proc->dispatchCreds_->gid, 0u);
+  EXPECT_EQ(proc->dispatchCreds_->machinename, "testhost");
+  EXPECT_EQ(proc->dispatchCreds_->gids, (std::vector<uint32_t>{0, 20}));
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerCredsTest, auth_none_yields_nullopt_creds) {
+  auto proc = std::make_shared<CredsRecordingProcessor>();
+  auto server = createTestServerWithManualExecutor(proc);
+  auto clientFd = connectClient(*server);
+
+  auto reply = sendAndCrank(clientFd, buildRpcRequest(2, 1));
+  // Characterization: AUTH_NONE requests are still dispatched, the default
+  // checkAuthentication accepts everything.
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+  EXPECT_EQ(proc->checkAuthCreds_, std::nullopt);
+  EXPECT_EQ(proc->dispatchCreds_, std::nullopt);
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerCredsTest, parse_skipped_when_processor_declines_creds) {
+  auto proc = std::make_shared<CredsRecordingProcessor>(/*parseCreds=*/false);
+  auto server = createTestServerWithManualExecutor(proc);
+  auto clientFd = connectClient(*server);
+
+  // Even though the request carries a valid AUTH_SYS credential, the
+  // processor declined the parse, so both hooks must see nullopt.
+  authsys_parms creds{/*stamp=*/7, "testhost", /*uid=*/0, /*gid=*/0, {0}};
+  auto reply = sendAndCrank(
+      clientFd, buildRpcRequestWithCred(4, 1, makeAuthSysCred(creds)));
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+  EXPECT_EQ(proc->checkAuthCreds_, std::nullopt);
+  EXPECT_EQ(proc->dispatchCreds_, std::nullopt);
+
+  cleanup(clientFd, server);
+}
+
+TEST_F(RpcServerCredsTest, malformed_authsys_creds_still_dispatched) {
+  auto proc = std::make_shared<CredsRecordingProcessor>();
+  auto server = createTestServerWithManualExecutor(proc);
+  auto clientFd = connectClient(*server);
+
+  // A 3-byte AUTH_SYS body cannot even hold the stamp field.
+  opaque_auth truncated{auth_flavor::AUTH_SYS, {1, 2, 3}};
+  auto reply = sendAndCrank(
+      clientFd, buildRpcRequestWithCred(3, 1, std::move(truncated)));
+  // Characterization: malformed credentials parse to nullopt and the request
+  // is still dispatched rather than rejected with an auth error.
+  EXPECT_EQ(readBigEndianU32(reply, 8), 1u); // msg_type::REPLY
+  EXPECT_EQ(readBigEndianU32(reply, 24), 0u); // accept_stat::SUCCESS
+  EXPECT_EQ(proc->dispatchCreds_, std::nullopt);
 
   cleanup(clientFd, server);
 }

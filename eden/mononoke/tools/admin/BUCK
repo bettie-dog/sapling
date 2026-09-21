@@ -13,7 +13,6 @@ rust_binary(
         "cargo_toml_config": {
             "dependencies_override": {
                 "dependencies": {
-                    "gix-hash": {"features": ["sha1"]},
                     "sapling-dag-types": {
                         "features": [
                             "for-tests",
@@ -67,6 +66,7 @@ rust_binary(
         "fbsource//third-party/rust:tokio-stream",
         "fbsource//third-party/rust:tokio-util",
         "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:uuid",
         "fbsource//third-party/rust:walkdir",
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/bounded_traversal:bounded_traversal",
@@ -84,6 +84,7 @@ rust_binary(
         "//eden/mononoke/blobstore:blobstore_factory",
         "//eden/mononoke/blobstore:cacheblob",
         "//eden/mononoke/blobstore:ephemeral_blobstore",
+        "//eden/mononoke/cmdlib:arg_extensions",
         "//eden/mononoke/cmdlib:cmdlib_cross_repo",
         "//eden/mononoke/cmdlib/commit_id:commit_id",
         "//eden/mononoke/cmdlib/displaying:cmdlib_displaying",
@@ -127,6 +128,7 @@ rust_binary(
         "//eden/mononoke/features/commit_transformation:commit_transformation",
         "//eden/mononoke/features/cross_repo_sync:cross_repo_sync",
         "//eden/mononoke/features/pushrebase:pushrebase",
+        "//eden/mononoke/features/pushrebase:pushrebase_client",
         "//eden/mononoke/features/pushrebase:pushrebase_hooks",
         "//eden/mononoke/features/redaction:redaction",
         "//eden/mononoke/features/repo_update_logger:repo_update_logger",
@@ -162,6 +164,7 @@ rust_binary(
         "//eden/mononoke/repo_attributes/git_ref_content_mapping:git_ref_content_mapping",
         "//eden/mononoke/repo_attributes/git_source_of_truth:git_source_of_truth",
         "//eden/mononoke/repo_attributes/git_symbolic_refs:git_symbolic_refs",
+        "//eden/mononoke/repo_attributes/hook_manager/hook_manager:hook_manager",
         "//eden/mononoke/repo_attributes/mutable_blobstore:mutable_blobstore",
         "//eden/mononoke/repo_attributes/mutable_counters:mutable_counters",
         "//eden/mononoke/repo_attributes/mutable_renames:mutable_renames",
@@ -175,9 +178,11 @@ rust_binary(
         "//eden/mononoke/repo_attributes/repo_derived_data:repo_derived_data",
         "//eden/mononoke/repo_attributes/repo_identity:repo_identity",
         "//eden/mononoke/repo_attributes/repo_lock:repo_lock",
+        "//eden/mononoke/repo_attributes/repo_permission_checker:repo_permission_checker",
         "//eden/mononoke/repo_attributes/restricted_paths:restricted_paths",
         "//eden/mononoke/repo_attributes/restricted_paths_common:restricted_paths_common",
         "//eden/mononoke/repo_attributes/sql_query_config:sql_query_config",
+        "//eden/mononoke/repo_authorization:repo_authorization",
         "//eden/mononoke/repo_factory:repo_factory",
         "//eden/mononoke/scs/if:source_control-rust",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
@@ -188,11 +193,17 @@ rust_binary(
         []
         if rust_oss.is_oss_build()
         else [
+            "//artillery/artillery2/api/cpp/cli_lite/rust:art_cli_lite_rs",
+            # Only used by the fbcode-only src/facebook/ commands; keeping it
+            # out of the OSS deps avoids the unused-dependency check failure.
+            "fbsource//third-party/rust:derive_more",
             "//common/rust/configo:configo",
             "//configerator/structs/scm/mononoke/repos:repos-rust",
             "//eden/mononoke/blobstore:blobstore_factory",
             "//eden/mononoke/blobstore:fileblob",
             "//eden/mononoke/blobstore:redactedblobstore",
+            "//eden/mononoke/common/sql_construct:sql_construct",
+            "//eden/mononoke/metaconfig:metaconfig_parser",
             "//eden/mononoke/repo_attributes/bonsai_blob_mapping:bonsai_blob_mapping",
             "//eden/mononoke/repo_attributes/deletion_log:deletion_log",
             "//eden/mononoke/tools/repo_spec_writer:repo_spec_writer",

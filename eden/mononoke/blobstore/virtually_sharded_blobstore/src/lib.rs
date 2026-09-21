@@ -5,11 +5,6 @@
  * GNU General Public License version 2.
  */
 
-#![feature(generic_assert)]
-// The clippy lint is not our fault and is a result of the bug https://fburl.com/7perds28
-#![allow(internal_features)]
-#![feature(core_intrinsics)]
-
 mod ratelimit;
 mod shard;
 
@@ -52,7 +47,7 @@ use shard::Shards;
 use shared_error::anyhow::IntoSharedError;
 use shared_error::anyhow::SharedError;
 use stats::prelude::*;
-use twox_hash::XxHash;
+use twox_hash::XxHash64;
 
 use crate::ratelimit::AccessReason;
 use crate::ratelimit::Ticket;
@@ -132,7 +127,7 @@ impl PresenceData {
     const PUT: &'static [u8] = &[1];
 
     fn from_put(v: &BlobstoreBytes) -> Self {
-        let mut hasher = XxHash::with_seed(0);
+        let mut hasher = XxHash64::with_seed(0);
         hasher.write(v.as_bytes().as_ref());
         Self::Put(hasher.finish())
     }
@@ -194,7 +189,7 @@ pub struct VirtuallyShardedBlobstore<T> {
 
 impl<T: fmt::Display> fmt::Display for VirtuallyShardedBlobstore<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VirtuallyShardedBlobstore<{}>", &self.inner.blobstore)
+        write!(f, "VirtuallyShardedBlobstore<{}>", self.inner.blobstore)
     }
 }
 

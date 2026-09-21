@@ -47,6 +47,7 @@ import platform from './platform';
 import {optimisticMergeConflicts} from './previews';
 import {copyAndShowToast} from './toast';
 import {ChangedFileMode, ConflictType, succeedableRevset} from './types';
+import {showConfirmation} from './useModal';
 import {usePromise} from './usePromise';
 
 /**
@@ -155,6 +156,13 @@ export function File({
       {label: t('Copy Filename'), onClick: () => clipboardCopy(basename(file.path))},
       {label: t('Open File'), onClick: () => platform.openFile(file.path)},
     ];
+
+    if (isMarkdownPreviewablePath(file.path) && platform.openPreview != null) {
+      options.push({
+        label: t('Open Preview'),
+        onClick: () => platform.openPreview?.(file.path),
+      });
+    }
 
     if (platform.openContainingFolder != null) {
       options.push({
@@ -316,6 +324,24 @@ function FileActions({
   }
 
   if (
+    isMarkdownPreviewablePath(file.path) &&
+    platform.openPreview != null &&
+    file.mode !== ChangedFileMode.Submodule
+  ) {
+    actions.push(
+      <Tooltip title={t('Open markdown preview')} key="open-preview" delayMs={1000}>
+        <Button
+          className="file-show-on-hover"
+          icon
+          data-testid="file-open-preview-button"
+          onClick={() => platform.openPreview?.(file.path)}>
+          <Icon icon="open-preview" />
+        </Button>
+      </Tooltip>,
+    );
+  }
+
+  if (
     (revertableStatues.has(file.status) && comparison.type !== ComparisonType.Committed) ||
     // special case: reverting does actually work for added files in the head commit
     (comparison.type === ComparisonType.HeadChanges && file.status === 'A')
@@ -339,14 +365,17 @@ function FileActions({
               return;
             }
 
-            const ok = await platform.confirm(
-              comparison.type === ComparisonType.UncommittedChanges
-                ? t('Are you sure you want to revert $file?', {replace: {$file: file.path}})
-                : t(
-                    'Are you sure you want to revert $file back to how it was just before the last commit? Uncommitted changes to this file will be lost.',
-                    {replace: {$file: file.path}},
-                  ),
-            );
+            const ok = await showConfirmation({
+              title: t('Revert File?'),
+              message:
+                comparison.type === ComparisonType.UncommittedChanges
+                  ? t('Are you sure you want to revert $file?', {replace: {$file: file.path}})
+                  : t(
+                      'Are you sure you want to revert $file back to how it was just before the last commit? Uncommitted changes to this file will be lost.',
+                      {replace: {$file: file.path}},
+                    ),
+              confirmLabel: t('Revert'),
+            });
             if (!ok) {
               return;
             }
@@ -408,9 +437,13 @@ function FileActions({
             icon
             data-testid="file-action-delete"
             onClick={async () => {
-              const ok = await platform.confirm(
-                t('Are you sure you want to delete $file?', {replace: {$file: file.path}}),
-              );
+              const ok = await showConfirmation({
+                title: t('Delete File?'),
+                message: t('Are you sure you want to delete $file?', {
+                  replace: {$file: file.path},
+                }),
+                confirmLabel: t('Delete'),
+              });
               if (!ok) {
                 return;
               }
@@ -646,6 +679,20 @@ function PartialSelectionPanel({file}: {file: UIChangedFile}) {
         mode="unified"
       />
     </div>
+  );
+}
+
+/**
+ * Whether a file path looks like markdown that VS Code can render in a
+ * preview tab. Used to show an inline preview button in the file list.
+ */
+export function isMarkdownPreviewablePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    lower.endsWith('.md') ||
+    lower.endsWith('.markdown') ||
+    lower.endsWith('.mdown') ||
+    lower.endsWith('.mkd')
   );
 }
 

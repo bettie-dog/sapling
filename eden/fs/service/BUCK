@@ -69,12 +69,19 @@ cpp_binary(
     srcs = [
         "facebook/main.cpp",
     ],
+    allocator = select({
+        "DEFAULT": None,
+        "ovr_config//os:macos": "jemalloc",
+    }),
     linker_flags = select({
         "DEFAULT": [],
         "ovr_config//os:windows": [
             "/STACK:2097152",  # This was picked arbitrarily as 2 MB
         ],
     }),
+    modifiers = [
+        "fbcode//eden/scm/lib/backingstore:edenfs-cas[enabled]",
+    ],
     deps = [
         ":main",
         ":server",
@@ -124,11 +131,13 @@ cpp_binary(
     deps = [
         "//eden/common/utils:user_info",
         "//eden/fs/privhelper:flags",
+        "//eden/fs/privhelper:pin_scan",
         "//eden/fs/privhelper:rollback",
         "//eden/fs/privhelper:server",
         "//folly:exception",
         "//folly:file",
         "//folly:file_util",
+        "//folly:string",
         "//folly/init:init",
         "//folly/logging:init",
         "//folly/logging:logging",
@@ -230,6 +239,25 @@ cpp_library(
 )
 
 cpp_library(
+    name = "pin_scan_runner",
+    srcs = ["PinScanRunner.cpp"],
+    headers = ["PinScanRunner.h"],
+    deps = [
+        "//eden/common/utils:process",
+        "//folly:exception",
+        "//folly:scope_guard",
+        "//folly:string",
+        "//folly/logging:logging",
+    ],
+    exported_deps = [
+        "//eden/fs/privhelper:pin_scan",
+        "//eden/fs/telemetry:log_info",
+        "//folly:cancellation_token",
+        "//folly:expected",
+    ],
+)
+
+cpp_library(
     name = "startup_logger",
     srcs = [
         "StartupLogger.cpp",
@@ -251,6 +279,7 @@ cpp_library(
         "//folly:file_util",
         "//folly:string",
         "//folly/logging:logging",
+        "//folly/portability:fcntl",
         "//folly/portability:unistd",
     ],
     exported_deps = [
@@ -326,12 +355,14 @@ cpp_library(
         "EdenStateDir.cpp",
         "HeartbeatManager.cpp",
         "PeriodicTask.cpp",
+        "RestartArmer.cpp",
         "ThriftPermissionChecker.cpp",
     ],
     deps = [
         "fbsource//third-party/cpptoml:cpptoml",
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/re2:re2",
+        ":pin_scan_runner",
         ":startup_logger",
         ":startup_status_subscriber",
         ":thrift-streaming-cpp2-types",
@@ -364,6 +395,8 @@ cpp_library(
         "//eden/fs/notifications:command_notifier",
         "//eden/fs/notifications:notifier",
         "//eden/fs/notifications:null_notifier",
+        "//eden/fs/privhelper:pin_scan",
+        "//eden/fs/privhelper:privhelper",
         "//eden/fs/prjfs:prjfs",
         "//eden/fs/rust/redirect_ffi:redirect-ffi",  # @manual
         "//eden/fs/rust/redirect_ffi:redirect-ffi-cpp-wrapper",
@@ -405,19 +438,23 @@ cpp_library(
         "//folly:file_util",
         "//folly:indestructible",
         "//folly:random",
+        "//folly:scope_guard",
         "//folly:stop_watch",
         "//folly:string",
         "//folly:utility",
         "//folly/chrono:conv",
+        "//folly/container:f14_hash",
         "//folly/coro:collect",
         "//folly/coro:current_executor",
         "//folly/coro:invoke",
         "//folly/executors:cpu_thread_pool_executor",
         "//folly/executors/thread_factory:named_thread_factory",
         "//folly/io/async:async_signal_handler",
+        "//folly/io/async:event_base_manager",
         "//folly/json:dynamic",
         "//folly/logging:logging",
-        "//folly/portability:sys_types",
+        "//folly/portability:fcntl",
+        "//folly/portability:unistd",
         "//thrift/lib/cpp/concurrency:thread_manager",
         "//thrift/lib/cpp/util:enum_utils",
         "//thrift/lib/cpp2:server",
@@ -427,6 +464,9 @@ cpp_library(
         "//thrift/lib/cpp2/server:round_robin_request_pile",
     ] + select({
         "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "//eden/common/utils/facebook:process_attribution",  # @manual
+        ],
         "ovr_config//os:macos": [
             "//folly:subprocess",
         ],
@@ -468,6 +508,7 @@ cpp_library(
         "//folly/futures:shared_promise",
         "//folly/io/async:async_base",
         "//folly/portability:sys_stat",
+        "//folly/portability:sys_types",
         "//folly/synchronization:lifo_sem",
         "//monitoring/obc:obc_lib",
         "//thrift/lib/cpp:event_handler_base",

@@ -10,6 +10,7 @@ use std::io;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use async_runtime::block_on;
 use checkout::BookmarkAction;
 use checkout::ReportMode;
 use clidispatch::ReqCtx;
@@ -18,9 +19,12 @@ use clidispatch::fallback;
 use cliparser::define_flags;
 use cmdutil::MergeToolOpts;
 use configmodel::ConfigExt;
+use dag::Vertex;
 use fs_err as fs;
 use repo::repo::Repo;
 use repostate::command_state::Operation;
+use repostate::command_state::SUBTREE_COPY_STATE_FILE;
+use types::HgId;
 use workingcopy::workingcopy::LockedWorkingCopy;
 use workingcopy::workingcopy::WorkingCopy;
 
@@ -69,6 +73,14 @@ define_flags! {
 pub fn run(ctx: ReqCtx<GotoOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
     if !repo.config().get_or_default("checkout", "use-rust")? {
         fallback!("checkout.use-rust is False");
+    }
+
+    if repo
+        .config()
+        .get_nonempty("experimental", "preferred-target")
+        .is_some()
+    {
+        fallback!("preferred-target enforcement uses Python checkout");
     }
 
     if repo.config().get("commands", "update.check").as_deref() == Some("none") {
@@ -193,6 +205,19 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
         }
     };
 
+    let _lock = repo.lock()?;
+    if !ctx.opts.r#continue
+        && !hgplain::is_plain(None)
+        && matches!(
+            repo.config().get("checkout", "obsolete-mode").as_deref(),
+            None | Some("warn") | Some("abort")
+        )
+        && let Some(store) = repo.mutation_store()?
+        && store.has_successors(target)?
+    {
+        fallback!("checkout target has mutation successors");
+    }
+
     tracing::debug!(target: "checkout_info", checkout_mode="rust");
 
     let checkout_mode = if ctx.opts.clean {
@@ -205,7 +230,6 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
         checkout::CheckoutMode::AbortIfConflicts
     };
 
-    let _lock = repo.lock()?;
     checkout::checkout(
         &ctx.core,
         repo,
@@ -221,7 +245,42 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
         true,
     )?;
 
+    if ctx.opts.clean {
+        util::file::unlink_if_exists(wc.dot_hg_path().join(SUBTREE_COPY_STATE_FILE))?;
+    }
+
+    // Informational only: never fail a completed checkout over it.
+    if let Err(err) = show_destination(&ctx, repo, target) {
+        tracing::debug!(?err, "error showing checkout destination");
+    }
+
     Ok(0)
+}
+
+fn show_destination(ctx: &ReqCtx<GotoOpts>, repo: &Repo, target: HgId) -> Result<()> {
+    if ctx.global_opts().quiet
+        || hgplain::is_plain(None)
+        || !repo
+            .config()
+            .get_or("checkout", "show-destination", || true)?
+    {
+        return Ok(());
+    }
+    let commits = repo.dag_commits()?;
+    let fields = block_on(
+        commits
+            .read()
+            .get_commit_fields(&Vertex::copy_from(target.as_ref())),
+    )?;
+    if let Some(fields) = fields {
+        let title = fields.description()?.lines().next().unwrap_or("");
+        ctx.io().write(format!(
+            "checked out {} \"{}\"\n",
+            &target.to_hex()[..12],
+            title
+        ))?;
+    }
+    Ok(())
 }
 
 enum GotoMergeState {

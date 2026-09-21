@@ -15,6 +15,8 @@ mod resolve;
 mod scribe;
 
 pub use crate::manifest_commit::create_manifest_commit;
+pub use crate::repin::CasBaseline;
+pub use crate::repin::ManifestCommitSpec;
 pub use crate::repin::PreparedManifestCommit;
 pub use crate::repin::RepinOptions;
 pub use crate::repin::RepinOutcome;
@@ -24,5 +26,8 @@ pub use crate::repo_provider::RepoProvider;
 pub use crate::resolve::ResolveEntry;
 pub use crate::resolve::ResolveOutcome;
 pub use crate::resolve::ResolveResult;
+pub use crate::resolve::bulk_read_bonsais_by_git_sha1;
+pub use crate::resolve::bulk_read_bookmarks;
+pub use crate::resolve::bulk_read_git_sha1s;
 pub use crate::resolve::resolve_bookmarks_cross_repo;
 pub use crate::scribe::log_scribe_bookmark_update;

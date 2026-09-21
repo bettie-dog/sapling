@@ -10,7 +10,7 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.104"
 async-stream = "0.3"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bonsai_git_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_git_mapping" }
 bonsai_tag_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_tag_mapping" }
 bookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks" }
@@ -20,12 +20,12 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 cmdlib_caching = { version = "0.1.0", path = "../../../cmdlib/caching" }
 connection_security_checker = { version = "0.1.0", path = "../../../common/connection_security_checker" }
 context = { version = "0.1.0", path = "../../slapi/slapi_server/context" }
-either = "1.16.0"
+either = "1.18.0"
 environment = { version = "0.1.0", path = "../../../cmdlib/environment" }
 executor_lib = { version = "0.1.0", path = "../../../cmdlib/sharding" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_env = { version = "0.1.0", path = "../../../git/git_env" }
 git_source_of_truth = { version = "0.1.0", path = "../../../repo_attributes/git_source_of_truth" }
@@ -35,12 +35,11 @@ gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
 gix-packetline = { version = "0.21.5", features = ["blocking-io"] }
 gix-transport = "0.57.2"
-gotham = "0.8"
-gotham_derive = "0.8"
+gotham = "0.8.1"
+gotham_derive = "0.8.1"
 gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
-hex = { version = "0.4.3", features = ["alloc"] }
-http = "1.4.2"
-http-body-util = "0.1.4"
+http = "1.5.0"
+http-body-util = "0.1.5"
 import_direct = { version = "0.1.0", path = "../../../git/import_direct" }
 import_tools = { version = "0.1.0", path = "../../../git/import_tools" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
@@ -76,11 +75,12 @@ serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw
 sharding_ext = { version = "0.1.0", path = "../../../cmdlib/sharding_ext" }
 sharding_observability = { version = "0.1.0", path = "../../../cmdlib/sharding_observability" }
 slapi_service = { version = "0.1.0", path = "../../slapi/slapi_service" }
+source_control = { version = "0.1.0", path = "../../../scs/if" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
-thiserror = "2.0.19"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 topo_sort = { version = "0.1.0", path = "../../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 weight_observer = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

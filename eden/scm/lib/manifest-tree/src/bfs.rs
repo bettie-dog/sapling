@@ -10,14 +10,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use anyhow::anyhow;
 use edenapi_types::errors::find_permission_denied;
 use manifest::FileMetadata;
 use pathmatcher::DirectoryMatch;
+use pathmatcher::DynMatcher;
 use pathmatcher::Matcher;
 use slex::Batch;
 use slex::Items;
 use slex::Work;
 use slex::WorkOptions;
+use storemodel::PermissionDenial;
 use storemodel::TreeEntry;
 use types::FetchContext;
 use types::HgId;
@@ -41,7 +44,7 @@ pub(crate) fn num_workers() -> usize {
 fn tree_entry_to_links(
     parent_path: &types::RepoPath,
     entry: Arc<dyn TreeEntry>,
-    denied_hgids: &HashMap<HgId, String>,
+    denied_hgids: &HashMap<HgId, PermissionDenial>,
 ) -> Result<BTreeMap<PathComponentBuf, Link>> {
     let mut links = BTreeMap::new();
     for item in entry.iter_owned()? {
@@ -49,13 +52,14 @@ fn tree_entry_to_links(
         let link = match flag {
             store::Flag::File(file_type) => Link::leaf(FileMetadata::new(hgid, file_type)),
             store::Flag::Directory => {
-                if let Some(request_acl) = denied_hgids.get(&hgid) {
+                if let Some(denial) = denied_hgids.get(&hgid) {
                     let mut path = parent_path.to_owned();
                     path.push(component.as_path_component());
                     Link::durable_permission_denied(types::errors::PermissionDenied {
                         path,
                         hgid,
-                        request_acl: request_acl.clone(),
+                        request_acl: denial.request_acl.clone(),
+                        denial_message: denial.denial_message.clone(),
                     })
                 } else {
                     Link::durable(hgid)
@@ -71,6 +75,7 @@ pub(crate) struct PrefetchTree<'a> {
     pub path: &'a RepoPath,
     pub entry: &'a Arc<DurableEntry>,
     pub subtree_matches_everything: bool,
+    pub matcher_index: usize,
 }
 
 #[derive(Clone)]
@@ -78,6 +83,7 @@ struct PrefetchWork {
     path: RepoPathBuf,
     entry: Arc<DurableEntry>,
     subtree_matches_everything: bool,
+    matcher_index: usize,
 }
 
 impl PrefetchWork {
@@ -86,6 +92,7 @@ impl PrefetchWork {
             path: self.path.as_repo_path(),
             entry: &self.entry,
             subtree_matches_everything: self.subtree_matches_everything,
+            matcher_index: self.matcher_index,
         }
     }
 }
@@ -96,6 +103,7 @@ impl<'a> From<PrefetchTree<'a>> for PrefetchWork {
             path: entry.path.to_owned(),
             entry: Arc::clone(entry.entry),
             subtree_matches_everything: entry.subtree_matches_everything,
+            matcher_index: entry.matcher_index,
         }
     }
 }
@@ -104,19 +112,19 @@ fn build_links(
     parent_path: &types::RepoPath,
     tree_entry: Arc<dyn TreeEntry>,
     entries: &[PrefetchTree<'_>],
-    matcher: &dyn Matcher,
+    matchers: &[DynMatcher],
 ) -> Result<MaybeLinks> {
     let mut denied_hgids = HashMap::new();
-    match filter_acl_children(tree_entry.as_ref(), entries, matcher)
+    match filter_acl_children(tree_entry.as_ref(), entries, matchers)
         .and_then(|children_with_acl| tree_entry.filter_permission_denied(children_with_acl))
     {
         Ok(iter) => {
             for item in iter {
                 match item {
-                    Ok((_component, hgid, reason)) => {
-                        tracing::debug!(%hgid, reason, "marking child tree as permission denied");
+                    Ok((_component, hgid, denial)) => {
+                        tracing::debug!(%hgid, acl = %denial.request_acl, "marking child tree as permission denied");
                         acl_metrics::ACL_AVOIDED.increment();
-                        denied_hgids.insert(hgid, reason);
+                        denied_hgids.insert(hgid, denial);
                     }
                     Err(err) => {
                         tracing::debug!(?err, "error reading permission_denied_children");
@@ -145,7 +153,7 @@ enum LocalPrefetch {
 pub(crate) fn prefetch_trees<'a>(
     store: &InnerStore,
     entries: impl IntoIterator<Item = PrefetchTree<'a>>,
-    matcher: &dyn Matcher,
+    matchers: &[DynMatcher],
 ) -> Result<()> {
     let entries = entries
         .into_iter()
@@ -185,7 +193,7 @@ pub(crate) fn prefetch_trees<'a>(
             LocalPrefetch::Hit { work, tree_entry } => {
                 let prefetch = work.as_prefetch_tree();
                 let links =
-                    build_links(work.path.as_repo_path(), tree_entry, &[prefetch], matcher)?;
+                    build_links(work.path.as_repo_path(), tree_entry, &[prefetch], matchers)?;
                 work.entry.links.get_or_init(|| links);
             }
             LocalPrefetch::Miss(work) => {
@@ -212,14 +220,15 @@ pub(crate) fn prefetch_trees<'a>(
                     };
                     let prefetch = work.as_prefetch_tree();
                     let links =
-                        build_links(work.path.as_repo_path(), tree_entry, &[prefetch], matcher)?;
+                        build_links(work.path.as_repo_path(), tree_entry, &[prefetch], matchers)?;
                     work.entry.links.get_or_init(|| links);
                 }
                 Err(err) => {
-                    let (hgid, request_acl) = match find_permission_denied(&err) {
-                        Some(permission_denied) => permission_denied,
+                    let denied = match find_permission_denied(&err) {
+                        Some(denied) => denied,
                         None => return Err(err),
                     };
+                    let hgid = denied.tree_id;
 
                     let work = match remote_work_by_hgid
                         .get_mut(&hgid)
@@ -239,7 +248,8 @@ pub(crate) fn prefetch_trees<'a>(
                     let perm_err = types::errors::PermissionDenied {
                         path: work.path,
                         hgid,
-                        request_acl: request_acl.unwrap_or_default(),
+                        request_acl: denied.request_acl,
+                        denial_message: denied.denial_message,
                     };
                     work.entry
                         .links
@@ -254,7 +264,7 @@ pub(crate) fn prefetch_trees<'a>(
 fn filter_acl_children(
     tree_entry: &dyn TreeEntry,
     entries: &[PrefetchTree<'_>],
-    matcher: &dyn Matcher,
+    matchers: &[DynMatcher],
 ) -> Result<Vec<(PathComponentBuf, HgId)>> {
     let children_with_acls = tree_entry.children_with_acls()?;
     let mut should_check = vec![false; children_with_acls.len()];
@@ -269,6 +279,9 @@ fn filter_acl_children(
             break;
         }
 
+        let matcher = matchers
+            .get(entry.matcher_index)
+            .ok_or_else(|| anyhow!("missing matcher {} for tree prefetch", entry.matcher_index))?;
         let mut child_path = None;
         for (should_check, (component, _hgid)) in
             should_check.iter_mut().zip(children_with_acls.iter())

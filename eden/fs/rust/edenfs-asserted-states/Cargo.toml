@@ -12,13 +12,13 @@ anyhow = "1.0.104"
 edenfs-asserted-states-client = { version = "0.1.0", path = "../edenfs-asserted-states-client" }
 edenfs-client = { version = "0.1.0", path = "../../cli_rs/edenfs-client" }
 edenfs-error = { version = "0.1.0", path = "../../cli_rs/edenfs-error" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hex = { version = "0.4.3", features = ["alloc"] }
 itertools = "0.15.0"
 sapling-spawn-ext = { version = "0.1.0", path = "../../../scm/lib/spawn-ext" }
 sapling-util = { version = "0.1.0", path = "../../../scm/lib/util" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-whoami = "1.5"
+whoami = "2.1.3"

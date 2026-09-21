@@ -4,6 +4,7 @@
 
 
   $ enable amend
+  $ setconfig commit.modify-obsolete-mode=ignore
 
   $ . "$TESTDIR/library.sh"
   $ . "$TESTDIR/infinitepush/library.sh"

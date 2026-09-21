@@ -87,6 +87,7 @@ with hgdemandimport.deactivated():
         debugconflictcontext,
         debugdirs,
         debugdryup,
+        debugmergetext,
         debugmetalog,
         debugmutation,
         debugrebuildchangelog,
@@ -99,6 +100,7 @@ with hgdemandimport.deactivated():
         eden,
         fs,
         isl,
+        lint,
         subtree,
         uncommit,
     )
@@ -1770,6 +1772,15 @@ def commit(ui, repo, *pats, **opts):
 
 
 def _docommit(ui, repo, *pats, **opts):
+    subtree_copy_state = subtreeutil.read_subtree_copy_state(repo)
+    if subtree_copy_state and (
+        pats or opts.get("include") or opts.get("exclude") or opts.get("interactive")
+    ):
+        raise error.Abort(
+            _("cannot partially commit pending subtree copy changes"),
+            hint=_("run '@prog@ commit' to commit the subtree copy changes"),
+        )
+
     if opts.get(r"interactive"):
         opts.pop(r"interactive")
         ret = cmdutil.dorecord(
@@ -1779,11 +1790,13 @@ def _docommit(ui, repo, *pats, **opts):
         # commit(), 1 if nothing changed or None on success.
         return 1 if ret == 0 else ret
 
-    cmdutil.checkunfinished(repo, op="commit")
+    cmdutil.checkunfinished(repo, op="amend" if opts.get("amend") else "commit")
 
     extra = {}
+    predecessor = None
     if opts.get("amend"):
         old = repo["."]
+        predecessor = old
         rewriteutil.precheck(repo, [old.rev()], "amend")
 
         # Currently histedit gets confused if an amend happens while histedit
@@ -1808,11 +1821,27 @@ def _docommit(ui, repo, *pats, **opts):
         def commitfunc(ui, repo, message, match, opts):
             ms = mergemod.mergestate.read(repo)
             subtree_merges = ms.subtree_merges
-            extra.update(subtreeutil.gen_merge_info(repo, subtree_merges))
-            summaryfooter = subtreeutil.gen_merge_commit_msg(subtree_merges)
+            if subtree_copy_state and subtree_merges:
+                raise error.Abort(
+                    _("unexpected simultaneous subtree copy and merge state"),
+                    hint=_(
+                        "use '@prog@ goto . --clean' to recover; "
+                        "this will destroy uncommitted changes"
+                    ),
+                )
+            summaryfooter = ""
             if subtree_merges:
+                extra.update(subtreeutil.gen_merge_info(repo, subtree_merges))
+                summaryfooter = subtreeutil.gen_merge_commit_msg(subtree_merges)
                 parents = repo.working_parent_nodes()
                 repo.setparents(parents[0])
+            elif subtree_copy_state:
+                extra.update(
+                    subtreeutil.subtree_copy_state_to_extra(repo, subtree_copy_state)
+                )
+                summaryfooter = subtreeutil.gen_copy_commit_msg_from_subtree_copy_state(
+                    repo, subtree_copy_state
+                )
             # Block merge commits unless explicitly allowed. If repo state is not
             # maintained for commands like rebase, commit can end up creating a
             # merge commit, which is incorrect and has performance implications.
@@ -1840,6 +1869,8 @@ def _docommit(ui, repo, *pats, **opts):
             )
 
         node = cmdutil.commit(ui, repo, commitfunc, pats, opts)
+        if subtree_copy_state:
+            subtreeutil.clear_subtree_copy_state(repo)
 
         if not node:
             stat = cmdutil.postcommitstatus(repo, pats, opts)
@@ -1852,7 +1883,7 @@ def _docommit(ui, repo, *pats, **opts):
                 ui.status(_("nothing changed\n"))
             return 1
 
-    cmdutil.commitstatus(repo, node, opts=opts)
+    cmdutil.commitstatus(repo, node, opts=opts, predecessor=predecessor)
 
 
 @command(
@@ -2816,9 +2847,11 @@ def _dograft(ui, to_repo, *revs, from_repo=None, **opts):
 
         # commit
         editor = cmdutil.getcommiteditor(editform="graft", **opts)
-        message, _is_from_user = _makegraftmessage(
+        message, is_from_user = _makegraftmessage(
             to_repo, ctx, opts, from_paths, to_paths, from_repo
         )
+        if not is_from_user and to_repo[None].dirty():
+            message = rewriteutil.copycommitmessage(to_repo, message, "graft", ctx)
         node = to_repo.commit(
             text=message, user=user, date=date, extra=extra, editor=editor
         )
@@ -2871,52 +2904,6 @@ def _makegraftmessage(to_repo, ctx, opts, from_paths, to_paths, from_repo):
             message.append("(grafted from %s)" % ctx.hex())
     message = "\n".join(message)
     return cmdutil.add_summary_footer(ctx.repo().ui, description, message), is_from_user
-
-
-@command(
-    "grep|gre",
-    [
-        ("A", "after-context", "", "print NUM lines of trailing context", "NUM"),
-        ("B", "before-context", "", "print NUM lines of leading context", "NUM"),
-        ("C", "context", "", "print NUM lines of output context", "NUM"),
-        ("i", "ignore-case", None, "ignore case when matching"),
-        ("l", "files-with-matches", None, "print only filenames that match"),
-        ("n", "line-number", None, "print matching line numbers"),
-        ("V", "invert-match", None, "select non-matching lines"),
-        ("w", "word-regexp", None, "match whole words only"),
-        ("E", "extended-regexp", None, "use POSIX extended regexps"),
-        ("F", "fixed-strings", None, "interpret pattern as fixed string"),
-        ("P", "perl-regexp", None, "use Perl-compatible regexps"),
-        (
-            "I",
-            "include",
-            [],
-            _("include files matching the given patterns"),
-            _("PATTERN"),
-        ),
-        (
-            "X",
-            "exclude",
-            [],
-            _("exclude files matching the given patterns"),
-            _("PATTERN"),
-        ),
-    ],
-    inferrepo=True,
-)
-def grep(ui, repo, pattern, *pats, **opts):
-    # Copy match specific options
-    match_opts = {}
-    for k in ("include", "exclude"):
-        if k in opts:
-            match_opts[k] = opts.get(k)
-
-    # Search everything in the current directory, or using the specified
-    # patterns instead.
-    wctx = repo[None]
-    matcher = scmutil.match(wctx, pats or ["."], match_opts)
-
-    return cmdutil.grep(ui, repo, table, matcher, pattern, **opts)
 
 
 @command(
@@ -4080,6 +4067,8 @@ def log(ui, repo, *pats, **opts):
     if opts.get("follow") and opts.get("rev"):
         opts["rev"] = [revsetlang.formatspec("reverse(::%lr)", opts.get("rev"))]
         del opts["follow"]
+
+    scmutil.maybe_show_path_typo_hint(ui, repo, pats, rev=opts.get("rev"))
 
     if opts.get("graph"):
         if linerange:
@@ -6244,6 +6233,9 @@ def update(
             ),
         )
 
+    if not opts.get("continue"):
+        bookmarks.checkagentpreferredtarget(repo, rev)
+
     # Suggest `hg prev` as an alternative to 'hg update .^'.
     # internal config: ui.suggesthgprev
     if node == ".^" and ui.configbool("ui", "suggesthgprev", False):
@@ -6262,8 +6254,8 @@ def update(
         else:
             abort_or_reset_mergestate()
 
-        # Either we consumed this with "--continue" or we ignoring it with a
-        # different destination.
+        # Either we consumed this with "--continue" or are replacing it with
+        # a different destination.
         repo.localvfs.tryunlink("updatestate")
 
         cmdutil.checkunfinished(repo, op="goto_clean" if clean else None)
@@ -6276,6 +6268,8 @@ def update(
         else:
             brev = rev
         rev = scmutil.revsingle(repo, rev, rev).rev()
+        if not opts.get("continue"):
+            rewriteutil.gotocheck(repo, [repo[rev]])
 
         repo.ui.setconfig("ui", "forcemerge", tool, "update")
 
@@ -6287,6 +6281,15 @@ def update(
         result = hg.updatetotally(
             ui, repo, rev, brev, clean=clean, updatecheck=updatecheck
         )
+
+        if (
+            ui.configbool("checkout", "show-destination", True)
+            and not ui.plain()
+            and not ui.quiet
+        ):
+            destctx = repo[rev]
+            title = next(iter(destctx.description().splitlines()), "")
+            ui.write(_('checked out %s "%s"\n') % (short(destctx.node()), title))
 
         if merge:
             mergemod.try_conclude_merge_state(repo)

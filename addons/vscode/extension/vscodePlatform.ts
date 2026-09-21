@@ -23,7 +23,7 @@ import type {CodeReviewIssue} from 'isl/src/firstPassCodeReview/types';
 import {arraysEqual} from 'isl/src/utils';
 import * as pathModule from 'node:path';
 import * as vscode from 'vscode';
-import {executeVSCodeCommand} from './commands';
+import {executeVSCodeCommand, openFolderInWindowOrTile} from './commands';
 import {PERSISTED_STORAGE_KEY_PREFIX, shouldOpenBeside} from './config';
 import {encodeSaplingDiffUri} from './DiffContentProvider';
 import {t} from './i18n';
@@ -51,6 +51,7 @@ function diagnosticSeverity(severity: vscode.DiagnosticSeverity): DiagnosticSeve
 export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServerPlatform => ({
   platformName: 'vscode',
   sessionId: vscode.env.sessionId,
+  isBasecamp: Internal.isBasecamp?.() ?? false,
   panelOrView: undefined,
   async handleMessageFromClient(
     this: VSCodeServerPlatform,
@@ -120,6 +121,24 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           });
           break;
         }
+        case 'platform/openPreview': {
+          if (repo == null) {
+            break;
+          }
+          const path: AbsolutePath = pathModule.join(repo.info.repoRoot, message.path);
+          const uri = vscode.Uri.file(path);
+          // Open markdown preview. Use side-by-side when ISL is configured to
+          // open files beside the current editor, otherwise open in place.
+          // Fall back to opening the raw file if the markdown preview command
+          // is unavailable (e.g. markdown extension disabled).
+          const command = shouldOpenBeside()
+            ? 'markdown.showPreviewToSide'
+            : 'markdown.showPreview';
+          vscode.commands
+            .executeCommand(command, uri)
+            .then(undefined, () => openFileInRepo(repo, message.path, undefined, undefined));
+          break;
+        }
         case 'platform/revealInFileExplorer': {
           if (repo != null) {
             const path: AbsolutePath = pathModule.join(repo.info.repoRoot, message.path);
@@ -141,8 +160,7 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           break;
         }
         case 'platform/openInNewWindow': {
-          const folderUri = vscode.Uri.file(message.path);
-          vscode.commands.executeCommand('vscode.openFolder', folderUri, {forceNewWindow: true});
+          await openFolderInWindowOrTile(message.path, true);
           break;
         }
         case 'platform/openFolder': {
@@ -336,6 +354,10 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           } else {
             vscode.commands.executeCommand(message.command, ...message.args);
           }
+          break;
+        }
+        case 'platform/investigateFailure': {
+          await Internal.investigateFailure?.(ctx, message.failure);
           break;
         }
         case 'platform/resolveAllCommentsWithAI': {

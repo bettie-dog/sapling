@@ -193,6 +193,7 @@ pub mod fold_commits;
 pub mod git;
 pub mod land_stack;
 pub mod move_bookmark;
+pub mod rebase_stack;
 pub mod update_submodule_expansion;
 
 pub use git::upload_non_blob_git_object;
@@ -205,14 +206,6 @@ define_stats! {
     prefix = "mononoke.api";
     staleness: dynamic_singleton_counter(
         "staleness.secs.{}.{}",
-        (repoid: ::mononoke_types::RepositoryId, bookmark: String)
-    ),
-    missing_from_cache: dynamic_singleton_counter(
-        "missing_from_cache.{}.{}",
-        (repoid: ::mononoke_types::RepositoryId, bookmark: String)
-    ),
-    missing_from_repo: dynamic_singleton_counter(
-        "missing_from_repo.{}.{}",
         (repoid: ::mononoke_types::RepositoryId, bookmark: String)
     ),
 }
@@ -554,21 +547,11 @@ pub async fn report_monitoring_stats(
     Ok(())
 }
 
-fn report_bookmark_missing_from_cache(
-    ctx: &CoreContext,
-    repo: &impl RepoIdentityRef,
-    bookmark: &BookmarkKey,
-) {
+fn report_bookmark_missing_from_cache(repo: &impl RepoIdentityRef, bookmark: &BookmarkKey) {
     error!(
         "Monitored bookmark does not exist in the cache: {}, repo: {}",
         bookmark,
         repo.repo_identity().name()
-    );
-
-    STATS::missing_from_cache.set_value(
-        ctx.fb,
-        1,
-        (repo.repo_identity().id(), bookmark.to_string()),
     );
 
     #[cfg(fbcode_build)]
@@ -582,20 +565,10 @@ fn report_bookmark_missing_from_cache(
     });
 }
 
-fn report_bookmark_missing_from_repo(
-    ctx: &CoreContext,
-    repo: &impl RepoIdentityRef,
-    bookmark: &BookmarkKey,
-) {
+fn report_bookmark_missing_from_repo(repo: &impl RepoIdentityRef, bookmark: &BookmarkKey) {
     error!(
         "Monitored bookmark does not exist in the repo: {}",
         bookmark
-    );
-
-    STATS::missing_from_repo.set_value(
-        ctx.fb,
-        1,
-        (repo.repo_identity().id(), bookmark.to_string()),
     );
 
     #[cfg(fbcode_build)]
@@ -653,11 +626,11 @@ async fn report_bookmark_age_difference(
         .await?;
 
     if maybe_bcs_id_from_blobrepo.is_none() {
-        report_bookmark_missing_from_repo(ctx, repo, bookmark);
+        report_bookmark_missing_from_repo(repo, bookmark);
     }
 
     if maybe_bcs_id_from_service.is_none() {
-        report_bookmark_missing_from_cache(ctx, repo, bookmark);
+        report_bookmark_missing_from_cache(repo, bookmark);
     }
 
     if let (Some(service_bcs_id), Some(blobrepo_bcs_id)) =

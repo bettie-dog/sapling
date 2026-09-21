@@ -13,11 +13,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use cas_client::CasFetchManager;
 use commits_trait::DagCommits;
 use configloader::Config;
 use configloader::config::ConfigSet;
 use configloader::hg::PinnedConfig;
 use configloader::hg::RepoInfo;
+use configmodel::ConfigExt;
 use context::CoreContext;
 use eagerepo::EagerRepoStore;
 use edenapi::SaplingRemoteApi;
@@ -28,6 +30,7 @@ use manifest_tree::TreeManifest;
 use manifest_tree::TreeResolver;
 use metalog::MetaLog;
 use metalog::RefName;
+use mutationstore::MutationStore;
 use parking_lot::RwLock;
 use pathmatcher::DynMatcher;
 use repo_minimal_info::RepoMinimalInfo;
@@ -71,12 +74,14 @@ pub struct Repo {
     config: Arc<dyn Config>,
     repo_name: Option<String>,
     metalog: OnceLock<Arc<RwLock<MetaLog>>>,
+    mutation_store: OnceLock<Option<Arc<MutationStore>>>,
     eden_api: OnceLock<(LazyCapabilities, Arc<dyn SaplingRemoteApi>)>,
     dag_commits: OnceLock<Arc<RwLock<Box<dyn DagCommits + Send + 'static>>>>,
     file_store: OnceLock<Arc<dyn FileStore>>,
     file_scm_store: OnceLock<Arc<scmstore::FileStore>>,
     tree_store: OnceLock<Arc<dyn TreeStore>>,
     tree_scm_store: OnceLock<Arc<scmstore::TreeStore>>,
+    cas_manager: OnceLock<Option<Arc<CasFetchManager>>>,
     #[cfg(feature = "wdir")]
     working_copy: OnceLock<Arc<RwLock<WorkingCopy>>>,
     eager_store: Option<EagerRepoStore>,
@@ -174,7 +179,7 @@ impl Repo {
         let locker = Arc::new(RepoLocker::new(&config, info.store_path.clone())?);
 
         #[cfg(feature = "wdir")]
-        let p1 = workingcopy::fast_path_wdir_parents(&info.path, info.ident)
+        let p1 = workingcopy::fast_path_wdir_parents_with_config(&info.path, info.ident, &config)
             .ok()
             .map(|parents| parents.p1().copied().unwrap_or(NULL_ID));
 
@@ -186,12 +191,14 @@ impl Repo {
             config: Arc::new(config),
             repo_name,
             metalog: Default::default(),
+            mutation_store: Default::default(),
             eden_api: Default::default(),
             dag_commits: Default::default(),
             file_store: Default::default(),
             file_scm_store: Default::default(),
             tree_store: Default::default(),
             tree_scm_store: Default::default(),
+            cas_manager: Default::default(),
             #[cfg(feature = "wdir")]
             working_copy: Default::default(),
             eager_store: None,
@@ -286,6 +293,16 @@ impl Repo {
         self.store_path.join("metalog")
     }
 
+    #[cached_field]
+    pub fn mutation_store(&self) -> Result<Option<Arc<MutationStore>>> {
+        if !self.config.get_or("mutation", "enabled", || false)? {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(MutationStore::open(
+            self.store_path.join("mutation"),
+        )?)))
+    }
+
     /// Constructs the SaplingRemoteAPI client. Errors out if the SaplingRemoteAPI should not be
     /// constructed.
     ///
@@ -368,7 +385,7 @@ impl Repo {
             return Ok(store);
         }
 
-        let fs = build_scm_file_store(self)?;
+        let fs = build_scm_file_store(self, self.cas_manager())?;
         let _ = self.file_scm_store.set(fs.clone());
 
         let fs = Arc::new(ArcFileStore(fs));
@@ -400,11 +417,28 @@ impl Repo {
             self,
             self.file_scm_store(),
             self.permission_denied_paths.clone(),
+            self.cas_manager(),
         )?;
         let _ = self.tree_scm_store.set(ts.clone());
         let _ = self.tree_store.set(ts.clone());
 
         Ok(ts)
+    }
+
+    fn cas_manager(&self) -> Option<Arc<CasFetchManager>> {
+        self.cas_manager
+            .get_or_init(|| match cas_client::new(self.config.clone()) {
+                Ok(cas_manager) => cas_manager,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cas_client",
+                        ?error,
+                        "failed to create CAS client; CAS fetching is disabled"
+                    );
+                    None
+                }
+            })
+            .clone()
     }
 
     pub fn set_permission_denied_paths(&mut self, paths: context::PermissionDeniedPaths) {

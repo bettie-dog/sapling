@@ -185,9 +185,13 @@ def mergepredicate(repo):
 
 
 STATES = (
-    # (state, rust state object with 'is_active()' and 'hint()')
+    # (state, rust state object with 'is_active()' and 'status_msg()')
     # OR
     # (state, predicate to detect states, helpful message function)
+    (
+        "subtree copy",
+        wc.commandstate.get_state("subtree copy", "subtree-copy-state"),
+    ),
     ("histedit", wc.commandstate.get_state("histedit", "histedit-state")),
     ("bisect", fileexistspredicate("bisect.state"), bisectmsg),
     ("graft", wc.commandstate.get_state("graft", "graftstate")),
@@ -282,7 +286,7 @@ def getrepostate(repo):
             if statename in skip:
                 continue
             if state.is_active(repo.path):
-                msgfn = lambda _repo, ui: ui.warn(prefixlines(state.hint()))
+                msgfn = lambda _repo, ui: ui.warn(prefixlines(state.status_msg()))
                 return (statename, msgfn)
         elif len(compositestate) == 3:
             # python case

@@ -49,9 +49,11 @@ use import_tools::GitimportTarget;
 use import_tools::LfsServerUrlFormat;
 use import_tools::ReuploadCommits;
 use import_tools::bookmark::BookmarkOperationErrorReporting;
+use import_tools::bookmark::set_bookmarks;
 use import_tools::create_changeset_for_annotated_tag;
 use import_tools::git_reader::GitReader;
 use import_tools::import_tree_as_single_bonsai_changeset;
+use import_tools::is_internal_only_ref;
 use import_tools::set_bookmark;
 use import_tools::upload_git_object;
 use import_tools::upload_git_tag;
@@ -87,10 +89,14 @@ use tracing::warn;
 use crate::repo::Repo;
 
 pub const HEAD_SYMREF: &str = "HEAD";
-const LFS_SIMULTANEOUS_CONNECTION_LIMIT: usize = 20;
 // Retry policy for the one-shot bulk bookmark listing.
 const BOOKMARK_LIST_RETRY_DELAY: Duration = Duration::from_secs(1);
 const BOOKMARK_LIST_RETRY_ATTEMPTS: usize = 4;
+// Cleanup deletions per bookmark transaction. One transaction per bookmark
+// makes a large backlog take hours (a full commit round-trip each); one
+// transaction for everything makes a single stale CAS fail the whole batch
+// and unboundedly widens the transaction.
+const CLEANUP_DELETE_BATCH_SIZE: usize = 100;
 
 // Refactor this a bit. Use a thread pool for git operations. Pass that wherever we use store repo.
 // Transform the walk into a stream of commit + file changes.
@@ -281,6 +287,11 @@ struct GitimportArgs {
     /// before deciding that the file is missing.
     #[clap(long, default_value_t = 5)]
     lfs_import_max_attempts: u32,
+    /// Maximum number of LFS objects downloaded from the LFS server at the
+    /// same time. Lower it for repos with many multi-hundred-MB objects so
+    /// each transfer finishes before the forward proxy drops it.
+    #[clap(long, default_value_t = 20)]
+    lfs_concurrency: usize,
     /// If any bookmarks were present in Mononoke but are not present in Git, delete them in
     /// Mononoke.
     /// This is necessary for a catch-up import situation if a Git branch was deleted between both
@@ -431,7 +442,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     url_format,
                     args.allow_dangling_lfs_pointers,
                     args.lfs_import_max_attempts,
-                    Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
+                    Some(args.lfs_concurrency),
                     args.tls_args,
                 )?
             }
@@ -452,7 +463,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     https_proxy,
                     args.allow_dangling_lfs_pointers,
                     args.lfs_import_max_attempts,
-                    Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
+                    Some(args.lfs_concurrency),
                 )?
             }
             (None, None) => GitImportLfs::new_internal(
@@ -558,6 +569,11 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
             .context("read_git_refs failed")?;
         let git_ref_mapping = refs
             .into_iter()
+            // Filtered here rather than via --exclude-refs because
+            // --cleanup-mononoke-bookmarks builds its keep-set from the
+            // unfiltered mapping: excluding later would strand a bookmark an
+            // earlier import created. Same shape as the heads/HEAD skip below.
+            .filter(|(git_ref, _)| !is_internal_only_ref(&git_ref.name))
             .map(|(git_ref, commit)| {
                 Ok((
                     git_ref.metadata,
@@ -769,24 +785,49 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     .filter(|ref_name| *ref_name != "heads/HEAD")
                     .map(str::to_owned)
                     .collect();
-                for (bookmark_key, old_changeset) in existing_bookmarks.iter() {
-                    if git_ref_names.contains(bookmark_key.name().as_str()) {
-                        continue;
-                    }
-                    let allow_non_fast_forward = true;
-                    let operation =
-                        BookmarkOperation::new(bookmark_key.clone(), Some(*old_changeset), None)?;
+                // Each operation is paired with its log line up front; the line
+                // is emitted only after its batch's transaction commits, so a
+                // logged deletion is always a durable one.
+                let delete_operations = existing_bookmarks
+                    .iter()
+                    .filter(|(bookmark_key, _)| {
+                        !git_ref_names.contains(bookmark_key.name().as_str())
+                    })
+                    .map(|(bookmark_key, old_changeset)| {
+                        anyhow::Ok((
+                            BookmarkOperation::new(
+                                bookmark_key.clone(),
+                                Some(*old_changeset),
+                                None,
+                            )?,
+                            format!(
+                                "Bookmark: \"{}\": {:?} (deleted)",
+                                bookmark_key.name(),
+                                old_changeset
+                            ),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                    set_bookmark(
+                let allow_non_fast_forward = true;
+                let mut remaining = delete_operations.into_iter().peekable();
+                while remaining.peek().is_some() {
+                    let (batch, batch_log_lines): (Vec<_>, Vec<_>) =
+                        remaining.by_ref().take(CLEANUP_DELETE_BATCH_SIZE).unzip();
+                    set_bookmarks(
                         &ctx,
                         &repo_context,
-                        &operation,
+                        batch,
                         pushvars.as_ref(),
                         allow_non_fast_forward,
                         BookmarkOperationErrorReporting::WithContext,
                         None,
+                        vec![],
                     )
                     .await?;
+                    for line in batch_log_lines {
+                        info!("{line}");
+                    }
                 }
             }
         };
