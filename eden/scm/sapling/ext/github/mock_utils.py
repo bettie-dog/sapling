@@ -710,14 +710,23 @@ class StackRequest(MockRequest):
     def __init__(self, key: str) -> None:
         self._key = key
         self._response: Optional[Result[JsonDict, str]] = None
+        self._responses: Optional[List[Result[JsonDict, str]]] = None
 
     def and_respond(self, response: Any) -> None:
         self._response = Ok(response)
+
+    def and_respond_seq(self, responses: List[Any]) -> None:
+        """Responds with each value in turn; the last value repeats."""
+        self._responses = [Ok(r) for r in responses]
 
     def and_error(self, message: str) -> None:
         self._response = Err(message)
 
     def get_response(self) -> Result[JsonDict, str]:
+        if self._responses is not None:
+            if len(self._responses) > 1:
+                return self._responses.pop(0)
+            return self._responses[0]
         if self._response is None:
             raise MockResponseNotSet(self._key)
         return self._response

@@ -10,8 +10,9 @@ lives here: the API wrappers, stack discovery, and the reconciliation that
 keeps the native stack mirroring the local stack of pull requests.
 """
 
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from sapling import error
 from sapling.i18n import _
@@ -33,6 +34,22 @@ _Params = Union[str, int, bool, List[int], List[str]]
 STACKS_API_VERSION = "2026-03-10"
 
 _STACKS_HEADERS = {"X-GitHub-Api-Version": STACKS_API_VERSION}
+
+GRAPHQL_GET_PR_OWNERSHIP = """
+query GetPrOwnership($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      author {
+        login
+      }
+      headRefName
+    }
+  }
+}
+"""
+
+# Head branches that `sl pr submit` itself creates.
+_SAPLING_PR_BRANCH = re.compile(r"^pr\d+$")
 
 
 @dataclass
@@ -191,82 +208,120 @@ async def find_native_stack(
     )
 
 
-async def prepare_native_stack_bases(
-    ui,
-    partitions: List[List["CommitData"]],
-    trunk: str,
-    repository: Repository,
-) -> None:
-    """Retargets the base branch of existing open PRs whose position in the
-    local stack changed, dissolving the native GitHub stack first if the PRs
-    are part of one (base branches are locked while stacked). The stack is
-    re-linked after the push by sync_native_stack().
+def _classify_stack_divergence(
+    desired: List[int], stack_open: List[int], has_new_prs: bool
+) -> Tuple[str, List[int]]:
+    """Compares the open members of the native stack against the open pull
+    requests of the submit scope (both bottom to top).
+
+    Returns (kind, off_path) where kind is one of:
+    - "match": identical.
+    - "append": the stack is a prefix of the scope (new members go on top).
+    - "mid_stack": the scope is a prefix of the stack and nothing new is
+      being created above it -- a submit from a mid-stack commit.
+    - "rebuild": anything else -- the order of open members changed, or the
+      stack has open members that are not part of the submit scope (a
+      dropped/folded commit, or a different line of a forked tree).
+      off_path lists those members.
     """
-    mismatched = []
-    for index, partition in enumerate(partitions):
-        pr = partition[0].pr
-        if not pr or pr.state != PullRequestState.OPEN:
-            continue
-        base = trunk
-        if index < len(partitions) - 1:
-            base = none_throws(partitions[index + 1][0].head_branch_name)
-        if pr.base_branch_name != base:
-            mismatched.append((pr, base))
-    if not mismatched:
+    if stack_open == desired:
+        return ("match", [])
+    if stack_open == desired[: len(stack_open)]:
+        return ("append", [])
+    if desired == stack_open[: len(desired)]:
+        if has_new_prs:
+            return ("rebuild", stack_open[len(desired) :])
+        return ("mid_stack", [])
+    return ("rebuild", [n for n in stack_open if n not in desired])
+
+
+async def _get_pr_ownership(
+    hostname: str, owner: str, name: str, number: int
+) -> Result[Tuple[Optional[str], Optional[str]], str]:
+    """Returns (author_login, head_ref_name) for the pull request."""
+    params: Dict[str, _Params] = {
+        "query": GRAPHQL_GET_PR_OWNERSHIP,
+        "owner": owner,
+        "name": name,
+        "number": number,
+    }
+    result = await gh_cli.make_request(params, hostname=hostname)
+    if result.is_err():
+        return Err(result.unwrap_err())
+    pr = result.unwrap()["data"]["repository"]["pullRequest"]
+    author = (pr.get("author") or {}).get("login")
+    return Ok((author, pr.get("headRefName")))
+
+
+async def _abort_if_not_ours(
+    off_path: List[int], repository: Repository, stack_number: int
+) -> None:
+    """Aborts unless every off-path open member of the stack is a pull
+    request this checkout could have created: authored by the authenticated
+    user, with a sapling-made pr<N> head branch.
+    """
+    if not off_path:
         return
 
-    stack_result = await find_native_stack(partitions, repository)
-    if stack_result.is_err():
-        ui.status_err(
-            _("warning: could not query native stack state: %s\n")
-            % stack_result.unwrap_err()
+    def query_failed(err: str) -> error.Abort:
+        return error.Abort(
+            _("cannot verify ownership of pull requests in native stack #%d: %s")
+            % (stack_number, err)
         )
-    else:
-        stack = stack_result.unwrap()
-        if stack and stack.is_open:
-            local_numbers = [
-                p[0].pr.number
-                for p in partitions
-                if p[0].pr and p[0].pr.state == PullRequestState.OPEN
-            ]
-            foreign = [
-                n for n in stack.open_pr_numbers() if n not in local_numbers
-            ]
-            if foreign:
-                # Same ownership rule as sync_native_stack: never dissolve a
-                # stack containing pull requests that are not ours. But the
-                # bases of our PRs need to change and are locked by the
-                # stack, so pushing now would risk GitHub auto-closing PRs
-                # as merged (see #1275) -- refuse to continue.
-                raise error.Abort(
-                    _(
-                        "cannot update pull request bases: stack #%d contains "
-                        "pull requests not in your local stack (%s); resolve "
-                        "this on GitHub (e.g. with 'gh stack unstack') and "
-                        "re-run"
-                    )
-                    % (stack.number, ", ".join(f"#{n}" for n in foreign))
-                )
-            unstack_result = await unstack_pull_requests(
-                repository.hostname,
-                repository.owner,
-                repository.name,
-                stack.number,
-                stack.open_pr_numbers(),
-            )
-            if unstack_result.is_err():
-                # Pushing reordered branches while bases are locked risks
-                # GitHub auto-closing PRs as "merged" (see #1275), so refuse
-                # to continue.
-                raise error.Abort(
-                    _("cannot update pull request bases while they are in stack #%d: %s")
-                    % (stack.number, unstack_result.unwrap_err())
-                )
-            ui.status_err(
-                _("temporarily unstacked #%d to update pull request bases\n")
-                % stack.number
-            )
 
+    username_result = await gh_submit.get_username(repository.hostname)
+    if username_result.is_err():
+        raise query_failed(username_result.unwrap_err())
+    username = username_result.unwrap()
+
+    foreign = []
+    for number in off_path:
+        ownership = await _get_pr_ownership(
+            repository.hostname, repository.owner, repository.name, number
+        )
+        if ownership.is_err():
+            raise query_failed(ownership.unwrap_err())
+        author, head = ownership.unwrap()
+        if author != username or not head or not _SAPLING_PR_BRANCH.match(head):
+            foreign.append(number)
+    if foreign:
+        raise error.Abort(
+            _(
+                "cannot rebuild native stack #%d: it contains pull requests "
+                "not created from this checkout (%s)"
+            )
+            % (stack_number, ", ".join(f"#{n}" for n in foreign)),
+            hint=_("resolve this on GitHub (e.g. with 'gh stack unstack') and re-run"),
+        )
+
+
+async def _unstack_all_open(
+    ui, stack: PullRequestStack, repository: Repository, rebuild: bool
+) -> None:
+    unstack_result = await unstack_pull_requests(
+        repository.hostname,
+        repository.owner,
+        repository.name,
+        stack.number,
+        stack.open_pr_numbers(),
+    )
+    if unstack_result.is_err():
+        # Pushing reordered branches while bases are locked risks GitHub
+        # auto-closing PRs as "merged" (see #1275), so refuse to continue.
+        raise error.Abort(
+            _("cannot update pull request bases while they are in stack #%d: %s")
+            % (stack.number, unstack_result.unwrap_err())
+        )
+    if rebuild:
+        ui.status_err(_("dissolved native stack #%d for rebuild\n") % stack.number)
+    else:
+        ui.status_err(
+            _("temporarily unstacked #%d to update pull request bases\n")
+            % stack.number
+        )
+
+
+async def _retarget_bases(ui, mismatched, repository: Repository) -> None:
     for pr, base in mismatched:
         result = await gh_submit.update_pull_request(
             repository.hostname, pr.node_id, pr.title, pr.body, base
@@ -278,6 +333,112 @@ async def prepare_native_stack_bases(
             )
         else:
             ui.status_err(_("updated base for %s\n") % pr.url)
+
+
+async def prepare_native_stack_bases(
+    ui,
+    partitions: List[List["CommitData"]],
+    trunk: str,
+    repository: Repository,
+    *,
+    rebuild_stack: bool = False,
+    has_new_prs: bool = False,
+) -> None:
+    """Reconciles the native GitHub stack with the submit scope BEFORE
+    anything is pushed, retargeting the base branch of existing open PRs
+    whose position in the local stack changed (base branches are locked
+    while stacked, so this dissolves the stack first when needed; it is
+    re-linked after the push by sync_native_stack()).
+
+    Order-preserving changes (amends, appends, a commit inserted between two
+    members) are handled automatically. Changes that reorder open members or
+    leave open members of the stack outside the submit scope (a dropped or
+    folded commit, or a different line of a forked tree) abort unless
+    --rebuild-stack was passed: rebuilding rewrites reviewer-visible state.
+    Stacks containing pull requests not created from this checkout are never
+    modified.
+    """
+    mismatched = []
+    for index, partition in enumerate(partitions):
+        pr = partition[0].pr
+        if not pr or pr.state != PullRequestState.OPEN:
+            continue
+        base = trunk
+        if index < len(partitions) - 1:
+            base = none_throws(partitions[index + 1][0].head_branch_name)
+        if pr.base_branch_name != base:
+            mismatched.append((pr, base))
+
+    desired = [
+        p[0].pr.number
+        for p in reversed(partitions)
+        if p[0].pr and p[0].pr.state == PullRequestState.OPEN
+    ]
+    if not desired:
+        return
+
+    stack = None
+    stack_result = await find_native_stack(partitions, repository)
+    if stack_result.is_err():
+        ui.status_err(
+            _("warning: could not query native stack state: %s\n")
+            % stack_result.unwrap_err()
+        )
+    else:
+        stack = stack_result.unwrap()
+
+    if stack is None or not stack.is_open:
+        await _retarget_bases(ui, mismatched, repository)
+        return
+
+    kind, off_path = _classify_stack_divergence(
+        desired, stack.open_pr_numbers(), has_new_prs
+    )
+    if kind == "mid_stack":
+        # Members above the submit scope keep their positions; nothing to
+        # retarget (sync_native_stack prints the hint after the push).
+        return
+    if kind in ("match", "append"):
+        if not mismatched:
+            return
+        # Order-preserving base changes (e.g. a commit inserted between two
+        # stacked members): safe to dissolve silently; the stack is
+        # re-linked after the push.
+        await _unstack_all_open(ui, stack, repository, rebuild=False)
+        await _retarget_bases(ui, mismatched, repository)
+        return
+
+    # kind == "rebuild"
+    await _abort_if_not_ours(off_path, repository, stack.number)
+    if not rebuild_stack:
+        if off_path:
+            raise error.Abort(
+                _(
+                    "native stack #%d contains open pull requests that are "
+                    "not among the commits being submitted: %s"
+                )
+                % (stack.number, ", ".join(f"#{n}" for n in off_path)),
+                hint=_(
+                    "re-run with --rebuild-stack to rebuild the native stack "
+                    "on this line (they stay open but leave the stack)"
+                ),
+            )
+        raise error.Abort(
+            _(
+                "the local stack was reordered, so native stack #%d must be "
+                "dissolved and re-created (GitHub locks pull request bases "
+                "while stacked)"
+            )
+            % stack.number,
+            hint=_("re-run with --rebuild-stack to do this automatically"),
+        )
+    await _unstack_all_open(ui, stack, repository, rebuild=True)
+    if off_path:
+        ui.status_err(
+            _("%s left open and unstacked; close them on GitHub if no longer needed\n")
+            % ", ".join(f"#{n}" for n in off_path)
+        )
+    await _retarget_bases(ui, mismatched, repository)
 
 
 async def sync_native_stack(
@@ -334,6 +495,17 @@ async def sync_native_stack(
         open_members = stack.open_pr_numbers()
         if open_members == desired:
             ui.status_err(_("native stack #%d is up-to-date\n") % stack.number)
+            return
+        if len(desired) < len(open_members) and desired == open_members[: len(desired)]:
+            # Submit from a mid-stack commit: members above the submit scope
+            # keep their positions and are left untouched.
+            ui.status_err(
+                _(
+                    "native stack #%d unchanged; %d pull request(s) stacked "
+                    "above #%d were not part of this submit\n"
+                )
+                % (stack.number, len(open_members) - len(desired), desired[-1])
+            )
             return
         # Appending is only valid when the new entries chain onto the stack's
         # ACTUAL top member — GitHub validates each added pull request's base

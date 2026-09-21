@@ -39,9 +39,15 @@ def submit(ui, repo, *args, **opts) -> int:
     github_repo = check_github_repo(repo)
     is_draft = opts.get("draft")
     is_open = opts.get("open")
+    rebuild_stack = bool(opts.get("rebuild_stack"))
     return asyncio.run(
         update_commits_in_stack(
-            ui, repo, github_repo, is_draft=is_draft, is_open=is_open
+            ui,
+            repo,
+            github_repo,
+            is_draft=is_draft,
+            is_open=is_open,
+            rebuild_stack=rebuild_stack,
         )
     )
 
@@ -202,7 +208,12 @@ async def get_partitions(ui, repo, store, filter) -> List[List[CommitData]]:
 
 
 async def update_commits_in_stack(
-    ui, repo, github_repo: GitHubRepo, is_draft: bool, is_open: bool = False
+    ui,
+    repo,
+    github_repo: GitHubRepo,
+    is_draft: bool,
+    is_open: bool = False,
+    rebuild_stack: bool = False,
 ) -> int:
     parents = repo.dirstate.parents()
     if parents[0] == nullid:
@@ -299,6 +310,8 @@ async def update_commits_in_stack(
                     partitions,
                     get_pr_trunk_branch(workflow, repository),
                     repository,
+                    rebuild_stack=rebuild_stack,
+                    has_new_prs=bool(params.pull_requests_to_create),
                 )
             else:
                 # Update base branches on existing PRs before pushing.
