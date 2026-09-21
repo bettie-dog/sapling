@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from sapling import error
 from sapling.ext.github.consts import query
-from sapling.ext.github.gh_submit import PullRequestState, STACKS_API_VERSION
+from sapling.ext.github.gh_submit import PullRequestState
+from sapling.ext.github.native_stacks import STACKS_API_VERSION
 from sapling.ext.github.pull_request_body import title_and_body
 from sapling.result import Err, Ok, Result
 
