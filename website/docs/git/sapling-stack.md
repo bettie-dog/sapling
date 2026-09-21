@@ -35,7 +35,10 @@ sl config --user github.pr-workflow stack
 Notes on the `stack` workflow:
 
 - GitHub requires all branches of a stack to live in the same repository, so pull requests are created against the push remote's repository itself rather than its upstream. If your push remote is a fork, the stack lives on the fork.
-- If the stack on GitHub no longer matches your local stack (for example after reordering or removing commits), `sl pr submit` automatically dissolves and re-links it — unless the stack contains pull requests that are not part of your local stack (e.g. linked by a collaborator with `gh stack link`), in which case it is left untouched with a warning.
+- Amending commits, appending new ones, and re-linking after an earlier failure are handled automatically. Changes that would rewrite the stack's reviewer-visible shape — reordering commits, dropping or folding a commit whose pull request is still open, or submitting a different line of a forked tree — make `sl pr submit` stop before pushing anything; re-run it with `--rebuild-stack` to dissolve the stack, retarget the bases, and re-link it to match. Pull requests that fall out of the stack this way stay open (with their chained base) but leave the stack; close them on GitHub if they are no longer needed.
+- GitHub's native stacks are strictly linear and a pull request can belong to only one stack, so a forked local tree can have pull requests on every line but a native stack on only one line at a time; `--rebuild-stack` moves the stack to the line being submitted.
+- Stacks containing pull requests that were not created from your checkout (e.g. linked by a collaborator with `gh stack link`) are never modified, with or without `--rebuild-stack`; resolve those on GitHub.
+- Submitting from a mid-stack commit updates just the pull requests in scope and leaves the stack untouched, with a hint about the members above.
 - If linking the stack fails (for example, the stacks API preview is not enabled for the repository), the pull requests are still created with chained bases and a warning is printed; re-running `sl pr submit` retries the link.
 - Pull requests created with this workflow omit the "Stack created with Sapling" footer from their descriptions, since GitHub displays the stack natively.
 
