@@ -1383,7 +1383,8 @@ void TreeInode::loadChildInode(PathComponentPiece name, InodeNumber number) {
     // loadChildInode is called by InodeMap during FUSE_LOOKUP processing. Pass
     // a null fetch context because we don't need to record statistics.
     static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
-        "TreeInode::loadChildInode");
+        ObjectFetchContext::StaticCauseDetail::fromLiteral(
+            "TreeInode::loadChildInode"));
     future = startLoadingInodeNoThrow(entry, name, context, false);
   }
   registerInodeLoadComplete(future, name, number);
@@ -1415,19 +1416,22 @@ void TreeInode::inodeLoadComplete(
   {
     auto contents = lockContentsWrite();
     auto iter = contents->entries.find(childName);
-    if (iter == contents->entries.end()) {
-      // This shouldn't ever happen.
-      // The rename(), unlink(), and rmdir() code should always ensure
-      // the child inode in question is loaded before removing or renaming
-      // it.  (We probably could allow renaming/removing unloaded inodes,
-      // but the loading process would have to be significantly more
-      // complicated to deal with this, both here and in the parent lookup
-      // process in InodeMap::lookupInode().)
+    if (iter == contents->entries.end() ||
+        iter->second.getInodeNumber() != childInode->getNodeId()) {
+      // The child was removed while this load was in flight. Removing an
+      // unloaded child does not wait for a load in flight, and the name may
+      // have been reused since, so the entry found here can belong to a
+      // different inode. Fail the load instead of attaching this inode to an
+      // entry that does not refer to it.
       XLOGF(
           ERR,
-          "child {} in {} removed before it finished loading",
+          "child {} in {} removed before it finished loading: loaded inode {}, entry now {}",
           childName,
-          getLogPath());
+          getLogPath(),
+          childInode->getNodeId(),
+          iter == contents->entries.end()
+              ? std::string{"gone"}
+              : folly::to<std::string>(iter->second.getInodeNumber().get()));
       throw InodeError(
           ENOENT,
           inodePtrFromThis(),
@@ -1435,12 +1439,9 @@ void TreeInode::inodeLoadComplete(
           "inode removed before loading finished");
     }
     // This load completed after releasing the parent lock. Only cache the
-    // restricted bit if the current slot still names the same unloaded SCM
-    // child we fetched. These checks only make the cache update conservative;
-    // inodeLoadComplete() still relies on the stronger invariant that this
-    // name still maps to the inode load it is completing.
-    if (iter->second.isDirectory() && !iter->second.isMaterialized() &&
-        iter->second.getInodeNumber() == childInode->getNodeId()) {
+    // restricted bit if the entry still describes the unloaded SCM child we
+    // fetched, since it may have been materialized in the meantime.
+    if (iter->second.isDirectory() && !iter->second.isMaterialized()) {
       if (auto* childTree = dynamic_cast<TreeInode*>(childInode.get())) {
         auto childTreeId = childTree->getObjectId();
         if (childTreeId &&
@@ -2309,12 +2310,14 @@ FileInodePtr TreeInode::mknod(
   RelativePath targetName;
   FileInodePtr inode;
 
-  if (!S_ISSOCK(mode) && !S_ISREG(mode)) {
+  bool supported = S_ISSOCK(mode) || S_ISREG(mode);
+#ifdef __linux__
+  supported = supported ||
+      (S_ISFIFO(mode) && getMount()->getEdenConfig()->enableFifo.getValue());
+#endif
+  if (!supported) {
     throw InodeError(
-        EPERM,
-        inodePtrFromThis(),
-        name,
-        "only unix domain sockets and regular files are supported by mknod");
+        EPERM, inodePtrFromThis(), name, "unsupported file type for mknod");
   }
 
   // The dev parameter to mknod only applies to block and character devices,
@@ -2524,7 +2527,8 @@ void TreeInode::removeAllChildrenRecursively(
   while (it != contents->entries.end()) {
     auto inodeNum = it->second.getInodeNumber();
     bool isDir = it->second.isDirectory();
-    if (it->second.getInode()) {
+    bool isLoaded = it->second.getInode() != nullptr;
+    if (isLoaded) {
       // If a treeInode is not empty, i.e. files were added to the tree
       // between step2 and step3, an exception will be thrown.
 
@@ -2554,10 +2558,15 @@ void TreeInode::removeAllChildrenRecursively(
     // Erase from contents must happen right after markUnlink
     it = contents->entries.erase(it);
 
-    if (isDir) {
-      getOverlay()->recursivelyRemoveOverlayDir(inodeNum);
-    } else {
-      getOverlay()->removeOverlayFile(inodeNum);
+    // A loaded child frees its own overlay state when it is unloaded, which
+    // may not happen until the kernel drops its references to it. Freeing it
+    // here would take that state away from an inode that is still in use.
+    if (!isLoaded) {
+      if (isDir) {
+        getOverlay()->recursivelyRemoveOverlayDir(inodeNum);
+      } else {
+        getOverlay()->removeOverlayFile(inodeNum);
+      }
     }
   }
 
@@ -2576,38 +2585,71 @@ InodePtr TreeInode::tryRemoveUnloadedChild(
     throw InodeError(EPERM, inodePtrFromThis());
   }
 #endif
-  auto contents = lockContentsWrite();
-
-  auto it = contents->entries.find(name);
-  if (it == contents->entries.end()) {
-    throw InodeError(ENOENT, inodePtrFromThis(), name);
+  {
+    // Peek first so a missing or already loaded child does not materialize
+    // this directory as a side effect.
+    auto contents = lockContentsRead();
+    auto it = contents->entries.find(name);
+    if (it == contents->entries.end()) {
+      throw InodeError(ENOENT, inodePtrFromThis(), name);
+    }
+    if (auto node = it->second.getInodePtr()) {
+      return node;
+    }
   }
 
-  auto inodeName = copyCanonicalInodeName(it);
-  auto inodeNumber = it->second.getInodeNumber();
+  // Materializing needs the rename lock, which must be acquired before the
+  // contents lock. Holding it also keeps the path recorded in the journal
+  // accurate, as in removeImpl.
+  auto renameLock = getMount()->acquireRenameLock();
+  auto myPath = getPath();
+  if (!myPath.has_value()) {
+    throw InodeError(ENOENT, inodePtrFromThis());
+  }
+  materialize(&renameLock);
 
-  if (auto node = it->second.getInodePtr()) {
-    // The child has a loaded! Fall back to the slow path.
-    return node;
+  std::optional<PathComponent> inodeName;
+  dtype_t dtype;
+  {
+    auto contents = lockContentsWrite();
+
+    auto it = contents->entries.find(name);
+    if (it == contents->entries.end()) {
+      throw InodeError(ENOENT, inodePtrFromThis(), name);
+    }
+
+    inodeName = copyCanonicalInodeName(it);
+    auto inodeNumber = it->second.getInodeNumber();
+
+    if (auto node = it->second.getInodePtr()) {
+      // The child was loaded while the lock was not held. Fall back to the
+      // slow path.
+      return node;
+    }
+
+    // erase() invalidates the iterator.
+    bool isDir = it->second.isDirectory();
+    dtype = it->second.getDtype();
+
+    contents->entries.erase(it);
+    if (InvalidationRequired::Yes == invalidate) {
+      invalidateChannelEntryCache(*contents, *inodeName, inodeNumber)
+          .throwUnlessValue();
+      invalidateChannelDirCache(*contents).get();
+    }
+
+    updateMtimeAndCtimeLocked(contents->entries, getNow());
+    if (isDir) {
+      getOverlay()->recursivelyRemoveOverlayDir(inodeNumber);
+    } else {
+      getOverlay()->removeOverlayFile(inodeNumber);
+    }
+    getOverlay()->removeChild(
+        getNodeId(), inodeName->piece(), contents->entries);
   }
 
-  // erase() invalidates the iterator.
-  bool isDir = it->second.isDirectory();
-
-  contents->entries.erase(it);
-  if (InvalidationRequired::Yes == invalidate) {
-    invalidateChannelEntryCache(*contents, inodeName, inodeNumber)
-        .throwUnlessValue();
-    invalidateChannelDirCache(*contents).get();
-  }
-
-  updateMtimeAndCtimeLocked(contents->entries, getNow());
-  if (isDir) {
-    getOverlay()->recursivelyRemoveOverlayDir(inodeNumber);
-  } else {
-    getOverlay()->removeOverlayFile(inodeNumber);
-  }
-  getOverlay()->removeChild(getNodeId(), name, contents->entries);
+  getMount()->getJournal().recordRemoved(
+      myPath.value() + inodeName->piece(), dtype);
   return nullptr;
 }
 
@@ -2852,27 +2894,45 @@ int TreeInode::checkPreRemove(const FileInode& /* child */) {
 class TreeInode::TreeRenameLocks {
  public:
   TreeRenameLocks() = default;
+  ~TreeRenameLocks() {
+    reset();
+  }
+
+  TreeRenameLocks(const TreeRenameLocks&) = delete;
+  TreeRenameLocks& operator=(const TreeRenameLocks&) = delete;
+  TreeRenameLocks(TreeRenameLocks&&) = delete;
+  TreeRenameLocks& operator=(TreeRenameLocks&&) = delete;
 
   void acquireLocks(
       RenameLock&& renameLock,
-      TreeInode* srcTree,
-      TreeInode* destTree,
+      TreeInode& srcTree,
+      TreeInode& destTree,
       PathComponentPiece destName);
 
   /**
    * Reset the TreeRenameLocks to the empty state, releasing all locks that it
-   * holds.
+   * holds. The reference on the destination child is dropped last, after the
+   * rename lock, so an unlinked destination is destroyed with no lock held.
    */
   void reset() {
-    *this = TreeRenameLocks();
+    releaseAllButRename();
+    renameLock_ = RenameLock{};
+    destChildRef_.reset();
   }
 
   /**
    * Release all locks held by this TreeRenameLocks object except for the
-   * mount point RenameLock.
+   * mount point RenameLock. The reference on the destination child is kept
+   * until reset().
    */
   void releaseAllButRename() {
-    *this = TreeRenameLocks(std::move(renameLock_));
+    srcContentsLock_ = {};
+    destContentsLock_ = {};
+    destChildContentsLock_ = {};
+    srcContents_ = nullptr;
+    destContents_ = nullptr;
+    destChildContents_ = nullptr;
+    destChildIter_ = {};
   }
 
   const RenameLock& renameLock() const {
@@ -2916,10 +2976,11 @@ class TreeInode::TreeRenameLocks {
   }
 
  private:
-  explicit TreeRenameLocks(RenameLock&& renameLock)
-      : renameLock_{std::move(renameLock)} {}
-
-  void lockDestChild(PathComponentPiece destName);
+  bool isBeforeInLockOrder(const TreeInode& a, const TreeInode& b) const;
+  void lockSource(TreeInode& srcTree);
+  void lockDestination(TreeInode& destTree);
+  TreeInode* FOLLY_NULLABLE findDestChild(PathComponentPiece destName);
+  void lockDestChild(TreeInode& destChildTree);
 
   /**
    * The mountpoint-wide rename lock.
@@ -2954,6 +3015,17 @@ class TreeInode::TreeRenameLocks {
    * does not exist.
    */
   PathMap<DirEntry>::iterator destChildIter_;
+
+  /**
+   * A reference on the loaded destination child, if any.
+   *
+   * doRename() unlinks the destination child while destChildContentsLock_ is
+   * still held on it. Once unlinked, the inode is destroyed by whoever drops
+   * the last InodePtr, which may be another thread. This reference keeps it
+   * alive until reset() has released every lock, so that its destruction,
+   * which may do overlay I/O, happens outside them.
+   */
+  InodePtr destChildRef_;
 };
 
 ImmediateFuture<Unit> TreeInode::rename(
@@ -2991,7 +3063,7 @@ ImmediateFuture<Unit> TreeInode::rename(
 
     // Acquire the locks required to do the rename
     TreeRenameLocks locks;
-    locks.acquireLocks(std::move(renameLock), this, destParent.get(), destName);
+    locks.acquireLocks(std::move(renameLock), *this, *destParent, destName);
 
     // Look up the source entry.  The destination entry info was already
     // loaded by TreeRenameLocks::acquireLocks().
@@ -3027,7 +3099,10 @@ ImmediateFuture<Unit> TreeInode::rename(
               destName);
           return ImmediateFuture<Unit>{
               folly::Try<Unit>{InodeError{ENOTDIR, destParent, destName}}};
-        } else if (
+        }
+        // An unloaded destination has no contents to inspect yet; it is
+        // loaded below (needDest) and this check runs again on the retry.
+        if (locks.destChild() != nullptr &&
             locks.destChild() != srcEntry.getInode() &&
             !locks.destChildIsEmpty()) {
           XLOGF(
@@ -3135,6 +3210,52 @@ bool isAncestor(const RenameLock& renameLock, TreeInode* a, TreeInode* b) {
 }
 } // namespace
 
+/**
+ * Order ancestors before descendants and keep disjoint subtrees together.
+ * Compare the first differing ancestors, since preallocation and earlier
+ * renames can give a child a lower inode number than its parent. The rename
+ * lock keeps the hierarchy stable while comparing and acquiring locks.
+ * The caller keeps both inodes alive through references or their parent's
+ * contents lock; each inode in turn retains its ancestors. Do not create an
+ * InodePtr from the destination child, which may have no pointer references.
+ */
+bool TreeInode::TreeRenameLocks::isBeforeInLockOrder(
+    const TreeInode& a,
+    const TreeInode& b) const {
+  const auto getDepth = [this](const TreeInode& inode) {
+    size_t depth = 0;
+    for (auto parent = inode.getParent(renameLock_); parent;
+         parent = parent->getParent(renameLock_)) {
+      ++depth;
+    }
+    return depth;
+  };
+
+  const auto aDepth = getDepth(a);
+  const auto bDepth = getDepth(b);
+  const auto* aAncestor = &a;
+  const auto* bAncestor = &b;
+  for (auto depth = aDepth; depth > bDepth; --depth) {
+    aAncestor = aAncestor->getParent(renameLock_).get();
+  }
+  for (auto depth = bDepth; depth > aDepth; --depth) {
+    bAncestor = bAncestor->getParent(renameLock_).get();
+  }
+  if (aAncestor == bAncestor) {
+    return aDepth < bDepth;
+  }
+
+  while (true) {
+    auto* aParent = aAncestor->getParent(renameLock_).get();
+    auto* bParent = bAncestor->getParent(renameLock_).get();
+    if (aParent == bParent) {
+      return aAncestor->getNodeId() < bAncestor->getNodeId();
+    }
+    aAncestor = aParent;
+    bAncestor = bParent;
+  }
+}
+
 ImmediateFuture<Unit> TreeInode::doRename(
     TreeRenameLocks&& locks,
     PathComponentPiece srcName,
@@ -3191,26 +3312,39 @@ ImmediateFuture<Unit> TreeInode::doRename(
   // Success.
   // Update the destination with the source data (this copies in the id if
   // it happens to be set).
-  std::unique_ptr<InodeBase> deletedInode;
-  auto* childInode = srcEntry.getInode();
+  // The child is used after the contents locks are released below, when an
+  // unload or FORGET could otherwise destroy it. Hold a reference until then.
+  auto childInode = srcEntry.getInodePtr();
   bool destChildExists = locks.destChildExists();
   if (destChildExists) {
-    deletedInode = locks.destChild()->markUnlinked(
+    // The reference held by locks keeps the destination alive, so
+    // markUnlinked() never hands ownership back here; locks.reset() below
+    // destroys the inode once every lock is released.
+    locks.destChild()->markUnlinked(
         destParent.get(), destName, locks.renameLock());
+    // Tests block here to drop their own references to the unlinked
+    // destination while the rename still holds its contents lock.
+    getMount()->getServerState()->getFaultInjector().check(
+        "TreeInode::doRename", destName);
 
-    // Replace the destination contents entry with the source data
-    locks.destChildIter()->second = std::move(srcIter->second);
+    // On a case-insensitive mount the existing entry may be spelled
+    // differently from destName. The entry is re-inserted under destName so
+    // the listing agrees with the child's location and the overlay record.
+    auto entry = std::move(srcIter->second);
+    locks.destContents()->erase(locks.destChildIter());
+    auto ret = locks.destContents()->emplace(destName, std::move(entry));
+    XCHECK(ret.second);
   } else {
     auto ret =
         locks.destContents()->emplace(destName, std::move(srcIter->second));
     XCHECK(ret.second);
+  }
 
-    // If the source and destination directory are the same, then inserting the
-    // destination entry may have invalidated our source entry iterator, so we
-    // have to look it up again.
-    if (destParent.get() == this) {
-      srcIter = locks.srcContents()->find(srcName);
-    }
+  // If the source and destination directory are the same, then modifying the
+  // destination entries may have invalidated our source entry iterator, so we
+  // have to look it up again.
+  if (destParent.get() == this) {
+    srcIter = locks.srcContents()->find(srcName);
   }
 
   // Inform the child inode that it has been moved
@@ -3256,10 +3390,9 @@ ImmediateFuture<Unit> TreeInode::doRename(
     }
   }
 
-  // Release the rename lock before we destroy the deleted destination child
-  // inode (if it exists).
+  // Releasing the locks also drops the reference the locks held on the
+  // destination child, which destroys it now that it is unlinked.
   locks.reset();
-  deletedInode.reset();
 
   return folly::unit;
 }
@@ -3277,69 +3410,190 @@ ImmediateFuture<Unit> TreeInode::doRename(
  * This function ensures the locks are held with the proper ordering.
  * Since we hold the rename lock first, we can acquire multiple TreeInode
  * contents_ locks at once, but we must still ensure that we acquire locks on
- * ancestor TreeInode's before any of their descendants.
+ * ancestor TreeInodes before any of their descendants. Disjoint subtrees are
+ * ordered by the inode numbers of their first differing ancestors.
+ *
+ * Moving directories can reverse the order of the same inode locks across
+ * renames, so TSan may still report lock-order cycles. The mountpoint rename
+ * lock serializes those operations, preventing them from deadlocking each
+ * other. Ancestor-before-descendant ordering remains necessary to avoid
+ * deadlocks with operations that do not acquire the rename lock.
  */
 void TreeInode::TreeRenameLocks::acquireLocks(
     RenameLock&& renameLock,
-    TreeInode* srcTree,
-    TreeInode* destTree,
+    TreeInode& srcTree,
+    TreeInode& destTree,
     PathComponentPiece destName) {
   // Store the mountpoint-wide rename lock.
   renameLock_ = std::move(renameLock);
 
-  if (srcTree == destTree) {
+  if (&srcTree == &destTree) {
     // If the source and destination directories are the same,
     // then there is really only one parent directory to lock.
-    srcContentsLock_ = srcTree->lockContentsWrite();
+    srcContentsLock_ = srcTree.lockContentsWrite();
     srcContents_ = &srcContentsLock_->entries;
     destContents_ = &srcContentsLock_->entries;
     // Look up the destination child entry, and lock it if it is a directory
-    lockDestChild(destName);
-  } else if (isAncestor(renameLock_, srcTree, destTree)) {
-    // If srcTree is an ancestor of destTree, we must acquire the lock on
-    // srcTree first.
-    srcContentsLock_ = srcTree->lockContentsWrite();
-    srcContents_ = &srcContentsLock_->entries;
-    destContentsLock_ = destTree->lockContentsWrite();
-    destContents_ = &destContentsLock_->entries;
-    lockDestChild(destName);
-  } else {
-    // In all other cases, lock destTree and destChild before srcTree,
-    // as long as we verify that destChild and srcTree are not the same.
-    //
-    // It is not possible for srcTree to be an ancestor of destChild,
-    // since we have confirmed that srcTree is not destTree nor an ancestor of
-    // destTree.
-    destContentsLock_ = destTree->lockContentsWrite();
-    destContents_ = &destContentsLock_->entries;
-    lockDestChild(destName);
-
-    // While srcTree cannot be an ancestor of destChild, it might be the
-    // same inode.  Don't try to lock the same TreeInode twice in this case.
-    //
-    // The rename will be failed later since this must be an error, but for now
-    // we keep going and let the exact error be determined later.
-    // This will either be ENOENT (src entry doesn't exist) or ENOTEMPTY
-    // (destChild is not empty since the src entry exists).
-    if (destChildExists() && destChild() == srcTree) {
-      XCHECK_NE(destChildContents_, nullptr);
-      srcContents_ = destChildContents_;
-    } else {
-      srcContentsLock_ = srcTree->lockContentsWrite();
-      srcContents_ = &srcContentsLock_->entries;
+    if (auto* destChildTree = findDestChild(destName)) {
+      lockDestChild(*destChildTree);
     }
+    return;
+  }
+
+  if (isBeforeInLockOrder(srcTree, destTree)) {
+    lockSource(srcTree);
+    lockDestination(destTree);
+    if (auto* destChildTree = findDestChild(destName)) {
+      lockDestChild(*destChildTree);
+    }
+    return;
+  }
+
+  lockDestination(destTree);
+  auto* destChildTree = findDestChild(destName);
+  if (destChildTree == nullptr) {
+    lockSource(srcTree);
+    return;
+  }
+  if (destChildTree == &srcTree) {
+    lockDestChild(*destChildTree);
+    XCHECK_NE(destChildContents_, nullptr);
+    srcContents_ = destChildContents_;
+    return;
+  }
+
+  if (isBeforeInLockOrder(*destChildTree, srcTree)) {
+    lockDestChild(*destChildTree);
+    lockSource(srcTree);
+  } else {
+    lockSource(srcTree);
+    lockDestChild(*destChildTree);
   }
 }
 
-void TreeInode::TreeRenameLocks::lockDestChild(PathComponentPiece destName) {
+void TreeInode::TreeRenameLocks::lockSource(TreeInode& srcTree) {
+  srcContentsLock_ = srcTree.lockContentsWrite();
+  srcContents_ = &srcContentsLock_->entries;
+}
+
+void TreeInode::TreeRenameLocks::lockDestination(TreeInode& destTree) {
+  destContentsLock_ = destTree.lockContentsWrite();
+  destContents_ = &destContentsLock_->entries;
+}
+
+TreeInode* FOLLY_NULLABLE
+TreeInode::TreeRenameLocks::findDestChild(PathComponentPiece destName) {
   // Look up the destination child entry
   destChildIter_ = destContents_->find(destName);
-  if (destChildExists() && destChildIsDirectory() && destChild() != nullptr) {
-    auto* childTree = boost::polymorphic_downcast<TreeInode*>(destChild());
-    destChildContentsLock_ = childTree->lockContentsWrite();
-    destChildContents_ = &destChildContentsLock_->entries;
+  if (!destChildExists() || destChild() == nullptr) {
+    return nullptr;
   }
+  destChildRef_ = InodePtr::newPtrLocked(destChild());
+  if (destChildIsDirectory()) {
+    return boost::polymorphic_downcast<TreeInode*>(destChild());
+  }
+  return nullptr;
 }
+
+void TreeInode::TreeRenameLocks::lockDestChild(TreeInode& destChildTree) {
+  destChildContentsLock_ = destChildTree.lockContentsWrite();
+  destChildContents_ = &destChildContentsLock_->entries;
+}
+
+namespace {
+
+/**
+ * Index the entries past `minOffset` by inode number. A request building an
+ * index for itself passes its own offset, so the request that ends a
+ * listing, which finds nothing past its offset, sorts nothing and allocates
+ * nothing.
+ *
+ * Restricted entries are indexed too. Granting access to one clears its
+ * restricted bit in place, which leaves entries.mutationCount() alone, so an
+ * index that left the entry out would keep hiding it from listings that
+ * should now show it.
+ */
+ReaddirIndex buildReaddirIndex(const DirEntries& entries, off_t minOffset) {
+  ReaddirIndex index{entries.mutationCount(), minOffset, {}};
+  if (minOffset == 0) {
+    index.entries.reserve(entries.size());
+  }
+  for (const auto& mapEntry : entries.all()) {
+    const auto inodeNumber = mapEntry.second.getInodeNumber();
+    if (static_cast<off_t>(inodeNumber.get() + 2) > minOffset) {
+      index.entries.emplace_back(inodeNumber, &mapEntry);
+    }
+  }
+  std::sort(
+      index.entries.begin(),
+      index.entries.end(),
+      [](const auto& a, const auto& b) { return a.first < b.first; });
+  return index;
+}
+
+/**
+ * A cached index serves a request at `offset` only while the map has not
+ * been mutated since the index was built (its entry pointers would
+ * otherwise dangle) and it covers everything past `offset`.
+ */
+bool isReaddirIndexCurrent(
+    const ReaddirIndex& index,
+    const TreeInodeState& state,
+    off_t offset) {
+  return index.mutationCount == state.entries.mutationCount() &&
+      offset >= index.minOffset;
+}
+
+/**
+ * The first indexed entry a request at `offset` lists. Omitted entries are
+ * skipped here as well as during emission, so that a request with nothing
+ * but omitted entries left reaches the end of the index and is recognized as
+ * the end of the listing.
+ */
+auto firstIndexedAfter(
+    const ReaddirIndex& index,
+    RestrictedContentMode mode,
+    off_t offset) {
+  auto it = std::lower_bound(
+      index.entries.begin(),
+      index.entries.end(),
+      offset,
+      [](const auto& indexed, off_t off) {
+        return static_cast<off_t>(indexed.first.get() + 2) <= off;
+      });
+  if (mode == RestrictedContentMode::Omitted) {
+    it = std::find_if(it, index.entries.end(), [](const auto& indexed) {
+      return !indexed.second->second.isRestricted();
+    });
+  }
+  return it;
+}
+
+/**
+ * Emit the indexed entries from `it` on, in offset order, until `add`
+ * declines one. Returns whether the index was exhausted.
+ */
+template <typename Iter, typename Fn>
+bool emitReaddirIndex(
+    const ReaddirIndex& index,
+    RestrictedContentMode mode,
+    Iter it,
+    Fn& add) {
+  const bool omit = mode == RestrictedContentMode::Omitted;
+  for (; it != index.entries.end(); ++it) {
+    const auto& [name, entry] = *it->second;
+    XDCHECK(entry.getInodeNumber() == it->first);
+    if (omit && entry.isRestricted()) {
+      continue;
+    }
+    if (!add(name.view(), entry, static_cast<off_t>(it->first.get() + 2))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
 
 template <typename Fn>
 bool TreeInode::readdirImpl(
@@ -3371,8 +3625,10 @@ bool TreeInode::readdirImpl(
    *
    * Today, Eden does not support hard links. Therefore, in the short term, we
    * can store inode numbers in off_t and treat them as an index into an
-   * inode-sorted list of entries. This has quadratic time complexity without an
-   * additional index but is correct.
+   * inode-sorted list of entries. Building that list costs a sort of the
+   * whole directory, so a listing that spans several requests caches it in
+   * TreeInode::readdirIndex_ for the later ones and drops it once the
+   * listing ends; the map's mutation count says whether it is still valid.
    *
    * In the long term, especially when Eden's tree directory structure is stored
    * in SQLite or something similar, we should maintain a seekdir/readdir cookie
@@ -3425,33 +3681,50 @@ bool TreeInode::readdirImpl(
     }
   }
 
+  // Offsets are ino + 2, not list positions, so omitting an entry never
+  // shifts the offsets of the rest across resumed readdir calls.
+  const auto mode = restrictedContentMode();
+  const bool cacheIndex =
+      getMount()->getEdenConfig()->experimentalReaddirIndexCache.getValue();
+  const auto& stats = getMount()->getStats();
+
   auto dir = lockContentsRead();
-
-  // Index the visible entries by InodeNumber, only including those past the
-  // given offset. Offsets are ino + 2, not list positions, so omitting an
-  // entry never shifts the offsets of the rest across resumed readdir calls.
-  std::vector<std::pair<InodeNumber, const DirContents::value_type*>> indices;
-  indices.reserve(dir->entries.size());
-  for (const auto& mapEntry : dir->entries.visible(restrictedContentMode())) {
-    auto inodeNumber = mapEntry.second.getInodeNumber();
-    if (static_cast<off_t>(inodeNumber.get() + 2) > off) {
-      indices.emplace_back(inodeNumber, &mapEntry);
-    }
-  }
-  std::make_heap(indices.begin(), indices.end(), std::greater<>{});
-
-  // The provided FuseDirList has limited space. Add entries until no more fit.
-  while (!indices.empty()) {
-    std::pop_heap(indices.begin(), indices.end(), std::greater<>{});
-    auto& [name, entry] = *indices.back().second;
-    indices.pop_back();
-
-    if (!add(name.view(), entry, entry.getInodeNumber().get() + 2)) {
-      return false;
+  std::shared_ptr<const ReaddirIndex> cached;
+  if (cacheIndex) {
+    // Building the index costs a sort of the whole directory, so a listing
+    // that takes several requests shares one index between them. The read
+    // lock held here keeps entries.mutationCount() stable, so an index that
+    // matches it can be used for the rest of this request.
+    cached = readdirIndex_.copy();
+    if (cached && isReaddirIndexCurrent(*cached, *dir, off)) {
+      stats->increment(&TreeInodeStats::readdirIndexHit);
+      const auto first = firstIndexedAfter(*cached, mode, off);
+      if (first == cached->entries.end()) {
+        // Nothing left to list past `off`: the listing is over.
+        readdirIndex_.wlock()->reset();
+        return true;
+      }
+      return emitReaddirIndex(*cached, mode, first, add);
     }
   }
 
-  return true;
+  // Only entries past `off` are indexed, so emission starts at the front.
+  auto index = buildReaddirIndex(dir->entries, off);
+  const bool finished =
+      emitReaddirIndex(index, mode, index.entries.begin(), add);
+  if (cacheIndex) {
+    if (!finished) {
+      // More requests will follow; let them reuse this index.
+      *readdirIndex_.wlock() =
+          std::make_shared<const ReaddirIndex>(std::move(index));
+      stats->increment(&TreeInodeStats::readdirIndexCached);
+    } else if (cached) {
+      // The cached index failed isReaddirIndexCurrent above and this listing
+      // is over, so nothing will use it again.
+      readdirIndex_.wlock()->reset();
+    }
+  }
+  return finished;
 }
 
 #ifndef _WIN32
@@ -3483,6 +3756,11 @@ std::tuple<NfsDirList, bool> TreeInode::nfsReaddir(
       [&list](StringPiece name, const DirEntry& entry, uint64_t offset) {
         return list.add(name, entry.getInodeNumber(), offset);
       });
+  if (isEof) {
+    // NFS clients stop at eof without the empty request that ends a FUSE
+    // listing, so this is where a cached index is dropped.
+    readdirIndex_.wlock()->reset();
+  }
 
   return {std::move(list), isEof};
 }
@@ -3747,7 +4025,8 @@ TreeInode::prepareDeferredDiffEntries(
                                                 : GitIgnore::TYPE_FILE;
       auto entryPath = currentPath + name;
       if (!isIgnored) {
-        auto ignoreStatus = ignore->match(entryPath, fileType);
+        auto ignoreStatus =
+            ignore->match(entryPath, fileType, context->getGlobMatchOptions());
         if (ignoreStatus == GitIgnore::HIDDEN) {
           // Completely skip over hidden entries.
           // This is used for reserved directories like .hg and .eden
@@ -3837,7 +4116,8 @@ TreeInode::prepareDeferredDiffEntries(
       if (!isIgnored && (inodeEntry->isDirectory() || scmEntries[0].isTree())) {
         auto fileType = inodeEntry->isDirectory() ? GitIgnore::TYPE_DIR
                                                   : GitIgnore::TYPE_FILE;
-        auto ignoreStatus = ignore->match(entryPath, fileType);
+        auto ignoreStatus =
+            ignore->match(entryPath, fileType, context->getGlobMatchOptions());
         if (ignoreStatus == GitIgnore::HIDDEN) {
           // This is rather unexpected.  We don't expect to find entries in
           // source control using reserved hidden names.
@@ -4753,6 +5033,12 @@ folly::Try<folly::Unit> TreeInode::removeOrReplaceCheckoutEntryLocked(
     } else {
       getOverlay()->recursivelyRemoveOverlayDir(oldEntryInodeNumber);
     }
+  } else if (!loadedChild) {
+    // A loaded child frees its overlay state when it is destroyed. An
+    // unloaded one was never materialized, so it has no overlay file, but
+    // it may still have a metadata record from an earlier load, and nothing
+    // else will free it.
+    getOverlay()->freeInodeMetadata(oldEntryInodeNumber);
   }
 
   return folly::Try<folly::Unit>{folly::unit};
@@ -5836,51 +6122,114 @@ bool needDecFsRefcount(InodeMap& inodeMap, InodeNumber ino) {
 } // namespace
 #endif
 
-#ifndef _WIN32
-folly::Try<folly::Unit> TreeInode::nfsInvalidateCacheEntryForGC(
-    TreeInodeState& state) {
-  if (auto* nfsdChannel = getMount()->getNfsdChannel()) {
-    const auto path = getPath();
-    if (path.has_value()) {
-      // The contents lock is held by invalidateChildrenNotMaterialized
-      auto mode = getMetadataLocked(state.entries).mode;
-      std::vector<InodeNumber> childInodes;
-      childInodes.reserve(state.entries.size());
-      for (const auto& entry : state.entries.all()) {
-        childInodes.push_back(entry.second.getInodeNumber());
-      }
-      auto stats = getMount()->getStats().copy();
-      nfsdChannel->invalidate(
-          getMount()->getPath() + *path,
-          mode,
-          [inodeMapWeak = getInodeMapWeak(),
-           stats = std::move(stats),
-           childInodes = std::move(childInodes)]() {
-            // Code to run after successful invalidation
-            if (auto inodeMap = inodeMapWeak.lock()) {
-              // The directory got invalidated, now we can dereference all of
-              // its contents
-              for (auto ino : childInodes) {
-                stats->increment(
-                    &NfsStats::nfsInvalidationGcClearFsRefcountAttempt);
-                if (inodeMap->isInodeLoadedOrRemembered(ino)) {
-                  XLOGF(DBG9, "GC invalidated inode {}", ino);
-                  inodeMap->clearFsRefcount(ino);
-                  stats->increment(
-                      &NfsStats::nfsInvalidationGcClearFsRefcountCleared);
-                } else {
-                  stats->increment(
-                      &NfsStats::nfsInvalidationGcClearFsRefcountSkipped);
-                }
-              }
-            } else {
-              XLOG(WARN, "InodeMap is killed before GC completes");
-            }
-          },
-          NfsInvalidationSource::Gc);
-    }
+namespace {
+/**
+ * Whether the NFS GC invalidation of a directory may clear this child's FS
+ * reference. Pinned inodes and directories whose subtree contains a pin are
+ * kept, and so are all directories when pin information is unavailable; see
+ * TreeInode::handleChildrenNotAccessedRecently.
+ */
+bool nfsGcMayClearChild(
+    const DirEntry& entry,
+    const std::shared_ptr<const folly::F14FastSet<InodeNumber>>& pinnedInodes,
+    const folly::F14FastSet<InodeNumber>& pinnedChildren) {
+  const auto ino = entry.getInodeNumber();
+  if (pinnedInodes && pinnedInodes->count(ino)) {
+    return false;
   }
-  return folly::Try<folly::Unit>{folly::unit};
+  if (entry.isDirectory()) {
+    return pinnedInodes && !pinnedChildren.count(ino);
+  }
+  return true;
+}
+} // namespace
+
+#ifndef _WIN32
+std::optional<std::pair<AbsolutePath, mode_t>>
+TreeInode::nfsPrepareDirInvalidationLocked(TreeInodeState& state) {
+  if (!getMount()->getNfsdChannel()) {
+    return std::nullopt;
+  }
+  const auto path = getPath();
+  if (!path.has_value()) {
+    return std::nullopt;
+  }
+  return std::make_pair(
+      getMount()->getPath() + *path, getMetadataLocked(state.entries).mode);
+}
+
+bool TreeInode::nfsInvalidateDirCacheLocked(
+    TreeInodeState& state,
+    std::optional<NfsInvalidationSource> source) {
+  auto* channel = getMount()->getNfsdChannel();
+  auto target = nfsPrepareDirInvalidationLocked(state);
+  if (!channel || !target) {
+    return false;
+  }
+  channel->invalidate(std::move(target->first), target->second, source);
+  return true;
+}
+
+std::optional<NfsGcPreparedInvalidation> TreeInode::nfsPrepareGcInvalidation(
+    TreeInodeState& state,
+    const std::shared_ptr<const folly::F14FastSet<InodeNumber>>& pinnedInodes,
+    folly::F14FastSet<InodeNumber> pinnedChildren) {
+  auto target = nfsPrepareDirInvalidationLocked(state);
+  if (!target) {
+    return std::nullopt;
+  }
+
+  // The contents lock is held by invalidateChildrenNotMaterialized. Which
+  // children to clear is decided when the chmod reaches EdenFS, not here:
+  // the chmod may wait in the invalidation queue, and a child the client
+  // looks up meanwhile is referenced again by that lookup.
+  auto stats = getMount()->getStats().copy();
+  auto forget = [self = inodePtrFromThis(),
+                 inodeMapWeak = getInodeMapWeak(),
+                 stats = std::move(stats),
+                 pinnedInodes,
+                 pinnedChildren = std::move(pinnedChildren)]() -> uint64_t {
+    auto inodeMap = inodeMapWeak.lock();
+    if (!inodeMap) {
+      XLOG(WARN, "InodeMap is killed before GC completes");
+      return 0;
+    }
+    // The client is about to forget the directory's names. Drop the
+    // children's references with it, as a FUSE FORGET would; whatever the
+    // client looks up again from here on is referenced anew by that lookup.
+    uint64_t numCleared = 0;
+    auto contents = self->getContentsUnchecked().rlock();
+    for (const auto& entry : contents->entries.all()) {
+      if (!nfsGcMayClearChild(entry.second, pinnedInodes, pinnedChildren)) {
+        continue;
+      }
+      const auto ino = entry.second.getInodeNumber();
+      stats->increment(&NfsStats::nfsInvalidationGcClearFsRefcountAttempt);
+      if (!entry.second.getInode() && !inodeMap->isInodeRemembered(ino)) {
+        stats->increment(&NfsStats::nfsInvalidationGcClearFsRefcountSkipped);
+        continue;
+      }
+      XLOGF(DBG9, "GC invalidated inode {}", ino);
+      if (inodeMap->clearFsRefcount(ino)) {
+        numCleared++;
+        stats->increment(&NfsStats::nfsInvalidationGcClearFsRefcountCleared);
+      }
+    }
+    return numCleared;
+  };
+  // Read without the parents' locks: a rename racing with this walk only
+  // changes which ancestors' request times the chmod leaves alone, and each
+  // step moves up one level, so the walk ends at the root.
+  std::vector<InodeNumber> lineage{getNodeId()};
+  for (auto parent = getParentRacy(); parent;
+       parent = parent->getParentRacy()) {
+    lineage.push_back(parent->getNodeId());
+  }
+  return NfsGcPreparedInvalidation{
+      std::move(target->first),
+      target->second,
+      std::move(forget),
+      std::move(lineage)};
 }
 #endif
 
@@ -5940,12 +6289,9 @@ ImmediateFuture<folly::Unit> TreeInode::invalidateChannelDirCache(
     // when an entry is removed or modified. But when new entries are
     // added, the inode itself must be invalidated.
     fuseChannel->invalidateInode(getNodeId(), 0, 0);
-  } else if (auto* nfsdChannel = getMount()->getNfsdChannel()) {
-    const auto path = getPath();
-    if (path.has_value()) {
-      auto mode = getMetadataLocked(state.entries).mode;
-      nfsdChannel->invalidate(getMount()->getPath() + *path, mode);
-    }
+  } else {
+    // Does nothing when the mount has no NFS channel either.
+    nfsInvalidateDirCacheLocked(state);
   }
 #else
   (void)state;
@@ -5981,12 +6327,9 @@ TreeInode::InvalidationSnapshot TreeInode::prepareInvalidateDirCache(
   // which protects access to `state` for the NFS mode lookup.
   if (auto* fuseChannel = getMount()->getFuseChannel()) {
     fuseChannel->invalidateInode(getNodeId(), 0, 0);
-  } else if (auto* nfsdChannel = getMount()->getNfsdChannel()) {
-    const auto path = getPath();
-    if (path.has_value()) {
-      auto mode = getMetadataLocked(state.entries).mode;
-      nfsdChannel->invalidate(getMount()->getPath() + *path, mode);
-    }
+  } else {
+    // Does nothing when the mount has no NFS channel either.
+    nfsInvalidateDirCacheLocked(state);
   }
 #else
   (void)state;
@@ -6074,7 +6417,13 @@ void TreeInode::saveOverlayPostCheckout(
           return std::nullopt;
         }
 
-        // TODO: This needs to compare filenames too.
+        // A renamed child keeps its object id, so the id alone can match a
+        // different entry of the Tree at the same position. The name has
+        // to match as well, or reloading from the Tree would change the
+        // directory.
+        if (inodeIter->first != scmIter->first) {
+          return std::nullopt;
+        }
 
         // If the child is not materialized, it is the same as some source
         // control object.  However, if it isn't the same as the object in our
@@ -6257,6 +6606,11 @@ size_t unloadChildrenIf(
     auto contents = self->getContentsUnchecked().wlock();
     auto inodeMapLock = inodeMap->lockForUnload();
 
+    // A listing that stopped before its end, or an NFS listing, leaves its
+    // readdir index behind until the directory changes; GC is the backstop
+    // that bounds how long that memory is held.
+    self->dropReaddirIndex();
+
     for (auto& entry : contents->entries.all()) {
       if (shouldCancel()) {
         break;
@@ -6327,6 +6681,12 @@ std::vector<TreeInodePtr> getTreeChildren(
 }
 
 } // namespace
+
+void TreeInode::dropReaddirIndex() {
+  if (std::exchange(*readdirIndex_.wlock(), nullptr)) {
+    getMount()->getStats()->increment(&TreeInodeStats::readdirIndexDroppedByGc);
+  }
+}
 
 size_t TreeInode::unloadChildrenNow() {
   auto neverCancel = [] { return false; };
@@ -6451,8 +6811,12 @@ ImmediateFuture<std::vector<NamedTreeInode>> getLoadedOrRememberedTreeChildren(
       }
       auto name = std::move(child.name);
       res.push_back(self->getOrLoadChildTree(name, context)
-                        .thenValue([name](TreeInodePtr tree) {
-                          return std::make_pair(name, std::move(tree));
+                        .thenTry([name, mount = self->getMount()](
+                                     folly::Try<TreeInodePtr>&& tree) {
+                          if (tree.hasException()) {
+                            mount->recordInodeGCTreeLoadFailure();
+                          }
+                          return std::make_pair(name, std::move(tree).value());
                         }));
     }
   }
@@ -6512,12 +6876,9 @@ processTreeChildren(
           futures.push_back(childProcessor(name.piece(), tree));
         }
 
-        // Check for cancellation after processing children
-        if (shouldCancelGC(cancellationToken)) {
-          return ImmediateFuture<std::vector<ResultType>>(
-              std::vector<ResultType>());
-        }
-
+        // Cancellation stops new work, but the child walks already started
+        // hold inode references and may have chmods in flight, so they are
+        // joined before the GC lease is released.
         return collectAllSafe(std::move(futures));
       });
 }
@@ -6534,9 +6895,8 @@ TreeInode::handleChildrenNotAccessedRecently(
         pinnedInodes) {
   if (getMount()->getNfsdChannel()) {
     return invalidateChildrenNotMaterializedNFS(
-               cutoff, context, cancellationToken)
-        .thenValue(
-            [](std::pair<uint64_t, bool> result) { return result.first; });
+               cutoff, context, cancellationToken, std::move(pinnedInodes))
+        .thenValue([](NfsGcResult result) { return result.numInvalidated; });
 
   } else if (getMount()->getPrjfsChannel()) {
     return invalidateChildrenNotMaterializedPrjFS(
@@ -6885,136 +7245,263 @@ TreeInode::invalidateChildrenNotAccessedRecentlyFuseImpl(
 }
 #endif
 
-ImmediateFuture<std::pair<
-    uint64_t /* numInvalidated */,
-    bool /* allDescendantsInvalidated */>>
-TreeInode::invalidateChildrenNotMaterializedNFS(
+namespace {
+/**
+ * One directory's contribution to the NFS GC walk. `done` is set when the
+ * directory queued its own invalidation; see Nfsd3::invalidateWithQueueLimit
+ * for what it completes with.
+ */
+struct NfsGcStep {
+  uint64_t numInvalidated{0};
+  bool invalidated{false};
+  bool containsPin{false};
+  std::optional<folly::SemiFuture<std::optional<uint64_t>>> done;
+};
+} // namespace
+
+ImmediateFuture<NfsGcResult> TreeInode::invalidateChildrenNotMaterializedNFS(
     std::chrono::system_clock::time_point cutoff,
     const ObjectFetchContextPtr& context,
-    folly::CancellationToken cancellationToken) {
+    folly::CancellationToken cancellationToken,
+    std::shared_ptr<const folly::F14FastSet<InodeNumber>> pinnedInodes) {
   if (shouldCancelGC(cancellationToken, getMount())) {
-    return std::make_pair(0u, false);
+    // This subtree was not examined, so report it as possibly pinned to keep
+    // ancestors from clearing its reference.
+    return NfsGcResult{0, false, /*containsPin=*/true};
+  }
+  if (getNodeId() == getMount()->getDotEdenInodeNumber()) {
+    // EdenFS's own directory, which tools resolve constantly: nothing to
+    // gain from forgetting it or its handful of entries. Report it as done
+    // and pinned, so the root goes on without clearing its reference.
+    return NfsGcResult{0, /*invalidated=*/true, /*containsPin=*/true};
   }
 
-  return processTreeChildren(
-             this,
-             getInodeMap(),
-             context,
-             cancellationToken,
-             [cutoff, context = context.copy(), cancellationToken](
-                 PathComponentPiece /*name*/, TreeInodePtr tree) {
-               return tree->invalidateChildrenNotMaterializedNFS(
-                   cutoff, context, cancellationToken);
-             })
-      .thenValue([self = inodePtrFromThis(), cutoff, cancellationToken](
-                     const std::vector<std::pair<uint64_t, bool>>&
-                         invalidations) {
-        // Check for cancellation before processing results
-        if (shouldCancelGC(cancellationToken)) {
-          return std::make_pair(uint64_t{0}, false);
-        }
+  auto childResults = processTreeChildren(
+      this,
+      getInodeMap(),
+      context,
+      cancellationToken,
+      [cutoff, context = context.copy(), cancellationToken, pinnedInodes](
+          PathComponentPiece /*name*/, TreeInodePtr tree) {
+        return tree
+            ->invalidateChildrenNotMaterializedNFS(
+                cutoff, context, cancellationToken, pinnedInodes)
+            .thenValue([ino = tree->getNodeId()](NfsGcResult result) {
+              return std::make_pair(ino, result);
+            });
+      });
 
-        uint64_t numInvalidated = 0;
-        bool allDescendantsInvalidated = true;
-        bool isThisTreeInvalidated = false;
-
-        for (auto invalidation : invalidations) {
-          numInvalidated += invalidation.first;
-          if (!invalidation.second) {
-            allDescendantsInvalidated = false;
-          }
-        }
-
-        {
-          if (!self->getPath().has_value()) {
-            // This directory was removed, no need to do anything.
-            return std::make_pair(numInvalidated, true);
-          }
-
-          auto contents = self->lockContentsWrite();
-          if (!allDescendantsInvalidated) {
-            // If any of the children are not invalidated, we should skip
-            // invalidation of this directory.
-            return std::make_pair(numInvalidated, false);
-          }
-          if (!contents->isMaterialized()) {
-            // if cutoff is max, we should invalidate everything, so we don't
-            // need to check the last fs request time
-            bool shouldInvalidate =
-                (cutoff == std::chrono::system_clock::time_point::max());
-            if (!shouldInvalidate) {
-              auto lastFsRequestTime = std::chrono::system_clock::from_time_t(
-                  self->getLastFsRequestTime().toTimespec().tv_sec);
-              // As we didn't update parent's last fs request time when children
-              // are accessed via the fs channel dispatcher, we need to check
-              // the children's last fs request time here.
-              for (auto& entry : contents->entries.all()) {
-                auto* entryInode = entry.second.getInode();
-                if (!entryInode) {
-                  continue;
-                }
-                auto childLastFsRequestTime =
-                    std::chrono::system_clock::from_time_t(
-                        entryInode->getLastFsRequestTime().toTimespec().tv_sec);
-                if (lastFsRequestTime < childLastFsRequestTime) {
-                  lastFsRequestTime = childLastFsRequestTime;
-                }
-              }
-              shouldInvalidate = (lastFsRequestTime < cutoff);
-              XLOGF(
-                  DBG9,
-                  "For path: {}, last fs request time: {}, cutoff: {}, shouldInvalidate by GC is {}",
-                  self->getPath().value().asString(),
-                  self->getLastFsRequestTime().toTimespec().tv_sec,
-                  cutoff.time_since_epoch().count(),
-                  shouldInvalidate);
-            }
-            if (shouldInvalidate) {
-              // Attempt to invalidate the directory, and then delete all of its
-              // children's inodes. The call order here is recursively
-              // bottom-up. At each level, the contents_'s lock is held by the
-              // invalidateChildrenNotMaterialized() until the
-              // completeInvalidations() returns and all of the children's inode
-              // get deleted.
-              // The directory itself will be deleted later in the parent's
-              // invalidation.
-
-              // Check for cancellation before invalidation
-              if (shouldCancelGC(cancellationToken)) {
-                return std::make_pair(uint64_t{0}, false);
-              }
+  // Deciding whether to invalidate this directory and queuing the
+  // invalidation run on the GC invalidation executor, as the FUSE walk does:
+  // queuing may wait for the invalidation queue to drain, which must not hold
+  // up the threads that serve requests. The continuation is attached to the
+  // folly::Future from via() rather than an ImmediateFuture, which would run
+  // it inline on the calling thread whenever the hop had already completed.
+  // The decision captures the executor to keep it alive for as long as the
+  // continuation, which the keep-alive token via() is given does not do.
+  std::shared_ptr<UnboundedQueueExecutor> invalidationExecutor;
 #ifndef _WIN32
-              // Windows platforms should not get to this path
-              auto invalidateResult =
-                  self->nfsInvalidateCacheEntryForGC(*contents);
+  invalidationExecutor = getMount()->getInodeGCInvalidationExecutor();
 #endif
-              numInvalidated++;
-              isThisTreeInvalidated = true;
-            }
-          }
-        }
+  auto decide =
+      [self = inodePtrFromThis(),
+       cutoff,
+       cancellationToken,
+       pinnedInodes = std::move(pinnedInodes),
+       invalidationExecutor](
+          const std::vector<std::pair<InodeNumber, NfsGcResult>>& childResults)
+      -> NfsGcStep {
+    NfsGcStep step;
+    step.containsPin = pinnedInodes && pinnedInodes->count(self->getNodeId());
+    // Check for cancellation before processing results
+    if (shouldCancelGC(cancellationToken)) {
+      step.containsPin = true;
+      return step;
+    }
 
-        return std::make_pair(numInvalidated, isThisTreeInvalidated);
-      })
-      .thenTry(
-          [self = inodePtrFromThis(),
-           cancellationToken](folly::Try<std::pair<uint64_t, bool>>&& result)
-              -> ImmediateFuture<std::pair<uint64_t, bool>> {
-            // Check for cancellation before waiting for invalidation to
-            // complete
-            if (shouldCancelGC(cancellationToken)) {
-              return std::make_pair(uint64_t{0}, false);
-            }
-            auto* nfsdChannel = self->getMount()->getNfsdChannel();
-            if (nfsdChannel) {
-              return nfsdChannel->completeInvalidations().thenTry(
-                  [result = std::move(result)](auto&&) mutable {
-                    return std::move(result);
-                  });
-            } else {
-              return std::move(result);
-            }
-          });
+    bool allDescendantsInvalidated = true;
+    folly::F14FastSet<InodeNumber> pinnedChildren;
+    for (const auto& [childIno, childResult] : childResults) {
+      step.numInvalidated += childResult.numInvalidated;
+      if (!childResult.invalidated) {
+        allDescendantsInvalidated = false;
+      }
+      if (childResult.containsPin) {
+        step.containsPin = true;
+        pinnedChildren.insert(childIno);
+      }
+    }
+
+    if (!self->getPath().has_value()) {
+      // This directory was removed, no need to do anything.
+      step.invalidated = true;
+      return step;
+    }
+
+    auto contents = self->lockContentsWrite();
+    if (pinnedInodes && !step.containsPin) {
+      // Pinned directories reported themselves above; pinned files are
+      // only visible here.
+      for (auto& entry : contents->entries.all()) {
+        if (!entry.second.isDirectory() &&
+            pinnedInodes->count(entry.second.getInodeNumber())) {
+          step.containsPin = true;
+          break;
+        }
+      }
+    }
+    if (!allDescendantsInvalidated) {
+      // If any of the children are not invalidated, we should skip
+      // invalidation of this directory.
+      return step;
+    }
+    // A materialized directory is reclaimed like any other: its state is in
+    // the overlay, so an unloaded child reloads from there, as on FUSE.
+
+    // if cutoff is max, we should invalidate everything, so we don't
+    // need to check the last fs request time
+    bool shouldInvalidate =
+        (cutoff == std::chrono::system_clock::time_point::max());
+    if (!shouldInvalidate) {
+      auto lastFsRequestTime = std::chrono::system_clock::from_time_t(
+          self->getLastFsRequestTime().toTimespec().tv_sec);
+      // As we didn't update parent's last fs request time when children
+      // are accessed via the fs channel dispatcher, we need to check
+      // the children's last fs request time here.
+      for (auto& entry : contents->entries.all()) {
+        auto* entryInode = entry.second.getInode();
+        if (!entryInode) {
+          continue;
+        }
+        auto childLastFsRequestTime = std::chrono::system_clock::from_time_t(
+            entryInode->getLastFsRequestTime().toTimespec().tv_sec);
+        if (lastFsRequestTime < childLastFsRequestTime) {
+          lastFsRequestTime = childLastFsRequestTime;
+        }
+      }
+      shouldInvalidate = (lastFsRequestTime < cutoff);
+      XLOGF(
+          DBG9,
+          "For path: {}, last fs request time: {}, cutoff: {}, shouldInvalidate by GC is {}",
+          self->getPath().value().asString(),
+          self->getLastFsRequestTime().toTimespec().tv_sec,
+          cutoff.time_since_epoch().count(),
+          shouldInvalidate);
+    }
+    if (!shouldInvalidate) {
+      return step;
+    }
+
+    // Attempt to invalidate the directory, and then clear the FS
+    // references of all of its children. The call order here is
+    // recursively bottom-up. The directory itself is cleared later by its
+    // parent's invalidation.
+
+    // Check for cancellation before invalidation
+    if (shouldCancelGC(cancellationToken)) {
+      step.numInvalidated = 0;
+      return step;
+    }
+
+    // The invalidation exists to clear the children's FS references. A
+    // child that is neither loaded nor remembered has none, and a
+    // directory child is left alone without pin information, so when
+    // no child would be cleared the chmod would do nothing. Skip it, but
+    // let the parent proceed as if this directory had been invalidated
+    // so it can clear this directory's own reference.
+    auto* inodeMap = self->getInodeMap();
+    bool anyChildReferenced = false;
+    for (auto& entry : contents->entries.all()) {
+      if (!nfsGcMayClearChild(entry.second, pinnedInodes, pinnedChildren)) {
+        continue;
+      }
+      if (entry.second.getInode() ||
+          inodeMap->isInodeRemembered(entry.second.getInodeNumber())) {
+        anyChildReferenced = true;
+        break;
+      }
+    }
+    if (!anyChildReferenced) {
+      step.invalidated = true;
+      return step;
+    }
+#ifndef _WIN32
+    auto prepared = self->nfsPrepareGcInvalidation(
+        *contents, pinnedInodes, std::move(pinnedChildren));
+    if (!prepared) {
+      return step;
+    }
+    // Queue with the contents lock released: the channel bounds how many
+    // GC invalidations may be queued at once, so this may wait.
+    contents.unlock();
+    auto* channel = self->getMount()->getNfsdChannel();
+    if (!channel) {
+      return step;
+    }
+    const auto maxQueued = self->getMount()
+                               ->getEdenConfig()
+                               ->nfsMaxQueuedGcInvalidations.getValue();
+    if (auto done = channel->invalidateWithQueueLimit(
+            std::move(prepared->path),
+            prepared->mode,
+            std::move(prepared->forget),
+            std::move(prepared->lineage),
+            maxQueued,
+            cancellationToken)) {
+      step.done = std::move(done);
+    }
+#endif
+    return step;
+  };
+
+#ifndef _WIN32
+  ImmediateFuture<NfsGcStep> stepFuture =
+      std::move(childResults)
+          .semi()
+          .via(folly::getKeepAliveToken(invalidationExecutor.get()))
+          .thenValue(std::move(decide));
+#else
+  ImmediateFuture<NfsGcStep> stepFuture =
+      std::move(childResults).thenValue(std::move(decide));
+#endif
+
+  return std::move(stepFuture)
+      .thenValue([](NfsGcStep&& step) -> ImmediateFuture<NfsGcResult> {
+        NfsGcResult result{
+            step.numInvalidated, step.invalidated, step.containsPin};
+        if (!step.done) {
+          return result;
+        }
+        // Wait for this directory's own chmod rather than for the whole
+        // queue to drain, so chmods of unrelated directories can be in
+        // flight at once when the channel has several invalidation threads.
+        // A cancelled walk waits too: the chmod was accepted, its forget
+        // callback holds inode references, and the SETATTR it turns into
+        // needs the channel to still be serving.
+        // The directory counts as invalidated only if its chmod reached
+        // EdenFS and the children were cleared, and it contributes the
+        // number of children whose FS reference was cleared, matching what
+        // the FUSE pass counts. A broken future means the channel stopped
+        // first.
+        return ImmediateFuture<std::optional<uint64_t>>{std::move(*step.done)}
+            .thenTry([result](folly::Try<std::optional<uint64_t>>&& cleared) {
+              auto finished = result;
+              if (cleared.hasException()) {
+                // The channel stopped first, or forget threw.
+                XLOGF(
+                    WARN,
+                    "NFS GC invalidation did not complete: {}",
+                    cleared.exception().what());
+              }
+              if (cleared.hasValue() && cleared->has_value()) {
+                finished.numInvalidated += **cleared;
+                finished.invalidated = true;
+              } else {
+                finished.invalidated = false;
+              }
+              return finished;
+            });
+      });
 }
 
 ImmediateFuture<uint64_t /* numInvalidated */>

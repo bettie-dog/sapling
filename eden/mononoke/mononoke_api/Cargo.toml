@@ -49,7 +49,7 @@ derived_data = { version = "0.1.0", path = "../derived_data" }
 derived_data_manager = { version = "0.1.0", path = "../derived_data/manager" }
 diff = { version = "0.1.0", path = "../features/diff" }
 directory_branch_cluster_manifest = { version = "0.1.0", path = "../derived_data/directory_branch_cluster_manifest" }
-either = "1.17.0"
+either = "1.18.0"
 enabled_derived_data_types = { version = "0.1.0", path = "../repo_attributes/enabled_derived_data_types" }
 ephemeral_blobstore = { version = "0.1.0", path = "../blobstore/ephemeral_blobstore" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
@@ -114,7 +114,7 @@ sapling-xdiff = { version = "0.1.0", path = "../../scm/lib/xdiff" }
 scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
 skeleton_manifest = { version = "0.1.0", path = "../derived_data/skeleton_manifest" }
 skeleton_manifest_v2 = { version = "0.1.0", path = "../derived_data/skeleton_manifest_v2" }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../repo_attributes/commit_graph/sql_commit_graph_storage" }
 sql_query_config = { version = "0.1.0", path = "../repo_attributes/sql_query_config" }

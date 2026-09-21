@@ -16,6 +16,8 @@
 #include <folly/Synchronized.h>
 #include <folly/container/F14Set.h>
 #include <folly/coro/safe/NowTask.h>
+#include <folly/small_vector.h>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -89,6 +91,67 @@ struct TreeInodeState {
    * treeId will be none.
    */
   std::optional<ObjectId> treeId;
+};
+
+enum class NfsInvalidationSource : uint8_t;
+
+/**
+ * What one directory reports to its parent from the NFS GC walk.
+ */
+struct NfsGcResult {
+  uint64_t numInvalidated{0};
+  /** Whether this directory and all of its descendants were invalidated. */
+  bool invalidated{false};
+  /**
+   * Whether this directory or something below it is pinned, in which case
+   * the parent must keep this directory's FS reference.
+   */
+  bool containsPin{false};
+};
+
+/**
+ * A directory invalidation that GC has prepared under the directory's
+ * contents lock and still has to queue on the NFS channel. Queuing may wait
+ * for queue capacity, so it happens with the lock released.
+ */
+struct NfsGcPreparedInvalidation {
+  AbsolutePath path;
+  mode_t mode;
+  /**
+   * Clears the FS references of the directory's children. Runs when the
+   * chmod reaches EdenFS as a SETATTR, right before the stale reply that
+   * makes the client forget the directory's names; see
+   * Nfsd3::invalidateWithQueueLimit.
+   */
+  folly::Function<uint64_t()> forget;
+  /** The directory and its ancestors, see Nfsd3::invalidateWithQueueLimit. */
+  std::vector<InodeNumber> lineage;
+};
+
+/**
+ * The entries of a directory in inode-number order, which is the order
+ * readdir lists them in. Restricted entries are indexed like any other: a
+ * permission grant makes one visible without mutating the map, so whether an
+ * entry is listed has to be decided when it is emitted rather than here.
+ * TreeInode::readdirImpl shares one index between the requests of a listing;
+ * see there for when it is trusted and dropped.
+ */
+struct ReaddirIndex {
+  /**
+   * entries.mutationCount() when the index was built. The index is used only
+   * while the count is unchanged, which guarantees the entry pointers are
+   * still valid.
+   */
+  uint64_t mutationCount;
+  /** Only entries whose offset follows this one are indexed. */
+  off_t minOffset;
+  /**
+   * Inline storage covers a directory of ordinary size, so a listing that
+   * fits in one request allocates nothing.
+   */
+  folly::
+      small_vector<std::pair<InodeNumber, const DirContents::value_type*>, 16>
+          entries;
 };
 
 /**
@@ -423,8 +486,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const RenameLock& renameLock);
 
   /**
-   * For unloaded nodes, the removal should be simpler: remove the node
-   * from entries and update the overlay.
+   * For unloaded nodes, the removal should be simpler: materialize this
+   * directory, remove the node from entries, update the overlay and record
+   * the removal in the journal.
    * If the return value is valid, the entry was not removed, and the child's
    * loaded inode was returned.
    */
@@ -599,6 +663,12 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   size_t unloadChildrenNow();
 
   /**
+   * Drop the readdir index of a listing that never reached its end, so that
+   * inode GC bounds how long it is held. See readdirImpl.
+   */
+  void dropReaddirIndex();
+
+  /**
    * Unload all children, recursively, neither referenced internally by Eden
    * nor by FUSE or ProjectedFS.
    *
@@ -648,6 +718,14 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * ancestors are protected by propagating a contains-pin flag up the
    * bottom-up traversal. When it is null, pin information is unavailable
    * and all directory entries are skipped.
+   *
+   * NFS GC clears FS references itself, so forgetting a directory that is
+   * some process's working directory, or a file some process holds open,
+   * makes every request that process sends with the handle fail with
+   * ESTALE. It therefore applies the same rule: pinned inodes and the
+   * directories above them keep their references, and without pin
+   * information (null) it leaves all directories referenced and reclaims
+   * files only. Unlike FUSE, NFS pins may be files.
    */
   ImmediateFuture<uint64_t /* numInvalidated */>
   handleChildrenNotAccessedRecently(
@@ -826,23 +904,23 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool async);
 
   /**
-   * Invalidate old non-materialized children's recursively.
+   * Invalidate old children recursively, materialized or not.
    *
    * File inodes touched before the passed in cutoff will be invalidated. Tree
    * inodes will also be invalidated if all of their children's have been
    * invalidated.
    *
-   * Returns the number of tree inodes invalidated underneath this tree (for
-   * logging purposes) and if this inode and all of its descendants were
-   * invalidated (for use as an unloading parameter)
+   * Returns the number of inodes whose FS reference was cleared underneath
+   * this tree, whether this inode and all of its descendants were
+   * invalidated, and whether the subtree contains a pinned inode; see
+   * NfsGcResult.
    */
-  ImmediateFuture<std::pair<
-      uint64_t /* numInvalidated */,
-      bool /* allDescendantsInvalidated */>>
-  invalidateChildrenNotMaterializedNFS(
+  ImmediateFuture<NfsGcResult> invalidateChildrenNotMaterializedNFS(
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
-      folly::CancellationToken cancellationToken = {});
+      folly::CancellationToken cancellationToken = {},
+      std::shared_ptr<const folly::F14FastSet<InodeNumber>> pinnedInodes =
+          nullptr);
 
   ImmediateFuture<uint64_t /* numInvalidated */>
   invalidateChildrenNotMaterializedPrjFS(
@@ -1356,14 +1434,39 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
 #ifndef _WIN32
   /**
-   * Sends a request to the kernel to invalidate its cache for this tree and
-   * then deletes all its children's inode. In NFS, this function is distinct
-   * from `invalidateChannelEntryCache` and is used exclusively for garbage
-   * collection because inodes need to be deleted after invalidation during NFS
-   * garbage collection.
+   * Prepare the NFS invalidation of this directory for GC: the chmod that
+   * makes the client forget the directory's names, and the callback that,
+   * as it does, clears the FS references of the directory's children so the
+   * GC sweep can unload them. Pinned children, directory children whose
+   * subtree contains a pin (pinnedChildren), and, without pin information,
+   * all directory children keep their reference; see
+   * handleChildrenNotAccessedRecently. The contents lock must be held; the
+   * caller queues the result once it has released the lock.
+   *
+   * Returns nullopt if the mount has no NFS channel or this directory has
+   * been unlinked.
    */
-  [[nodiscard]] folly::Try<folly::Unit> nfsInvalidateCacheEntryForGC(
-      TreeInodeState& state);
+  std::optional<NfsGcPreparedInvalidation> nfsPrepareGcInvalidation(
+      TreeInodeState& state,
+      const std::shared_ptr<const folly::F14FastSet<InodeNumber>>& pinnedInodes,
+      folly::F14FastSet<InodeNumber> pinnedChildren);
+
+  /**
+   * The path and mode for the chmod that makes the NFS client flush its
+   * cache for this directory. The contents lock must be held. Returns
+   * nullopt if the mount has no NFS channel or this directory has been
+   * unlinked.
+   */
+  std::optional<std::pair<AbsolutePath, mode_t>>
+  nfsPrepareDirInvalidationLocked(TreeInodeState& state);
+
+  /**
+   * Queue the chmod prepared by nfsPrepareDirInvalidationLocked(). Returns
+   * false, without doing anything, if there was nothing to prepare.
+   */
+  bool nfsInvalidateDirCacheLocked(
+      TreeInodeState& state,
+      std::optional<NfsInvalidationSource> source = std::nullopt);
 #endif
 
   /**
@@ -1484,6 +1587,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * Only prefetch children aux data once.
    */
   std::atomic<PrefetchState> prefetchState_{NeverEnumerated};
+
+  /**
+   * Index shared by the requests of a listing in flight; see readdirImpl.
+   * Its lock is held only to copy or replace the pointer, so readdir never
+   * needs the contents write lock.
+   */
+  folly::Synchronized<std::shared_ptr<const ReaddirIndex>> readdirIndex_;
 
   /**
    * This number is not guaranteed to be completely accurate as it is modified

@@ -80,6 +80,10 @@ pub use crate::bookmark::BookmarkRequest;
 pub use crate::bookmark::BookmarkResult;
 pub use crate::bookmark::ListBookmarkPatternsRequest;
 pub use crate::bookmark::ListBookmarkPatternsResponse;
+pub use crate::bookmark::MirrorBookmarkMove;
+pub use crate::bookmark::MirrorBookmarkUpdateReason;
+pub use crate::bookmark::ReplayIdenticalMovesRequest;
+pub use crate::bookmark::ReplayIdenticalMovesResponse;
 pub use crate::bookmark::SetBookmarkRequest;
 pub use crate::bookmark::SetBookmarkResponse;
 pub use crate::cloud::CloudShareWorkspaceRequest;
@@ -162,6 +166,7 @@ pub use crate::commitid::BonsaiChangesetId;
 pub use crate::commitid::CommitId;
 pub use crate::commitid::CommitIdScheme;
 pub use crate::commitid::GitSha1;
+pub use crate::errors::CODE_BOOKMARK_MOVE_ALREADY_PROCESSED;
 pub use crate::errors::ServerError;
 pub use crate::file::FileAttributes;
 pub use crate::file::FileAuxData;
@@ -291,12 +296,15 @@ pub enum SaplingRemoteApiServerErrorKind {
     #[error("SaplingRemoteAPI server returned an error with message: {0}")]
     OpaqueError(String),
     #[error(
-        "Unauthorized access to manifest under restricted path: {tree_id}. Request access via ACL {request_acl}."
+        "Unauthorized access to manifest under restricted path: {tree_id}. Request access via ACL {request_acl}.{}",
+        .denial_message.as_deref().map_or_else(String::new, |message| format!("\n{message}"))
     )]
     PermissionDenied {
         /// ID of the tree to which the user does not have access.
         tree_id: HgId,
         /// ACL to direct users for access requests.
         request_acl: String,
+        /// Repo-configured text to show with the denial, if any.
+        denial_message: Option<String>,
     },
 }

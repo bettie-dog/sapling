@@ -10,7 +10,6 @@
 #include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/telemetry/EdenStats.h"
 
-#include <signal.h>
 #include <unistd.h>
 #include <system_error>
 
@@ -40,6 +39,7 @@ struct Int {
 
   int value;
 };
+
 } // namespace
 
 TEST_F(InodeTableTest, persists_record) {
@@ -176,8 +176,27 @@ TEST_F(InodeTableTest, setDefault) {
   EXPECT_EQ(14, inodeTable->setDefault(1_ino, 16));
 }
 
+TEST_F(InodeTableTest, modifyOrThrowDoesNotWriteWhenCallbackThrows) {
+  auto inodeTable = InodeTable<Int>::open(tablePath, makeRefPtr<EdenStats>());
+  inodeTable->set(1_ino, 14);
+
+  EXPECT_THROW(
+      inodeTable->modifyOrThrow(
+          1_ino,
+          [](auto& value) {
+            value = 16;
+            throw std::runtime_error{"test error"};
+          }),
+      std::runtime_error);
+  EXPECT_EQ(14, inodeTable->getOrThrow(1_ino));
+}
+
 #if defined(__linux__) && defined(MADV_POPULATE_WRITE)
 TEST_F(InodeTableTest, modifyOrThrowHandlesUnavailableBackingPage) {
+  if (!sigbus_is_protected()) {
+    GTEST_SKIP() << "SIGBUS protection is unavailable";
+  }
+
   auto pageSize = sysconf(_SC_PAGESIZE);
   ASSERT_GT(pageSize, 0);
 
@@ -188,7 +207,10 @@ TEST_F(InodeTableTest, modifyOrThrowHandlesUnavailableBackingPage) {
       (targetInodeNumber - 1) * sizeof(InodeTable<Int>::Entry), truncatedSize);
   const auto targetInode = InodeNumber{targetInodeNumber};
 
-  auto inodeTable = InodeTable<Int>::open(tablePath, makeRefPtr<EdenStats>());
+  MappedDiskVectorOptions options;
+  options.useSigbusProtection = true;
+  auto inodeTable =
+      InodeTable<Int>::open(tablePath, makeRefPtr<EdenStats>(), options);
   for (uint64_t ino = 1; ino <= targetInodeNumber; ++ino) {
     inodeTable->set(InodeNumber{ino}, static_cast<int>(ino));
   }
@@ -197,14 +219,16 @@ TEST_F(InodeTableTest, modifyOrThrowHandlesUnavailableBackingPage) {
 
   EXPECT_EXIT(
       {
-        signal(SIGBUS, SIG_DFL);
+        if (sigbus_install_handler() != 0) {
+          _exit(1);
+        }
         try {
           inodeTable->modifyOrThrow(
               targetInode, [targetInodeNumber](auto& value) {
                 value = static_cast<int>(targetInodeNumber + 1);
               });
           _exit(2);
-        } catch (const std::system_error&) {
+        } catch (const std::runtime_error&) {
           _exit(0);
         }
       },
@@ -213,6 +237,10 @@ TEST_F(InodeTableTest, modifyOrThrowHandlesUnavailableBackingPage) {
 }
 
 TEST_F(InodeTableTest, freeInodeHandlesUnavailableBackingPage) {
+  if (!sigbus_is_protected()) {
+    GTEST_SKIP() << "SIGBUS protection is unavailable";
+  }
+
   auto pageSize = sysconf(_SC_PAGESIZE);
   ASSERT_GT(pageSize, 0);
 
@@ -222,7 +250,10 @@ TEST_F(InodeTableTest, freeInodeHandlesUnavailableBackingPage) {
   ASSERT_GT(
       (targetInodeNumber - 1) * sizeof(InodeTable<Int>::Entry), truncatedSize);
 
-  auto inodeTable = InodeTable<Int>::open(tablePath, makeRefPtr<EdenStats>());
+  MappedDiskVectorOptions options;
+  options.useSigbusProtection = true;
+  auto inodeTable =
+      InodeTable<Int>::open(tablePath, makeRefPtr<EdenStats>(), options);
   for (uint64_t ino = 1; ino <= targetInodeNumber; ++ino) {
     inodeTable->set(InodeNumber{ino}, static_cast<int>(ino));
   }
@@ -231,11 +262,13 @@ TEST_F(InodeTableTest, freeInodeHandlesUnavailableBackingPage) {
 
   EXPECT_EXIT(
       {
-        signal(SIGBUS, SIG_DFL);
+        if (sigbus_install_handler() != 0) {
+          _exit(1);
+        }
         try {
           inodeTable->freeInode(1_ino);
           _exit(2);
-        } catch (const std::system_error&) {
+        } catch (const std::runtime_error&) {
           _exit(0);
         }
       },

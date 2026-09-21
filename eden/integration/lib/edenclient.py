@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+from __future__ import annotations
 
 import json
 import logging
@@ -18,14 +18,26 @@ import sys
 import tempfile
 import threading
 import time
+import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast, Dict, Generator, List, Optional, TextIO, Tuple, Union
+from typing import (
+    Any,
+    cast,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    TextIO,
+    Tuple,
+    Union,
+)
 
-from eden.fs.cli import util
+from eden.fs.cli import proc_utils as proc_utils_mod, util
 from eden.fs.service.eden.thrift_clients import EdenService
-from eden.fs.service.eden.thrift_types import MountState
+from eden.fs.service.eden.thrift_types import MountInfo, MountState
 from eden.thrift import client
 from fb303_core.thrift_types import fb303_status
 
@@ -35,6 +47,70 @@ from .find_executables import FindExe
 # and many-core machines under load.
 EDENFS_START_TIMEOUT = 120
 EDENFS_STOP_TIMEOUT = 240
+
+
+def require_io_uring_kernel() -> None:
+    release = os.uname().release if sys.platform == "linux" else ""
+    # The FUSE io_uring ABI is kernel-specific; extend this allowlist
+    # when another fbk release is validated.
+    if "fbk" not in release or not release.startswith(("6.13.", "6.16.")):
+        raise unittest.SkipTest("requires an fbk 6.13 or 6.16 FUSE io_uring kernel")
+
+
+def fuse_transport_config(use_io_uring: bool) -> list[str]:
+    settings = [f"use-io-uring = {'true' if use_io_uring else 'false'}"]
+    if use_io_uring:
+        settings.append('io-uring-kernel-release-regex = ".*"')
+        # Allocate queues before replying to INIT to allow devfuse fallback.
+        settings.append("io-uring-pre-create-queues = true")
+    return settings
+
+
+def assert_fuse_transport(
+    mount_point: bytes, expected: str, actual: str | None
+) -> None:
+    if actual == expected:
+        return
+    message = (
+        f"FUSE transport for {os.fsdecode(mount_point)}: "
+        f"expected {expected!r}, got {actual!r}"
+    )
+    if expected == "io_uring" and actual == "devfuse":
+        raise unittest.SkipTest(
+            f"{message}; io_uring unavailable, using devfuse fallback"
+        )
+    raise AssertionError(message)
+
+
+def assert_fuse_transports(mounts: Iterable[MountInfo], expected: str) -> None:
+    fallbacks = []
+    for mount in mounts:
+        if mount.state != MountState.RUNNING or mount.fsChannelType != "fuse":
+            continue
+        try:
+            assert_fuse_transport(mount.mountPoint, expected, mount.fuseTransport)
+        except unittest.SkipTest as ex:
+            fallbacks.append(str(ex))
+    if fallbacks:
+        raise unittest.SkipTest("; ".join(fallbacks))
+
+
+def is_process_running(pid: Optional[int]) -> bool:
+    if pid is None:
+        return False
+
+    if sys.platform.startswith("linux"):
+        try:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+            state = stat.rsplit(")", 1)[1].strip().split()[0]
+            if state == "Z":
+                return False
+        except FileNotFoundError:
+            return False
+        except (IndexError, OSError):
+            pass
+
+    return proc_utils_mod.new().is_process_alive(pid)
 
 
 class EdenFS:
@@ -53,6 +129,7 @@ class EdenFS:
         logging_settings: Optional[Dict[str, str]] = None,
         extra_args: Optional[List[str]] = None,
         storage_engine: str = "memory",
+        expected_fuse_transport: Optional[str] = None,
     ) -> None:
         """
         Construct a new EdenFS object.
@@ -94,6 +171,7 @@ class EdenFS:
         self._storage_engine = storage_engine
         self._logging_settings = logging_settings
         self._extra_args = extra_args
+        self.expected_fuse_transport = expected_fuse_transport
 
         self._process: Optional[subprocess.Popen] = None
 
@@ -160,6 +238,15 @@ class EdenFS:
         if process is None or process.returncode is not None:
             return
         self.shutdown(retry=retry)
+
+    def wait_for_exit(self, timeout: float = EDENFS_STOP_TIMEOUT) -> int:
+        process = self._process
+        assert process is not None
+
+        return_code = process.wait(timeout=timeout)
+        self.report_time(f"Eden process exited with return code {return_code}")
+        self._process = None
+        return return_code
 
     def kill_dirty(self) -> None:
         """Kills privhelper and this instance directly, without waiting for cleanup.
@@ -257,6 +344,8 @@ class EdenFS:
             # Re-raise our own exception type so we can include the error
             # output.
             raise EdenCommandError(ex) from None
+        if config_dir and command in ("clone", "mount", "restart"):
+            self.assert_running_fuse_transports()
         return completed_process.stdout
 
     def run_unchecked(
@@ -317,6 +406,7 @@ class EdenFS:
             get_client=self.get_thrift_client,
             timeout=timeout,
         )
+        self.assert_running_fuse_transports()
         return health.is_healthy()
 
     def start(
@@ -368,6 +458,9 @@ class EdenFS:
                 timeout=timeout,
                 exclude_pid=takeover_from,
             )
+            # Takeover verification happens outside graceful_restart's rollback.
+            if takeover_from is None:
+                self.assert_running_fuse_transports()
 
     def get_extra_daemon_args(self) -> List[str]:
         extra_daemon_args: List[str] = [
@@ -492,6 +585,26 @@ class EdenFS:
 
         self._process = process
 
+    def _kill_after_shutdown_timeout(
+        self, process: subprocess.Popen, daemon_pid: Optional[int]
+    ) -> Tuple[int, bool]:
+        if daemon_pid is not None and not is_process_running(daemon_pid):
+            self.report_time(
+                "Eden daemon exited; killing stale edenfsctl daemon wrapper"
+            )
+            process.kill()
+            return_code = process.wait(timeout=10)
+            self.report_time(
+                f"Stale edenfsctl daemon wrapper exited with return code {return_code}"
+            )
+            return return_code, True
+
+        if can_run_sudo() and daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGKILL)
+        else:
+            process.kill()
+        return process.wait(timeout=10), False
+
     def shutdown(self, retry=False) -> None:
         """
         Run "eden shutdown" to stop the eden daemon.
@@ -515,6 +628,8 @@ class EdenFS:
             # to prevent overall test timeouts.
             timeout = 10
 
+        stale_wrapper = False
+
         # Run "edenfsctl stop" with a timeout of 0 to tell it not to wait for the EdenFS
         # process to exit.  Since we are running it directly (self._process) we will
         # need to wait on it.  Depending on exactly how it is being run the process may
@@ -533,12 +648,10 @@ class EdenFS:
         except subprocess.TimeoutExpired:
             # EdenFS did not exit normally on its own.
             self.report_time("Eden stop timed out, killing process")
-            if can_run_sudo() and daemon_pid is not None:
-                os.kill(daemon_pid, signal.SIGKILL)
-            else:
-                process.kill()
-            return_code = process.wait(timeout=10)
-            if not retry:
+            return_code, stale_wrapper = self._kill_after_shutdown_timeout(
+                process, daemon_pid
+            )
+            if not retry and not stale_wrapper:
                 raise Exception(
                     f"edenfs did not shutdown within {timeout} seconds; "
                     "had to send SIGKILL"
@@ -567,7 +680,9 @@ class EdenFS:
         finally:
             self._process = None
 
-        if return_code != 0 and not retry:
+        # A stale wrapper is intentionally killed after the daemon has exited,
+        # so its signal exit status does not indicate a daemon shutdown failure.
+        if return_code != 0 and not retry and not stale_wrapper:
             raise Exception(
                 "eden exited unsuccessfully with status {}".format(return_code)
             )
@@ -633,6 +748,8 @@ class EdenFS:
                 raise Exception(
                     "eden exited unsuccessfully with status {}".format(return_code)
                 )
+        if should_wait_for_new:
+            self.assert_running_fuse_transports()
         return old_process
 
     def run_takeover_tool(self, cmd: List[str]) -> None:
@@ -723,6 +840,20 @@ class EdenFS:
 
         return results
 
+    def assert_running_fuse_transports(self) -> None:
+        """Verify the configured transport expectation for every running FUSE mount.
+
+        Mounts that are still initializing, failed, or unmounted are not checked.
+        With no expectation configured, this does not contact the daemon.
+        Successful devfuse fallback skips io_uring tests; other mismatches fail.
+        A fallback on one mount does not hide a mismatch on another mount.
+        """
+        expected = self.expected_fuse_transport
+        if expected is None:
+            return
+        with self.get_thrift_client(timeout=EDENFS_START_TIMEOUT) as thrift_client:
+            assert_fuse_transports(thrift_client.listMounts(), expected)
+
     def get_mount_state(
         self, mount: pathlib.Path, client: Optional[EdenService.Sync] = None
     ) -> Optional[MountState]:
@@ -741,6 +872,16 @@ class EdenFS:
                 if entry_path == mount:
                     return MountState(entry.state)
             return None
+
+    def wait_for_checkout_removed(
+        self, mount: Union[str, os.PathLike], timeout: float = 60
+    ) -> None:
+        mount_path = pathlib.Path(mount)
+
+        def checkout_removed() -> Optional[bool]:
+            return True if self.get_mount_state(mount_path) is None else None
+
+        util.poll_until(checkout_removed, timeout=timeout)
 
     async def get_mount_state_async(
         self, mount: pathlib.Path, client: Optional[EdenService.Async] = None
@@ -853,6 +994,10 @@ class EdenFS:
 
     def unmount(self, mount_path: pathlib.Path) -> None:
         self.run_cmd("unmount", "--", str(mount_path))
+
+    async def unmount_async(self, mount_path: pathlib.Path) -> None:
+        async with self.get_async_thrift_client() as client:
+            await client.unmount(os.fsencode(mount_path))
 
 
 class EdenCommandError(subprocess.CalledProcessError):

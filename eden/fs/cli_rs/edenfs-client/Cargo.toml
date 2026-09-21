@@ -12,7 +12,7 @@ anyhow = "1.0.104"
 async-recursion = "1.1.1"
 async-trait = "0.1.92"
 byteorder = "1.5"
-dirs = "6.0"
+dirs = "7.0"
 dunce = "1.0.5"
 edenfs-config = { version = "0.1.0", path = "../edenfs-config" }
 edenfs-error = { version = "0.1.0", path = "../edenfs-error" }
@@ -40,9 +40,9 @@ subprocess = "0.2.15"
 sysinfo = "0.39.6"
 thrift_streaming_clients = { version = "0.1.0", path = "../../service/thrift_streaming/clients" }
 tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
-toml = { version = "1.1.4", features = ["preserve_order"] }
+toml = { version = "1.1.6", features = ["preserve_order"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-uuid = { version = "1.24.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 whoami = "2.1.3"
 
 [dev-dependencies]

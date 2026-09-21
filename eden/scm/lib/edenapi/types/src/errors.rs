@@ -31,10 +31,18 @@ use thiserror::Error;
 ///    situation.
 /// 2: HexError
 ///    Failed to convert hex to binary hash.
+/// 3: BookmarkMoveAlreadyProcessed
+///    A modern_sync mirror bookmark move to a `*_shadow` replica was already
+///    applied (a lost-ack replay). The replica is in the wanted state, so the
+///    client advances its checkpoint instead of retrying the move.
 pub struct ServerError {
     pub message: String,
     pub code: u64,
 }
+
+/// Error code for a modern_sync mirror bookmark move that the replica already
+/// applied. See the `ServerError` error code list.
+pub const CODE_BOOKMARK_MOVE_ALREADY_PROCESSED: u64 = 3;
 
 impl ServerError {
     pub fn new<M: Into<String>>(m: M, code: u64) -> Self {
@@ -55,15 +63,28 @@ impl From<types::hash::HexError> for ServerError {
     }
 }
 
-pub fn find_permission_denied(err: &anyhow::Error) -> Option<(crate::HgId, Option<String>)> {
+/// Manifest permission-denied details found in an error chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionDeniedInfo {
+    pub tree_id: crate::HgId,
+    pub request_acl: String,
+    pub denial_message: Option<String>,
+}
+
+pub fn find_permission_denied(err: &anyhow::Error) -> Option<PermissionDeniedInfo> {
     for err in err.chain() {
         if let Some(slapi_err) = err.downcast_ref::<crate::SaplingRemoteApiServerError>() {
             if let crate::SaplingRemoteApiServerErrorKind::PermissionDenied {
                 tree_id,
                 request_acl,
+                denial_message,
             } = &slapi_err.err
             {
-                return Some((*tree_id, Some(request_acl.clone())));
+                return Some(PermissionDeniedInfo {
+                    tree_id: *tree_id,
+                    request_acl: request_acl.clone(),
+                    denial_message: denial_message.clone(),
+                });
             }
         }
     }

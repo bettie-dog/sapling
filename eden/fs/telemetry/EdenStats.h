@@ -33,6 +33,7 @@ struct PrjfsStats;
 struct ObjectStoreStats;
 struct SaplingBackingStoreStats;
 struct JournalStats;
+struct GlobStats;
 struct ThriftStats;
 struct OverlayStats;
 struct InodeMapStats;
@@ -42,6 +43,7 @@ struct TreeCacheStats;
 struct ScmStatusCacheStats;
 struct TakeoverStats;
 struct CheckoutStats;
+struct TreeInodeStats;
 struct FakeStats;
 
 class EdenStats : public RefCounted {
@@ -89,6 +91,7 @@ class EdenStats : public RefCounted {
   ThreadLocal<ObjectStoreStats> objectStoreStats_;
   ThreadLocal<SaplingBackingStoreStats> saplingBackingStoreStats_;
   ThreadLocal<JournalStats> journalStats_;
+  ThreadLocal<GlobStats> globStats_;
   ThreadLocal<ThriftStats> thriftStats_;
   ThreadLocal<TelemetryStats> telemetryStats_;
   ThreadLocal<OverlayStats> overlayStats_;
@@ -99,6 +102,7 @@ class EdenStats : public RefCounted {
   ThreadLocal<ScmStatusCacheStats> scmStatusCacheStats_;
   ThreadLocal<TakeoverStats> takeoverStats_;
   ThreadLocal<CheckoutStats> checkoutStats_;
+  ThreadLocal<TreeInodeStats> treeInodeStats_;
   ThreadLocal<FakeStats> fakeStats_;
 };
 
@@ -134,6 +138,11 @@ EdenStats::getStatsForCurrentThread<SaplingBackingStoreStats>() {
 template <>
 inline JournalStats& EdenStats::getStatsForCurrentThread<JournalStats>() {
   return *journalStats_.get();
+}
+
+template <>
+inline GlobStats& EdenStats::getStatsForCurrentThread<GlobStats>() {
+  return *globStats_.get();
 }
 
 template <>
@@ -186,6 +195,11 @@ inline TakeoverStats& EdenStats::getStatsForCurrentThread<TakeoverStats>() {
 template <>
 inline CheckoutStats& EdenStats::getStatsForCurrentThread<CheckoutStats>() {
   return *checkoutStats_.get();
+}
+
+template <>
+inline TreeInodeStats& EdenStats::getStatsForCurrentThread<TreeInodeStats>() {
+  return *treeInodeStats_.get();
 }
 
 template <>
@@ -399,7 +413,9 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsInflightAtRequest{"nfs.inflight_at_request"};
 
   // Requests rejected by a "block" or over-budget "rate_limit" entry in
-  // nfs:uid-access-modes / nfs:gid-access-modes.
+  // nfs:uid-access-policy / nfs:gid-access-policy.
+  // nfs.{access,policed,blocked}.{uid,gid}.<id> take their id from config, so
+  // they are fb303 dynamic timeseries declared in Nfsd3.cpp, not members here.
   Counter nfsBlockedAccess{"nfs.blocked_access"};
 
   // NFS GC invalidation counters
@@ -407,6 +423,7 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsInvalidationGcSuccess{"nfs.invalidation.gc.success"};
   Counter nfsInvalidationGcFailure{"nfs.invalidation.gc.failure"};
   Counter nfsInvalidationGcEnoent{"nfs.invalidation.gc.enoent"};
+  Counter nfsInvalidationGcStaleReply{"nfs.invalidation.gc.stale_reply"};
 
   Counter nfsInvalidationGcClearFsRefcountAttempt{
       "nfs.invalidation.gc.clear_fs_refcount.attempt"};
@@ -645,6 +662,13 @@ struct JournalStats : StatsGroup<JournalStats> {
   Duration accumulateRange{"journal.accumulate_range_us"};
 };
 
+struct GlobStats : StatsGroup<GlobStats> {
+  Counter memoizedFailureStateLimitExceeded{
+      "glob_match.memoized_failure_state_limit_exceeded"};
+  Counter backtrackingStepLimitExceeded{
+      "glob_match.backtracking_step_limit_exceeded"};
+};
+
 struct ThriftStats : StatsGroup<ThriftStats> {
   Duration streamChangesSince{
       "thrift.StreamingEdenService.streamChangesSince.streaming_time_us"};
@@ -796,6 +820,12 @@ struct TakeoverStats : StatsGroup<TakeoverStats> {
 
 struct CheckoutStats : StatsGroup<CheckoutStats> {
   Counter avoidedDestinationConflicts{"checkout.avoided_destination_conflicts"};
+};
+
+struct TreeInodeStats : StatsGroup<TreeInodeStats> {
+  Counter readdirIndexHit{"inodes.readdir_index_hit"};
+  Counter readdirIndexCached{"inodes.readdir_index_cached"};
+  Counter readdirIndexDroppedByGc{"inodes.readdir_index_dropped_by_gc"};
 };
 
 /*

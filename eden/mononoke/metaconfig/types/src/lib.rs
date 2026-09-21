@@ -214,6 +214,11 @@ pub struct RepoConfig {
     pub readonly: RepoReadOnly,
     /// Should files be checked for redaction
     pub redaction: Redaction,
+    /// When true, an upload to this repo may bypass redaction (log-only, not
+    /// blocked) if the caller holds the mirror_upload permission. Set only on
+    /// AWS Operational Shadow replica repos, which modern_sync keeps identical
+    /// to a source repo. Defaults to false: redaction is enforced.
+    pub mirror_upload_redaction_bypass_enabled: bool,
     /// Params for the hook manager
     pub hook_manager_params: Option<HookManagerParams>,
     /// Max number of results in listkeyspatterns.
@@ -2577,6 +2582,9 @@ pub struct EnforcementConditionSet {
     /// Empty = don't filter on this dimension. Substring semantics
     /// (`Regex::is_match`). Invalid regexes are rejected at config parse time.
     pub client_identity_regexes: Vec<ComparableRegex>,
+    /// `None` = don't filter on this dimension; `Some(want)` = match only callers
+    /// whose `Metadata::likely_an_agent()` equals `want`.
+    pub is_agent: Option<bool>,
 }
 
 /// Parse a bare AMP group name into a `GROUP:` identity.
@@ -2659,6 +2667,8 @@ pub struct RestrictedPathsConfig {
     pub enforcement_enabled: bool,
     /// 4-stage rollout state for AclManifest. Defaults to `Disabled`.
     pub acl_manifest_mode: AclManifestMode,
+    /// Free text appended to restricted-path denial errors.
+    pub denial_message: Option<String>,
 }
 
 const DEFAULT_ACL_FILE_NAME: &str = ".slacl";
@@ -2675,6 +2685,7 @@ impl Default for RestrictedPathsConfig {
             enforcement_condition_sets: Vec::new(),
             enforcement_enabled: false,
             acl_manifest_mode: AclManifestMode::Disabled,
+            denial_message: None,
         }
     }
 }

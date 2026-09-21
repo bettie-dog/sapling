@@ -33,6 +33,7 @@
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/common/utils/UserInfo.h"
+#include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperFlags.h"
@@ -942,14 +943,16 @@ Future<Unit> PrivHelperClientImpl::setFuseReadAhead(
 
 Future<Unit> PrivHelperClientImpl::setRestartArgs(
     const EdenFsRestartArgs& args) {
-  auto xid = getNextXid();
-  auto request = PrivHelperConn::serializeSetRestartArgsRequest(xid, args);
+  return folly::makeFutureWith([&]() -> Future<Unit> {
+    auto xid = getNextXid();
+    auto request = PrivHelperConn::serializeSetRestartArgsRequest(xid, args);
 
-  return sendAndRecv(xid, "set_restart_args", std::move(request))
-      .thenValue([](UnixSocket::Message&& response) {
-        PrivHelperConn::parseEmptyResponse(
-            PrivHelperConn::REQ_SET_RESTART_ARGS, response);
-      });
+    return sendAndRecv(xid, "set_restart_args", std::move(request))
+        .thenValue([](UnixSocket::Message&& response) {
+          PrivHelperConn::parseEmptyResponse(
+              PrivHelperConn::REQ_SET_RESTART_ARGS, response);
+        });
+  });
 }
 
 void PrivHelperClientImpl::notifyCleanShutdown(StringPiece reason) noexcept {
@@ -991,6 +994,30 @@ int PrivHelperClientImpl::getPid() {
 bool tccDisclaimKillswitchPresent(const char* path) {
   return access(path, F_OK) == 0;
 }
+
+#ifdef __APPLE__
+// csops(2) lives in <sys/codesign.h>, which is not in the public SDK; the
+// syscall wrapper is exported by libSystem. Constants from xnu
+// bsd/sys/codesign.h.
+extern "C" int csops(pid_t, unsigned int, void*, size_t);
+constexpr unsigned int kCsOpsTeamId = 14; // CS_OPS_TEAMID
+
+std::string selfCodeSigningTeamId() {
+  // The reply is an 8-byte header (type word, big-endian length) followed by
+  // the NUL-terminated team identifier. The kernel fails with EINVAL when the
+  // signature is not valid, ENOENT when there is no team (ad-hoc/unsigned),
+  // and ERANGE instead of truncating, so a zeroed buffer is always
+  // NUL-terminated.
+  char buf[8 + 64] = {};
+  if (csops(getpid(), kCsOpsTeamId, buf, sizeof(buf)) != 0) {
+    if (errno != ENOENT && errno != EINVAL) {
+      XLOGF(WARN, "csops(CS_OPS_TEAMID) failed: {}", folly::errnoStr(errno));
+    }
+    return "none";
+  }
+  return std::string(buf + 8);
+}
+#endif
 
 unique_ptr<PrivHelper>
 startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
@@ -1042,6 +1069,29 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
         "not disclaiming TCC responsibility for the privhelper: killswitch "
         "file {} is present",
         kTccDisclaimKillswitchPath);
+  } else if (auto team = selfCodeSigningTeamId(); team != kTccDisclaimTeamId) {
+    // csops(2) only inspects running processes, so this checks edenfs itself,
+    // which ships in the same package as the privhelper.
+    //
+    // TODO: parse the config prior to starting the privhelper so that the
+    // privhelper spawn can honor dynamic config values
+    // (core:disclaim-tcc-team-id here, and the killswitch file could then
+    // become core:disclaim-tcc-responsibility). Until then the privhelper
+    // uses the compiled default.
+    //
+    // A real certificate whose team differs (development cert, or a rotated
+    // release team) silently loses the disclaim, so that is a WARN; "none" is
+    // an ad-hoc buck build, which is expected.
+    const auto message = fmt::format(
+        "not disclaiming TCC responsibility for the privhelper: code signature "
+        "team {}, not the fleet team {}",
+        team,
+        kTccDisclaimTeamId);
+    if (team == "none") {
+      XLOG(INFO) << message;
+    } else {
+      XLOG(WARN) << message;
+    }
   } else {
     // Make the privhelper its own TCC responsible process so that TCC grants
     // keyed to its code signature apply regardless of what launched EdenFS.

@@ -8,6 +8,7 @@
 #ifndef _WIN32
 
 #include "eden/fs/nfs/Nfsd3.h"
+#include "eden/common/utils/FaultInjector.h"
 
 #include "eden/fs/nfs/NfsAccessRateLimiter.h"
 
@@ -17,6 +18,7 @@
 
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fb303/ServiceData.h>
 #include <fb303/ThreadCachedServiceData.h>
@@ -32,6 +34,7 @@
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/nfs/NfsDispatcher.h"
 #include "eden/fs/nfs/NfsdRpc.h"
+#include "eden/fs/nfs/testharness/NfsRequestUtils.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
@@ -104,71 +107,6 @@ class FakeNfsDispatcher : public NfsDispatcher {
 #undef ENOENT_STUB
 };
 
-opaque_auth makeAuthSysCred(const authsys_parms& creds) {
-  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
-  folly::io::QueueAppender ser(&queue, 256);
-  XdrTrait<authsys_parms>::serialize(ser, creds);
-  auto buf = queue.move();
-  auto bytes = buf->coalesce();
-  return opaque_auth{
-      auth_flavor::AUTH_SYS, OpaqueBytes{bytes.begin(), bytes.end()}};
-}
-
-/**
- * Serialize an NFSv3 request for the given procedure with the given
- * credential, framed with a record-mark fragment header. serializeArgs is
- * called with the QueueAppender to append the procedure arguments.
- */
-template <typename SerializeArgs>
-std::unique_ptr<folly::IOBuf> buildNfsRequestImpl(
-    uint32_t xid,
-    nfsv3Procs proc,
-    opaque_auth cred,
-    SerializeArgs&& serializeArgs) {
-  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
-  folly::io::QueueAppender ser(&queue, 1024);
-
-  XdrTrait<uint32_t>::serialize(ser, 0); // fragment header placeholder
-  rpc_msg_call call{
-      xid,
-      msg_type::CALL,
-      call_body{
-          kRPCVersion,
-          kNfsdProgNumber,
-          kNfsd3ProgVersion,
-          folly::to_underlying(proc),
-          std::move(cred),
-          opaque_auth{auth_flavor::AUTH_NONE, {}},
-      },
-  };
-  XdrTrait<rpc_msg_call>::serialize(ser, call);
-  serializeArgs(ser);
-
-  auto len = static_cast<uint32_t>(queue.chainLength() - sizeof(uint32_t));
-  auto buf = queue.move();
-  auto* header = reinterpret_cast<uint32_t*>(buf->writableData());
-  *header = folly::Endian::big(len | 0x80000000);
-  return buf;
-}
-
-template <typename Args>
-std::unique_ptr<folly::IOBuf> buildNfsRequest(
-    uint32_t xid,
-    nfsv3Procs proc,
-    opaque_auth cred,
-    const Args& args) {
-  return buildNfsRequestImpl(
-      xid, proc, std::move(cred), [&](folly::io::QueueAppender& ser) {
-        XdrTrait<Args>::serialize(ser, args);
-      });
-}
-
-std::unique_ptr<folly::IOBuf>
-buildNfsRequest(uint32_t xid, nfsv3Procs proc, opaque_auth cred) {
-  return buildNfsRequestImpl(
-      xid, proc, std::move(cred), [](folly::io::QueueAppender&) {});
-}
-
 /**
  * Drives a real Nfsd3 server over a Unix socketpair. The ManualExecutor
  * keeps all request processing on the test thread so state recorded by
@@ -177,6 +115,9 @@ buildNfsRequest(uint32_t xid, nfsv3Procs proc, opaque_auth cred) {
 struct Nfsd3Test : ::testing::Test {
   void SetUp() override {
     config_ = EdenConfig::createTestEdenConfig();
+    // The per-id tests drive GETATTR/ACCESS/READ, so police those; the
+    // compiled-in default set is covered by default_set_polices_readdir_only.
+    setPolicedProcedures({"getattr", "access", "read"});
     reloadableConfig_ = std::make_shared<ReloadableConfig>(config_);
     errorLogger_ = std::make_unique<ErrorLogger>();
 
@@ -206,7 +147,8 @@ struct Nfsd3Test : ::testing::Test {
         /*longRunningFSRequestThreshold=*/std::chrono::nanoseconds{0},
         /*traceBusCapacity=*/1000,
         /*fastPathRPCs=*/false,
-        reloadableConfig_));
+        reloadableConfig_,
+        faultInjector_));
 
     int fds[2];
     ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
@@ -273,6 +215,39 @@ struct Nfsd3Test : ::testing::Test {
         READ3args{nfs_fh3{InodeNumber{42}}, /*offset=*/0, /*count=*/16}));
   }
 
+  std::vector<uint8_t> sendLookup(uint32_t xid, opaque_auth cred) {
+    return sendAndReceive(buildNfsRequest(
+        xid,
+        nfsv3Procs::lookup,
+        std::move(cred),
+        LOOKUP3args{diropargs3{nfs_fh3{InodeNumber{42}}, "foo"}}));
+  }
+
+  std::vector<uint8_t> sendReaddir(uint32_t xid, opaque_auth cred) {
+    return sendAndReceive(buildNfsRequest(
+        xid,
+        nfsv3Procs::readdir,
+        std::move(cred),
+        READDIR3args{
+            nfs_fh3{InodeNumber{42}},
+            /*cookie=*/0,
+            /*cookieverf=*/0,
+            /*count=*/4096}));
+  }
+
+  std::vector<uint8_t> sendReaddirplus(uint32_t xid, opaque_auth cred) {
+    return sendAndReceive(buildNfsRequest(
+        xid,
+        nfsv3Procs::readdirplus,
+        std::move(cred),
+        READDIRPLUS3args{
+            nfs_fh3{InodeNumber{42}},
+            /*cookie=*/0,
+            /*cookieverf=*/0,
+            /*dircount=*/4096,
+            /*maxcount=*/4096}));
+  }
+
   int64_t getCounter(folly::StringPiece key) {
     dispatcher_->getStats()->flush();
     facebook::fb303::ThreadCachedServiceData::get()->publishStats();
@@ -281,21 +256,31 @@ struct Nfsd3Test : ::testing::Test {
         .value_or(0);
   }
 
-  void setUidModes(std::unordered_map<uint32_t, NfsAccessMode> modes) {
-    config_->nfsUidAccessModes.setValue(
+  void setUidPolicy(std::unordered_map<uint32_t, NfsAccessMode> modes) {
+    config_->nfsUidAccessPolicy.setValue(
         std::move(modes), ConfigSourceType::UserConfig, true);
   }
 
-  void setGidModes(std::unordered_map<uint32_t, NfsAccessMode> modes) {
-    config_->nfsGidAccessModes.setValue(
+  void setGidPolicy(std::unordered_map<uint32_t, NfsAccessMode> modes) {
+    config_->nfsGidAccessPolicy.setValue(
         std::move(modes), ConfigSourceType::UserConfig, true);
   }
 
   void setRateLimit(uint32_t count, uint32_t windowSeconds) {
-    config_->nfsAccessRateLimitCount.setValue(
+    config_->nfsAccessPolicyRateLimitCount.setValue(
         count, ConfigSourceType::UserConfig, true);
-    config_->nfsAccessRateLimitWindowSeconds.setValue(
+    config_->nfsAccessPolicyRateLimitWindowSeconds.setValue(
         windowSeconds, ConfigSourceType::UserConfig, true);
+  }
+
+  void setPolicedProcedures(std::unordered_set<std::string> procedures) {
+    config_->nfsAccessPolicyProcedures.setValue(
+        std::move(procedures), ConfigSourceType::UserConfig, true);
+  }
+
+  // Drops the fixture's override so the compiled-in default set applies.
+  void useDefaultPolicedProcedures() {
+    config_->nfsAccessPolicyProcedures.clearValue(ConfigSourceType::UserConfig);
   }
 
   // uid 0 with gid 20 / aux {20}: matches a uid 0 entry only.
@@ -362,6 +347,7 @@ struct Nfsd3Test : ::testing::Test {
   std::shared_ptr<folly::ManualExecutor> manualExecutor_;
   std::shared_ptr<EdenConfig> config_;
   std::shared_ptr<ReloadableConfig> reloadableConfig_;
+  FaultInjector faultInjector_{/*enabled=*/false};
   std::unique_ptr<ErrorLogger> errorLogger_;
   folly::Logger straceLogger_{"eden.test.nfsd3"};
   UnixClock clock_;
@@ -396,8 +382,8 @@ TEST_F(Nfsd3Test, gid_entry_matches_auxiliary_gid) {
 }
 
 TEST_F(Nfsd3Test, empty_maps_skip_everything) {
-  setUidModes({});
-  setGidModes({});
+  setUidPolicy({});
+  setGidPolicy({});
   auto uidBefore = getCounter("nfs.access.uid.0.sum");
   auto gidBefore = getCounter("nfs.access.gid.0.sum");
   auto blockedBefore = getCounter("nfs.blocked_access.sum");
@@ -409,8 +395,9 @@ TEST_F(Nfsd3Test, empty_maps_skip_everything) {
   EXPECT_EQ(getCounter("nfs.blocked_access.sum"), blockedBefore);
 }
 
+// Relies on the fixture policing GETATTR/ACCESS/READ (see SetUp).
 TEST_F(Nfsd3Test, block_entry_rejects_across_procedures) {
-  setUidModes({{0, NfsAccessMode::Block}});
+  setUidPolicy({{0, NfsAccessMode::Block}});
   auto accessBefore = getCounter("nfs.access.uid.0.sum");
   auto blockedUidBefore = getCounter("nfs.blocked.uid.0.sum");
   auto blockedBefore = getCounter("nfs.blocked_access.sum");
@@ -429,8 +416,8 @@ TEST_F(Nfsd3Test, block_entry_rejects_across_procedures) {
 }
 
 TEST_F(Nfsd3Test, uid_and_gid_entries_are_independent) {
-  setUidModes({});
-  setGidModes({{0, NfsAccessMode::Block}});
+  setUidPolicy({});
+  setGidPolicy({{0, NfsAccessMode::Block}});
   auto uidBefore = getCounter("nfs.access.uid.0.sum");
 
   // Both gid 0 spellings are rejected by the gid entry alone.
@@ -443,8 +430,8 @@ TEST_F(Nfsd3Test, uid_and_gid_entries_are_independent) {
 }
 
 TEST_F(Nfsd3Test, arbitrary_ids_get_their_own_entries) {
-  setUidModes({{501, NfsAccessMode::Block}});
-  setGidModes({{20, NfsAccessMode::Log}});
+  setUidPolicy({{501, NfsAccessMode::Block}});
+  setGidPolicy({{20, NfsAccessMode::Log}});
   auto uidAccessBefore = getCounter("nfs.access.uid.501.sum");
   auto uidBlockedBefore = getCounter("nfs.blocked.uid.501.sum");
   auto gidAccessBefore = getCounter("nfs.access.gid.20.sum");
@@ -463,8 +450,8 @@ TEST_F(Nfsd3Test, arbitrary_ids_get_their_own_entries) {
 }
 
 TEST_F(Nfsd3Test, every_matching_gid_entry_is_evaluated) {
-  setUidModes({});
-  setGidModes({{0, NfsAccessMode::Log}, {20, NfsAccessMode::Block}});
+  setUidPolicy({});
+  setGidPolicy({{0, NfsAccessMode::Log}, {20, NfsAccessMode::Block}});
   auto gid0AccessBefore = getCounter("nfs.access.gid.0.sum");
   auto gid0BlockedBefore = getCounter("nfs.blocked.gid.0.sum");
   auto gid20AccessBefore = getCounter("nfs.access.gid.20.sum");
@@ -484,16 +471,19 @@ TEST_F(Nfsd3Test, every_matching_gid_entry_is_evaluated) {
 }
 
 TEST_F(Nfsd3Test, missing_creds_are_never_blocked) {
-  setUidModes({{0, NfsAccessMode::Block}});
-  setGidModes({{0, NfsAccessMode::Block}});
+  setUidPolicy({{0, NfsAccessMode::Block}});
+  setGidPolicy({{0, NfsAccessMode::Block}});
 
   expectAcceptedSuccess(
       sendGetattr(1, opaque_auth{auth_flavor::AUTH_NONE, {}}));
 }
 
 TEST_F(Nfsd3Test, control_plane_procs_are_exempt) {
-  setUidModes({{0, NfsAccessMode::Block}});
-  setGidModes({{0, NfsAccessMode::Block}});
+  // Listing exempt procedures in the policed set is harmless: exemption is
+  // checked before the set is consulted.
+  setPolicedProcedures({"null", "fsstat", "fsinfo", "pathconf", "getattr"});
+  setUidPolicy({{0, NfsAccessMode::Block}});
+  setGidPolicy({{0, NfsAccessMode::Block}});
   auto uidBefore = getCounter("nfs.access.uid.0.sum");
   auto blockedBefore = getCounter("nfs.blocked_access.sum");
 
@@ -525,7 +515,7 @@ TEST_F(Nfsd3Test, control_plane_procs_are_exempt) {
 }
 
 TEST_F(Nfsd3Test, rate_limit_allows_baseline_and_rejects_bursts) {
-  setUidModes({{0, NfsAccessMode::RateLimit}});
+  setUidPolicy({{0, NfsAccessMode::RateLimit}});
   // A generous window so the budget cannot refill mid-test.
   setRateLimit(/*count=*/3, /*windowSeconds=*/3600);
   auto accessBefore = getCounter("nfs.access.uid.0.sum");
@@ -547,7 +537,8 @@ TEST_F(Nfsd3Test, rate_limit_allows_baseline_and_rejects_bursts) {
 }
 
 TEST_F(Nfsd3Test, rate_limit_budgets_are_per_id) {
-  setUidModes({{0, NfsAccessMode::RateLimit}, {501, NfsAccessMode::RateLimit}});
+  setUidPolicy(
+      {{0, NfsAccessMode::RateLimit}, {501, NfsAccessMode::RateLimit}});
   setRateLimit(/*count=*/1, /*windowSeconds=*/3600);
 
   // Exhausting uid 0's budget leaves uid 501's untouched.
@@ -558,17 +549,128 @@ TEST_F(Nfsd3Test, rate_limit_budgets_are_per_id) {
 }
 
 TEST_F(Nfsd3Test, config_changes_apply_without_restart) {
-  setUidModes({{0, NfsAccessMode::Block}});
+  setUidPolicy({{0, NfsAccessMode::Block}});
   expectAuthTooWeak(sendGetattr(1, rootOnlyCred()));
 
   // Dropping the entry back to "log" unblocks the same running server.
-  setUidModes({{0, NfsAccessMode::Log}});
+  setUidPolicy({{0, NfsAccessMode::Log}});
   expectAcceptedSuccess(sendGetattr(2, rootOnlyCred()));
 
   // The gid map is picked up independently.
-  setGidModes({{0, NfsAccessMode::Block}});
+  setGidPolicy({{0, NfsAccessMode::Block}});
   expectAuthTooWeak(sendGetattr(3, rootAndWheelCred()));
   expectAcceptedSuccess(sendGetattr(4, rootOnlyCred()));
+
+  // So is the procedure set: LOOKUP is unpoliced until it is added.
+  setUidPolicy({{0, NfsAccessMode::Block}});
+  expectAcceptedSuccess(sendLookup(5, rootOnlyCred()));
+  setPolicedProcedures({"lookup"});
+  expectAuthTooWeak(sendLookup(6, rootOnlyCred()));
+}
+
+TEST_F(Nfsd3Test, default_set_polices_readdir_only) {
+  useDefaultPolicedProcedures();
+  EXPECT_EQ(
+      config_->nfsAccessPolicyProcedures.getValue(),
+      (std::unordered_set<std::string>{"readdir", "readdirplus"}));
+  setUidPolicy({{0, NfsAccessMode::Block}});
+  auto accessBefore = getCounter("nfs.access.uid.0.sum");
+  auto policedBefore = getCounter("nfs.policed.uid.0.sum");
+  auto blockedUidBefore = getCounter("nfs.blocked.uid.0.sum");
+  auto blockedBefore = getCounter("nfs.blocked_access.sum");
+  const std::vector<std::string> procs{
+      "readdir", "readdirplus", "getattr", "read", "lookup"};
+  std::vector<int64_t> perProcBefore;
+  for (const auto& proc : procs) {
+    perProcBefore.push_back(getCounter("nfs.access.uid.0." + proc + ".sum"));
+  }
+
+  // Directory traversal by the blocked uid is rejected...
+  expectAuthTooWeak(sendReaddir(1, rootOnlyCred()));
+  expectAuthTooWeak(sendReaddirplus(2, rootOnlyCred()));
+  // ...while its metadata and data requests still go through.
+  expectAcceptedSuccess(sendGetattr(3, rootOnlyCred()));
+  expectAcceptedSuccess(sendRead(4, rootOnlyCred()));
+  expectAcceptedSuccess(sendLookup(5, rootOnlyCred()));
+
+  // Every matching request is counted; only the policed ones are blocked.
+  EXPECT_EQ(getCounter("nfs.access.uid.0.sum") - accessBefore, 5);
+  EXPECT_EQ(getCounter("nfs.policed.uid.0.sum") - policedBefore, 2);
+  EXPECT_EQ(getCounter("nfs.blocked.uid.0.sum") - blockedUidBefore, 2);
+  EXPECT_EQ(getCounter("nfs.blocked_access.sum") - blockedBefore, 2);
+  // ...and each one is also counted under its procedure name.
+  for (size_t i = 0; i < procs.size(); ++i) {
+    EXPECT_EQ(
+        getCounter("nfs.access.uid.0." + procs[i] + ".sum") - perProcBefore[i],
+        1)
+        << procs[i];
+  }
+}
+
+TEST_F(Nfsd3Test, gid_entries_use_the_same_procedure_set) {
+  useDefaultPolicedProcedures();
+  setUidPolicy({});
+  setGidPolicy({{0, NfsAccessMode::Block}});
+  auto accessBefore = getCounter("nfs.access.gid.0.sum");
+  auto policedBefore = getCounter("nfs.policed.gid.0.sum");
+  auto blockedBefore = getCounter("nfs.blocked.gid.0.sum");
+  auto readdirBefore = getCounter("nfs.access.gid.0.readdir.sum");
+
+  expectAuthTooWeak(sendReaddir(1, wheelCred()));
+  expectAcceptedSuccess(sendGetattr(2, wheelCred()));
+
+  EXPECT_EQ(getCounter("nfs.access.gid.0.sum") - accessBefore, 2);
+  EXPECT_EQ(getCounter("nfs.policed.gid.0.sum") - policedBefore, 1);
+  EXPECT_EQ(getCounter("nfs.blocked.gid.0.sum") - blockedBefore, 1);
+  EXPECT_EQ(getCounter("nfs.access.gid.0.readdir.sum") - readdirBefore, 1);
+}
+
+TEST_F(Nfsd3Test, unpoliced_procedures_do_not_consume_budget) {
+  useDefaultPolicedProcedures();
+  setUidPolicy({{0, NfsAccessMode::RateLimit}});
+  setRateLimit(/*count=*/1, /*windowSeconds=*/3600);
+  auto accessBefore = getCounter("nfs.access.uid.0.sum");
+  auto policedBefore = getCounter("nfs.policed.uid.0.sum");
+  auto blockedUidBefore = getCounter("nfs.blocked.uid.0.sum");
+
+  // Ten unpoliced requests leave the single token in place...
+  for (uint32_t xid = 1; xid <= 10; ++xid) {
+    expectAcceptedSuccess(sendGetattr(xid, rootOnlyCred()));
+  }
+  // ...so the first READDIR still gets it and the second is over budget...
+  expectAcceptedSuccess(sendReaddir(11, rootOnlyCred()));
+  expectAuthTooWeak(sendReaddir(12, rootOnlyCred()));
+  // ...and an exhausted budget does not touch unpoliced requests either.
+  expectAcceptedSuccess(sendGetattr(13, rootOnlyCred()));
+
+  EXPECT_EQ(getCounter("nfs.access.uid.0.sum") - accessBefore, 13);
+  EXPECT_EQ(getCounter("nfs.policed.uid.0.sum") - policedBefore, 2);
+  EXPECT_EQ(getCounter("nfs.blocked.uid.0.sum") - blockedUidBefore, 1);
+}
+
+TEST_F(Nfsd3Test, empty_set_disables_enforcement) {
+  setPolicedProcedures({});
+  setUidPolicy({{0, NfsAccessMode::Block}});
+  auto accessBefore = getCounter("nfs.access.uid.0.sum");
+  auto policedBefore = getCounter("nfs.policed.uid.0.sum");
+  auto blockedBefore = getCounter("nfs.blocked_access.sum");
+
+  expectAcceptedSuccess(sendReaddir(1, rootOnlyCred()));
+  expectAcceptedSuccess(sendRead(2, rootOnlyCred()));
+
+  // Still counted, never policed.
+  EXPECT_EQ(getCounter("nfs.access.uid.0.sum") - accessBefore, 2);
+  EXPECT_EQ(getCounter("nfs.policed.uid.0.sum"), policedBefore);
+  EXPECT_EQ(getCounter("nfs.blocked_access.sum"), blockedBefore);
+}
+
+TEST_F(Nfsd3Test, set_can_include_read) {
+  // A name that is not an NFSv3 procedure is ignored, not an error.
+  setPolicedProcedures({"read", "frobnicate"});
+  setUidPolicy({{0, NfsAccessMode::Block}});
+
+  expectAuthTooWeak(sendRead(1, rootOnlyCred()));
+  expectAcceptedSuccess(sendReaddir(2, rootOnlyCred()));
 }
 
 TEST(NfsAccessRateLimiterTest, budget_refills_over_time) {
@@ -592,6 +694,28 @@ TEST(NfsAccessRateLimiterTest, budget_refills_over_time) {
   // everything.
   EXPECT_FALSE(limiter.allow(0, 60, 1120.0));
   EXPECT_TRUE(limiter.allow(2, 0, 1120.0));
+}
+
+TEST(InvalidatingInodesTest, removingAnInvalidationReleasesItsForgetCallback) {
+  InvalidatingInodes inodes;
+  const std::vector<InodeNumber> first{InodeNumber{2}, InodeNumber{1}};
+  const std::vector<InodeNumber> second{InodeNumber{3}, InodeNumber{1}};
+  auto captured = std::make_shared<int>(0);
+  std::weak_ptr<int> weak = captured;
+  inodes.add(first, [captured] { ++*captured; });
+  inodes.add(second, [] {});
+  captured.reset();
+  EXPECT_FALSE(weak.expired());
+
+  // A forget that never ran, because no SETATTR arrived, is released with
+  // its invalidation even though the two share an ancestor.
+  inodes.remove(first);
+  EXPECT_TRUE(weak.expired());
+  EXPECT_TRUE(inodes.contains(InodeNumber{1}));
+  EXPECT_FALSE(inodes.contains(InodeNumber{2}));
+  EXPECT_FALSE(inodes.takeForget(InodeNumber{2}));
+  inodes.remove(second);
+  EXPECT_FALSE(inodes.contains(InodeNumber{1}));
 }
 
 } // namespace

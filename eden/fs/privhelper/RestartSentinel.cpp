@@ -10,22 +10,20 @@
 #ifdef __APPLE__
 
 #include <fcntl.h>
+#include <folly/Expected.h>
 #include <folly/FileUtil.h>
 #include <folly/String.h>
-#include <folly/json/json.h>
+#include <folly/Unit.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/Unistd.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <string_view>
+#include <utility>
 
 namespace facebook::eden {
 
 namespace {
-// A command line and an environment, generously. The sentinel is written by an
-// unprivileged process, so its size is bounded before anything is parsed.
-constexpr size_t kMaxSentinelSize = 1024 * 1024;
-
 // The restart policy arrives over IPC from the unprivileged daemon, so the
 // privhelper bounds what it will honour. The daemon's own defaults are 3
 // restarts per 10 minutes.
@@ -52,8 +50,8 @@ struct SentinelPathParts {
 /**
  * An absolute sentinel path split into the directory to pin and the leaf to
  * look up in it, or nullopt when the path cannot name a file: "." and ".."
- * always resolve, so faccessat() could never report the sentinel gone, and a
- * NUL ends the path the syscalls act on early.
+ * always resolve, so the sentinel could never be reported gone, and a NUL ends
+ * the path the syscalls act on early.
  */
 std::optional<SentinelPathParts> splitSentinelPath(const std::string& path) {
   if (path.empty() || path.front() != '/' ||
@@ -67,6 +65,81 @@ std::optional<SentinelPathParts> splitSentinelPath(const std::string& path) {
     return std::nullopt;
   }
   return SentinelPathParts{view.substr(0, slash == 0 ? 1 : slash), name};
+}
+
+/** Why the sentinel is not a marker the daemon's user could have created. */
+enum class SentinelError {
+  /** Nothing is at the name. */
+  Absent,
+  /** Something is at the name, and it is not such a marker. */
+  Rejected,
+  /** What is at the name could not be established. */
+  Indeterminate,
+};
+
+/**
+ * Open the sentinel and establish that it is plausibly a marker the daemon's
+ * user created: a regular file owned by `uid` that only its owner can write.
+ *
+ * Runs as root against a name an unprivileged user controls, on a path that
+ * still owes the mounts a cleanup, so it neither blocks nor throws.
+ *
+ * Logs every failure but `Absent`, naming the consequence: a sentinel that is
+ * simply gone is the ordinary clean-shutdown signal, and every other reason
+ * leaves edenfs down.
+ */
+folly::Expected<folly::Unit, SentinelError>
+openSentinel(int dirFd, const std::string& name, uid_t uid) {
+  // O_NOFOLLOW rejects a symlink swapped in for the sentinel, and O_NONBLOCK
+  // keeps a FIFO from blocking here so the regular-file check below can reject
+  // it.
+  const int fd = openatNoInt(
+      dirFd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+  if (fd == -1) {
+    const int error = errno;
+    if (error == ENOENT) {
+      return folly::makeUnexpected(SentinelError::Absent);
+    }
+    XLOGF(
+        ERR,
+        "not restarting edenfs: cannot open the restart sentinel {} in the pinned directory: {}",
+        name,
+        folly::errnoStr(error));
+    // ELOOP is O_NOFOLLOW refusing a symlink, which settles what is at the
+    // name. Every other errno means the name could not be examined at all.
+    return folly::makeUnexpected(
+        error == ELOOP ? SentinelError::Rejected
+                       : SentinelError::Indeterminate);
+  }
+  folly::File file{fd, /*ownsFd=*/true};
+
+  struct stat st{};
+  if (::fstat(file.fd(), &st) != 0) {
+    XLOGF(
+        ERR,
+        "not restarting edenfs: cannot stat the restart sentinel {}: {}",
+        name,
+        folly::errnoStr(errno));
+    return folly::makeUnexpected(SentinelError::Indeterminate);
+  }
+  if (!S_ISREG(st.st_mode)) {
+    XLOGF(
+        ERR,
+        "not restarting edenfs: the restart sentinel {} is not a regular file",
+        name);
+    return folly::makeUnexpected(SentinelError::Rejected);
+  }
+  // Its existence is what keeps root armed, so whoever can create this file
+  // can force a relaunch. The path is caller-supplied, so the rejection does
+  // not name the file's uid or mode.
+  if (st.st_uid != uid || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    XLOGF(
+        ERR,
+        "not restarting edenfs: the restart sentinel {} has wrong ownership",
+        name);
+    return folly::makeUnexpected(SentinelError::Rejected);
+  }
+  return folly::unit;
 }
 } // namespace
 
@@ -154,152 +227,34 @@ std::optional<RestartSentinel::DisarmState> RestartSentinel::disarmState()
   if (loc == nullptr) {
     return DisarmState::Unknown;
   }
-  // The second, independent disarm signal. Only existence matters, so
-  // faccessat() rather than an open: a FIFO planted in the sentinel's place
-  // would block an open for ever. A spoofed "exists" only buys a restart a
-  // crash also buys.
-  if (::faccessat(loc->dir.fd(), loc->name.c_str(), F_OK, 0) == 0) {
+  // The second, independent disarm signal, and the whole decision: a clean
+  // shutdown unlinks the marker, so anything recreated at the name before root
+  // looks would otherwise revive a daemon the user stopped on purpose.
+  const auto sentinel = openSentinel(loc->dir.fd(), loc->name, uid_);
+  if (sentinel.hasValue()) {
     return DisarmState::Armed;
   }
-  const int error = errno;
-  // Only ENOENT means the daemon removed it. Anything else leaves the
-  // sentinel's state unknown, and root must not relaunch on a guess.
-  if (error != ENOENT) {
-    XLOGF(
-        ERR,
-        "cannot read the restart sentinel {} in the pinned directory: {}",
-        loc->name,
-        folly::errnoStr(error));
-    return DisarmState::Unknown;
-  }
-  return DisarmState::ShutdownAnnounced;
+  // Only a name root could not examine leaves the state genuinely unknown, and
+  // root must not relaunch on a guess. A name holding anything other than this
+  // daemon's marker reads as disarmed.
+  return sentinel.error() == SentinelError::Indeterminate
+      ? DisarmState::Unknown
+      : DisarmState::ShutdownAnnounced;
 }
 
 std::optional<RestartSentinel::RelaunchCommand>
-RestartSentinel::readRelaunchCommand() const {
+RestartSentinel::relaunchCommand() const {
   if (!config_.has_value()) {
     return std::nullopt;
   }
-  // 0 is what an absent nonce parses to, so a configuration carrying it would
-  // accept a sentinel written by a daemon too old to have one.
-  if (config_->sentinelNonce == 0) {
-    XLOGF(ERR, "not restarting edenfs: the restart configuration has no nonce");
-    return std::nullopt;
-  }
-  const auto* loc = location();
-  if (loc == nullptr) {
-    return std::nullopt;
-  }
-
-  // A root process reading a file the daemon's user can replace: O_NOFOLLOW
-  // rejects a symlink swapped in for the sentinel, and O_NONBLOCK keeps a FIFO
-  // from blocking here so the regular-file check below can reject it.
-  const int fd = openatNoInt(
-      loc->dir.fd(),
-      loc->name.c_str(),
-      O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-  if (fd == -1) {
-    XLOGF(
+  // An argv the parser accepted as empty would reach execve() with no argv[0].
+  if (config_->relaunchArgv.empty()) {
+    XLOG(
         ERR,
-        "not restarting edenfs: cannot open the restart sentinel {} in the pinned directory: {}",
-        loc->name,
-        folly::errnoStr(errno));
+        "not restarting edenfs: the restart arguments carry no relaunch command");
     return std::nullopt;
   }
-  const folly::File sentinel{fd, /*ownsFd=*/true};
-
-  struct stat st{};
-  if (::fstat(sentinel.fd(), &st) != 0) {
-    XLOGF(
-        ERR,
-        "not restarting edenfs: cannot stat the restart sentinel {}: {}",
-        loc->name,
-        folly::errnoStr(errno));
-    return std::nullopt;
-  }
-  if (!S_ISREG(st.st_mode)) {
-    XLOGF(
-        ERR,
-        "not restarting edenfs: the restart sentinel {} is not a regular file",
-        loc->name);
-    return std::nullopt;
-  }
-  // Privileges are dropped to uid_ before the command runs, so whoever can
-  // write this file picks what runs as the daemon's user. The path is
-  // caller-supplied, so the rejection does not name the file's uid or mode.
-  if (st.st_uid != uid_ || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-    XLOGF(
-        ERR,
-        "not restarting edenfs: the restart sentinel {} has wrong ownership",
-        loc->name);
-    return std::nullopt;
-  }
-  if (st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxSentinelSize) {
-    XLOGF(
-        ERR,
-        "not restarting edenfs: the restart sentinel {} is {} bytes",
-        loc->name,
-        st.st_size);
-    return std::nullopt;
-  }
-
-  std::string contents;
-  if (!folly::readFile(sentinel.fd(), contents, kMaxSentinelSize)) {
-    XLOGF(
-        ERR,
-        "not restarting edenfs: cannot read the restart sentinel {}: {}",
-        loc->name,
-        folly::errnoStr(errno));
-    return std::nullopt;
-  }
-
-  // Written by EdenServer::armPrivHelperRestart(); the shape is fixed:
-  //
-  //   {"argv": ["...", ...], "env": {"KEY": "VALUE", ...}, "nonce": 123}
-  RelaunchCommand command;
-  try {
-    const auto parsed = folly::parseJson(contents);
-
-    // The sentinel path is fixed per state dir, so this privhelper may open a
-    // file a newer generation wrote. A sentinel with no nonce reads as 0,
-    // which no generation ever stamps.
-    const auto* nonce = parsed.get_ptr("nonce");
-    const uint64_t sentinelNonce =
-        nonce && nonce->isInt() ? static_cast<uint64_t>(nonce->asInt()) : 0;
-    if (sentinelNonce != config_->sentinelNonce) {
-      XLOGF(
-          ERR,
-          "not restarting edenfs: the restart sentinel {} belongs to another "
-          "daemon generation",
-          loc->name);
-      return std::nullopt;
-    }
-
-    const auto* argv = parsed.get_ptr("argv");
-    if (!argv || !argv->isArray() || argv->empty()) {
-      XLOGF(
-          ERR,
-          "not restarting edenfs: the restart sentinel {} holds no command",
-          loc->name);
-      return std::nullopt;
-    }
-    for (const auto& arg : *argv) {
-      command.argv.push_back(arg.asString());
-    }
-    if (const auto* env = parsed.get_ptr("env"); env && env->isObject()) {
-      for (const auto& [key, value] : env->items()) {
-        command.env.emplace_back(key.asString(), value.asString());
-      }
-    }
-  } catch (const std::exception&) {
-    // Without the exception's message: folly's JSON errors quote the offending
-    // input, and these are somebody else's file contents in a root process's
-    // log.
-    XLOGF(ERR, "not restarting edenfs: invalid restart sentinel {}", loc->name);
-    return std::nullopt;
-  }
-
-  return command;
+  return RelaunchCommand{config_->relaunchArgv, config_->relaunchEnv};
 }
 
 bool RestartSentinel::admitRestartAttempt(uint64_t now) {

@@ -18,12 +18,12 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 derived_data_manager = { version = "0.1.0", path = "../manager" }
 derived_data_service_if = { version = "0.1.0", path = "../remote/if" }
-either = "1.17.0"
+either = "1.18.0"
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 manifest = { version = "0.1.0", path = "../../manifest" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 thiserror = "2.0.20"
 unodes = { version = "0.1.0", path = "../unodes" }
 

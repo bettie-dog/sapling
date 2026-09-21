@@ -175,6 +175,48 @@ describe('platform/subscribeToVSCodeConfig', () => {
   });
 });
 
+describe('platform/investigateFailure', () => {
+  async function checkHealth() {
+    const platform = getVSCodePlatform({} as vscode.ExtensionContext);
+    await platform.handleMessageFromClient(
+      undefined,
+      mockCtx,
+      {
+        type: 'platform/investigateFailure',
+        failure: {
+          operationId: 'id',
+          operationName: 'GotoOperation',
+          exitCode: 1,
+          output: '',
+          outputTruncated: false,
+        },
+      },
+      jest.fn(),
+      jest.fn(),
+    );
+  }
+
+  beforeEach(() => jest.clearAllMocks());
+
+  afterEach(() => {
+    delete Internal.investigateFailure;
+  });
+
+  it('passes the server context and failure to the internal investigation', async () => {
+    const check = jest.fn().mockResolvedValue(undefined);
+    Internal.investigateFailure = check;
+    await checkHealth();
+    expect(check.mock.calls).toEqual([[mockCtx, expect.objectContaining({operationId: 'id'})]]);
+  });
+
+  it('ignores health requests in OSS without commands, telemetry, or installation prompts', async () => {
+    await checkHealth();
+    expect(vscode.commands.getCommands).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+    expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('platform/openFileAtRevset', () => {
   const mockExtensionContext = {
     globalState: {update: jest.fn()},
@@ -230,6 +272,67 @@ describe('platform/openFileAtRevset', () => {
     );
 
     expect(vscode.window.showTextDocument).not.toHaveBeenCalled();
+  });
+});
+
+describe('platform/openPreview', () => {
+  const mockExtensionContext = {
+    globalState: {update: jest.fn()},
+  } as unknown as vscode.ExtensionContext;
+
+  const repoRoot = '/path/to/repo';
+  const mockRepo = {info: {repoRoot}} as never;
+
+  const mockExecuteCommand = vscode.commands.executeCommand as jest.MockedFunction<
+    typeof vscode.commands.executeCommand
+  >;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockExecuteCommand.mockReturnValue(Promise.resolve(undefined) as never);
+  });
+
+  it('opens markdown preview for the file', async () => {
+    const platform = getVSCodePlatform(mockExtensionContext);
+    const message: PlatformSpecificClientToServerMessages = {
+      type: 'platform/openPreview',
+      path: 'NOTES.md',
+    };
+
+    await platform.handleMessageFromClient.call(
+      platform,
+      mockRepo,
+      mockCtx,
+      message,
+      jest.fn() as (msg: ServerToClientMessage) => void,
+      jest.fn(),
+      jest.fn(),
+    );
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith(
+      'markdown.showPreview',
+      vscode.Uri.file(`${repoRoot}/NOTES.md`),
+    );
+  });
+
+  it('does nothing when there is no repo', async () => {
+    const platform = getVSCodePlatform(mockExtensionContext);
+    const message: PlatformSpecificClientToServerMessages = {
+      type: 'platform/openPreview',
+      path: 'NOTES.md',
+    };
+
+    await platform.handleMessageFromClient.call(
+      platform,
+      undefined,
+      mockCtx,
+      message,
+      jest.fn() as (msg: ServerToClientMessage) => void,
+      jest.fn(),
+      jest.fn(),
+    );
+
+    expect(mockExecuteCommand).not.toHaveBeenCalled();
   });
 });
 

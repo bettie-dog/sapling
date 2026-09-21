@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import contextlib
 import datetime
 import os
 import re
@@ -14,7 +15,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
+
+if sys.platform != "win32":
+    import fcntl
 
 from eden.fs.cli.util import (
     EdensparseMigrationStep,
@@ -24,7 +28,7 @@ from eden.fs.cli.util import (
 
 from . import configutil, daemon_util, proc_utils as proc_utils_mod
 from .config import EdenInstance
-from .util import poll_until, print_stderr, ShutdownError
+from .util import get_pid_using_lockfile, poll_until, print_stderr, ShutdownError
 
 # The amount of time to wait for the edenfs process to exit after we send SIGKILL.
 # We normally expect the process to be killed and reaped fairly quickly in this
@@ -300,6 +304,57 @@ def _send_sigkill(
         )
 
 
+def _may_remove_restart_sentinel(pid: int, config_dir: Path) -> bool:
+    """Whether pid's killer may remove config_dir's restart sentinel.
+
+    True when pid holds the lock, or when the lock file is absent so that no
+    daemon owns the state dir. A lock file that exists but cannot be read or
+    parsed counts as a live owner.
+    """
+    try:
+        return get_pid_using_lockfile(config_dir) == pid
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def _restart_lock(config_dir: Path) -> Iterator[None]:
+    """Serialize restart arming with a deliberate SIGKILL.
+
+    Raises ShutdownError rather than proceeding unlocked: killing while a
+    daemon arms would let the privhelper relaunch the daemon this kill is
+    meant to retire.
+    """
+    lock_path = config_dir / daemon_util.RESTART_SENTINEL_LOCK_NAME
+    with contextlib.ExitStack() as stack:
+        try:
+            lock_file = stack.enter_context(lock_path.open("a"))
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as ex:
+            raise ShutdownError(
+                f"Failed to acquire restart lock {lock_path}: {ex}"
+            ) from ex
+        yield
+
+
+def _remove_restart_sentinels(pid: int, config_dir: Path) -> None:
+    prefix = f"{daemon_util.RESTART_SENTINEL_NAME_PREFIX}{pid}."
+    try:
+        sentinels = list(config_dir.glob(f"{prefix}*"))
+    except OSError as ex:
+        print_stderr(f"Failed to list restart sentinels in {config_dir}: {ex}")
+        return
+    for sentinel in sentinels:
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as ex:
+            print_stderr(f"Failed to delete restart sentinel {sentinel}: {ex}")
+
+
 def sigkill_process(
     pid: int,
     config_dir: Path,
@@ -332,7 +387,18 @@ def sigkill_process(
         except Exception as e:
             print_stderr(f"Failed to delete heartbeat file {heartbeat_file}: {e}")
 
-    _send_sigkill(pid, instance)
+        if sys.platform == "darwin":
+            with _restart_lock(config_dir):
+                # Only pid's own sentinels are removed. A concurrent generation
+                # that took ownership while this call waited is left alone.
+                if _may_remove_restart_sentinel(pid, config_dir):
+                    _remove_restart_sentinels(pid, config_dir)
+                _send_sigkill(pid, instance)
+        else:
+            _send_sigkill(pid, instance)
+
+    else:
+        _send_sigkill(pid, instance)
 
     if timeout <= 0:
         return
@@ -389,6 +455,54 @@ def gracefully_restart_edenfs_service(
     return result
 
 
+def _daemon_args_file(instance: EdenInstance) -> Path:
+    return instance.state_dir / daemon_util.DAEMON_ARGS_FILENAME
+
+
+def _try_write_daemon_args_file(
+    instance: EdenInstance,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Record the daemon command and environment in the state directory.
+
+    Returns the failure message, or None if the file was written.
+    """
+    try:
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        daemon_util.write_daemon_args_file(
+            instance.state_dir, cmd, eden_env, restart_cmd
+        )
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            _daemon_args_file(instance).unlink(missing_ok=True)
+        return str(e)
+    except Exception as e:
+        # best-effort
+        return str(e)
+    return None
+
+
+def _warn_daemon_args_file_failure(instance: EdenInstance, error: str) -> None:
+    """Warn that the daemon command could not be recorded."""
+    # A state directory that refuses the write usually refuses the removal of
+    # the earlier file too, which leaves that command armed instead of none.
+    # An unreadable state directory gets the same benefit of the doubt.
+    try:
+        stale_file_survives = _daemon_args_file(instance).exists()
+    except OSError:
+        stale_file_survives = True
+    consequence = (
+        "edenfs may be auto-restarted from an earlier start's command"
+        if stale_file_survives
+        else "edenfs will not be auto-restarted after a crash"
+    )
+    print_stderr(
+        f"warning: failed to write the daemon args file: {error}; {consequence}"
+    )
+
+
 def _start_edenfs_service(
     instance: EdenInstance,
     daemon_binary: Optional[str] = None,
@@ -400,10 +514,17 @@ def _start_edenfs_service(
     daemon_binary = daemon_util.find_daemon_binary(daemon_binary)
     cmd, privhelper = get_edenfs_cmd(instance, daemon_binary)
 
+    # Snapshot the relaunch command before `--takeover` and the sudo wrapper,
+    # neither of which may be replayed. Must stay above
+    # `prepare_edenfs_privileges`.
+    restart_cmd = list(cmd)
+
     if takeover:
         cmd.append("--takeover")
     if edenfs_args:
+        # A restarted daemon should behave like the one it replaces.
         cmd.extend(edenfs_args)
+        restart_cmd.extend(edenfs_args)
 
     eden_env = get_edenfs_environment(instance, preserved_env)
     systemd_env = os.environ.copy()
@@ -412,12 +533,36 @@ def _start_edenfs_service(
     # prepare_edenfs_privileges for more info.
     cmd, eden_env = prepare_edenfs_privileges(daemon_binary, cmd, eden_env, privhelper)
 
-    if should_use_systemd_lifecycle_management(instance) and _try_setup_systemd_env(
-        systemd_env, instance
-    ):
-        return _systemctl_start_or_reload(
-            instance, cmd, eden_env, systemd_env, takeover
-        )
+    use_systemd = should_use_systemd_lifecycle_management(
+        instance
+    ) and _try_setup_systemd_env(systemd_env, instance)
+
+    # Windows has neither systemd nor a privhelper, so nothing there reads the
+    # file back. Off systemd the only reader is privhelper restart, which the
+    # daemon arms from this same knob.
+    write_args_file = sys.platform != "win32" and (
+        use_systemd
+        or instance.get_config_bool("privhelper.restart-edenfs-on-crash", default=False)
+    )
+
+    args_file_error = (
+        _try_write_daemon_args_file(instance, cmd, eden_env, restart_cmd)
+        if write_args_file
+        else None
+    )
+
+    if use_systemd:
+        if args_file_error is not None:
+            # systemd launches the daemon from the file rather than from this
+            # command, so there is nothing left for it to start.
+            print_stderr(
+                f"error: failed to write the daemon args file: {args_file_error}"
+            )
+            return 1
+        return _systemctl_start_or_reload(instance, systemd_env, takeover)
+
+    if args_file_error is not None:
+        _warn_daemon_args_file_failure(instance, args_file_error)
 
     if (
         sys.platform == "linux"
@@ -592,18 +737,10 @@ def _extract_daemon_error(startup_log_content: str) -> Optional[str]:
 
 def _systemctl_start_or_reload(
     instance: EdenInstance,
-    cmd: List[str],
-    eden_env: Dict[str, str],
     systemd_env: Dict[str, str],
     takeover: bool,
 ) -> int:
-    """Start or reload the edenfs systemd service.
-
-    Writes the daemon command and environment to an args file, then calls
-    systemctl start (fresh start) or systemctl reload (takeover).
-    """
-    instance.state_dir.mkdir(parents=True, exist_ok=True)
-    daemon_util.write_daemon_args_file(instance.state_dir, cmd, eden_env)
+    """Start or reload the edenfs systemd service."""
     unit = _get_systemd_unit(instance)
     if takeover and _is_systemd_unit_active(unit):
         action = "reload"
@@ -895,8 +1032,6 @@ def get_edenfs_environment(
         # when starting edenfs with cgroup isolation.
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
-        # Used to identify if edenfs was started by a coding agent
-        "CODING_AGENT_METADATA",
     ]
 
     if sys.platform == "win32":

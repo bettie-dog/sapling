@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {FailedOperationContext} from './failureInvestigation';
+
 import type {TypeaheadResult} from 'isl-components/Types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
@@ -33,6 +35,7 @@ export type PlatformName =
   | 'chromelike_app'
   | 'visualStudio'
   | 'obsidian'
+  | 'vscode-agents'
   | 'agentHome'
   | 'tui';
 
@@ -775,6 +778,7 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/revealInExplorerView'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openFileAtRevset'; path: RepoRelativePath; revset: string}
+  | {type: 'platform/openPreview'; path: RepoRelativePath}
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/openInNewWindow'; path: AbsolutePath}
   | {type: 'platform/openFolder'; path: AbsolutePath}
@@ -797,6 +801,10 @@ export type PlatformSpecificClientToServerMessages =
       scope: 'workspace' | 'global';
     }
   | {type: 'platform/checkForDiagnostics'; paths: Array<RepoRelativePath>}
+  | {
+      type: 'platform/investigateFailure';
+      failure: FailedOperationContext;
+    }
   | {type: 'platform/executeVSCodeCommand'; command: string; args: Array<Json>}
   | {type: 'platform/subscribeToVSCodeConfig'; config: string}
   | {

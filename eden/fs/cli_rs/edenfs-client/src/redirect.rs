@@ -10,10 +10,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 #[cfg(unix)]
+use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::ExitStatus;
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -33,6 +36,18 @@ use psutil::disk::disk_usage;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
+#[cfg(unix)]
+use subprocess::CommunicateError;
+#[cfg(unix)]
+use subprocess::Exec;
+#[cfg(unix)]
+use subprocess::ExitStatus as SubprocessExitStatus;
+#[cfg(unix)]
+use subprocess::NullFile;
+#[cfg(unix)]
+use subprocess::PopenError;
+#[cfg(unix)]
+use subprocess::Redirection as SubprocessRedirection;
 use toml::value::Value;
 
 use crate::checkout::CheckoutConfig;
@@ -46,6 +61,32 @@ use crate::mounttable::read_mount_table;
 pub const REPO_SOURCE: &str = ".eden-redirections";
 const USER_REDIRECTION_SOURCE: &str = ".eden/client/config.toml:redirections";
 pub const APFS_HELPER: &str = "/usr/local/libexec/eden/eden_apfs_mount_helper";
+#[cfg(unix)]
+const MKSCRATCH_SUCCESS_MARKER: &[u8] = b"\x1dEDEN_MKSCRATCH_SUCCESS\x1e";
+#[cfg(unix)]
+const MKSCRATCH_WRAPPER: &str = r#""$@" && printf '\035EDEN_MKSCRATCH_SUCCESS\036' >&2"#;
+
+#[derive(Debug)]
+enum MkscratchExitStatus {
+    Exited(ExitStatus),
+    RecoveredAfterReap,
+}
+
+impl MkscratchExitStatus {
+    fn success(&self) -> bool {
+        match self {
+            MkscratchExitStatus::Exited(status) => status.success(),
+            MkscratchExitStatus::RecoveredAfterReap => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MkscratchOutput {
+    status: MkscratchExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
 
 #[derive(Clone, Serialize, Copy, Debug, PartialEq, PartialOrd)]
 #[serde(rename_all = "lowercase")]
@@ -90,15 +131,13 @@ impl FromStr for RedirectionType {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DarwinBindRedirectionType {
     APFS,
     DMG,
     SYMLINK,
 }
 
-#[cfg(target_os = "macos")]
 impl fmt::Display for DarwinBindRedirectionType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -113,7 +152,6 @@ impl fmt::Display for DarwinBindRedirectionType {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl FromStr for DarwinBindRedirectionType {
     type Err = EdenFsError;
 
@@ -127,8 +165,7 @@ impl FromStr for DarwinBindRedirectionType {
         } else {
             // deliberately did not implement "Unknown"
             Err(EdenFsError::ConfigurationError(format!(
-                "Unknown darwin bind redirection type: {}. Must be one of: apfs, dmg",
-                s
+                "Unknown darwin bind redirection type: {s}. Must be one of: apfs, dmg, symlink"
             )))
         }
     }
@@ -239,8 +276,7 @@ pub struct Redirection {
     pub redir_type: RedirectionType,
     pub source: String,
     pub state: RedirectionState,
-    /// This field is lazily calculated and it is only populated after
-    /// [`Redirection::update_target_abspath`] is called.
+    /// This field is lazily calculated by [`get_effective_redirs_for_mount`].
     pub target: Option<PathBuf>,
 }
 
@@ -260,24 +296,32 @@ impl Redirection {
         .from_err()
     }
 
+    /// Read the configured darwin bind redirection implementation without
+    /// applying apfs-helper availability fallbacks.
+    #[cfg(target_os = "macos")]
+    pub fn configured_bind_redirection_type(
+        instance: &EdenFsInstance,
+    ) -> Result<DarwinBindRedirectionType> {
+        instance
+            .get_config()
+            .map(|config| config.redirections.darwin_redirection_type)
+            .and_then(|ty| DarwinBindRedirectionType::from_str(&ty))
+    }
+
     /// Determine what bind redirection type should be used on macOS. There are currently only 2
     /// options: apfs or dmg. We default to the old behavior, apfs.
     #[cfg(target_os = "macos")]
     pub fn determine_bind_redirection_type(instance: &EdenFsInstance) -> DarwinBindRedirectionType {
-        let config_value = instance
-            .get_config()
-            .map(|config| config.redirections.darwin_redirection_type)
-            .and_then(|ty| DarwinBindRedirectionType::from_str(&ty));
-        let has_apfs_helper = Self::have_apfs_helper().unwrap_or(false);
-        match config_value {
-            Ok(v) if !has_apfs_helper && v == DarwinBindRedirectionType::APFS => {
+        match Self::configured_bind_redirection_type(instance) {
+            Ok(DarwinBindRedirectionType::SYMLINK) => DarwinBindRedirectionType::SYMLINK,
+            Ok(DarwinBindRedirectionType::APFS) if !Self::have_apfs_helper().unwrap_or(false) => {
                 eprintln!(
                     "cannot use apfs redirections since apfs_helper '{APFS_HELPER}' is not available. Defaulting to dmg redirections."
                 );
                 DarwinBindRedirectionType::DMG
             }
             Ok(v) => v,
-            Err(e) if has_apfs_helper => {
+            Err(e) if Self::have_apfs_helper().unwrap_or(false) => {
                 eprintln!("{}. Defaulting to apfs.", e);
                 DarwinBindRedirectionType::APFS
             }
@@ -303,7 +347,127 @@ impl Redirection {
         PathBuf::from("edenfs").join("redirections")
     }
 
-    fn make_scratch_dir(checkout: &EdenFsCheckout, subdir: &Path) -> Result<PathBuf> {
+    fn parse_mkscratch_stdout(stdout: &[u8]) -> Result<PathBuf> {
+        #[cfg(unix)]
+        {
+            let path = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+            Ok(PathBuf::from(OsStr::from_bytes(path)))
+        }
+        #[cfg(windows)]
+        Ok(PathBuf::from(
+            std::str::from_utf8(stdout).from_err()?.trim_end(),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn classify_mkscratch_recovery(
+        status: SubprocessExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Result<MkscratchOutput> {
+        if !matches!(
+            status,
+            SubprocessExitStatus::Exited(0) | SubprocessExitStatus::Undetermined
+        ) {
+            return Err(EdenFsError::Other(anyhow!(
+                "mkscratch recovery wrapper failed with status {status:?}; an underlying signal may be encoded as 128 + signal; stderr: {}",
+                String::from_utf8_lossy(&stderr),
+            )));
+        }
+
+        let stderr = stderr
+            .strip_suffix(MKSCRATCH_SUCCESS_MARKER)
+            .ok_or_else(|| {
+                EdenFsError::Other(anyhow!(
+                    "mkscratch recovery wrapper completed without a success marker; status: {status:?}; stderr: {}",
+                    String::from_utf8_lossy(&stderr),
+                ))
+            })?;
+        Ok(MkscratchOutput {
+            status: MkscratchExitStatus::RecoveredAfterReap,
+            stdout,
+            stderr: stderr.to_vec(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn finish_mkscratch_recovery(
+        mut read_output: impl FnMut() -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), CommunicateError>,
+        mut wait: impl FnMut() -> Result<SubprocessExitStatus, PopenError>,
+    ) -> Result<MkscratchOutput> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let ((out, err), finished) = match read_output() {
+                Ok(capture) => (capture, true),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {
+                    // These bytes have already been consumed from the pipes,
+                    // and may include only part of the success marker.
+                    (error.capture, false)
+                }
+                Err(error) => return Err(error).from_err(),
+            };
+            stdout.extend(out.into_iter().flatten());
+            stderr.extend(err.into_iter().flatten());
+            if finished {
+                break;
+            }
+        }
+
+        let status = loop {
+            match wait() {
+                Err(PopenError::IoError(error)) if error.kind() == ErrorKind::Interrupted => {
+                    continue;
+                }
+                result => break result.from_err()?,
+            }
+        };
+        Self::classify_mkscratch_recovery(status, stdout, stderr)
+    }
+
+    #[cfg(unix)]
+    fn retry_mkscratch_after_reap(mkscratch: &Path, args: &[&str]) -> Result<MkscratchOutput> {
+        let mut child = Exec::cmd("/bin/sh")
+            .arg("-c")
+            .arg(MKSCRATCH_WRAPPER)
+            .arg("--")
+            .arg(mkscratch)
+            .args(args)
+            .stdin(NullFile)
+            .stdout(SubprocessRedirection::Pipe)
+            .stderr(SubprocessRedirection::Pipe)
+            .popen()
+            .from_err()?;
+        let mut communicator = child.communicate_start(None);
+        Self::finish_mkscratch_recovery(|| communicator.read(), || child.wait())
+    }
+
+    fn run_mkscratch(mkscratch: &Path, args: &[&str]) -> Result<MkscratchOutput> {
+        let output = Command::new(mkscratch).args(args).output();
+        match output {
+            Ok(output) => Ok(MkscratchOutput {
+                status: MkscratchExitStatus::Exited(output.status),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                // `mkscratch path` is idempotent, so retry the operation to
+                // recover an exit status instead of trusting output from the
+                // child whose status was reaped by another thread.
+                Redirection::retry_mkscratch_after_reap(mkscratch, args)
+            }
+            Err(error) => Err(error).from_err(),
+        }
+    }
+
+    fn resolve_scratch_dir(
+        checkout: &EdenFsCheckout,
+        subdir: &Path,
+        no_create: bool,
+    ) -> Result<PathBuf> {
+        // This client-library function is also called in the EdenFS daemon by
+        // EdenServiceHandler::listRedirections() through redirect_ffi.
         // TODO(zeyi): we can probably embed the logic from mkscratch here directly, without asking the CLI
         let mkscratch = Redirection::mkscratch_bin();
         let checkout_path_str = checkout.path().to_string_lossy().into_owned();
@@ -311,110 +475,104 @@ impl Redirection {
             .join(subdir)
             .to_string_lossy()
             .into_owned();
-        let args = &["path", &checkout_path_str, "--subdir", &subdir];
-        let output = Command::new(&mkscratch)
-            .args(args)
-            .output()
-            .from_err()
-            .with_context(|| {
-                format!(
-                    "Failed to execute mkscratch cmd: `{} {}`",
-                    mkscratch.display(),
-                    shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
-                )
-            })?;
-        if output.status.success() {
-            #[cfg(unix)]
-            {
-                let path = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-                Ok(PathBuf::from(OsStr::from_bytes(path)))
-            }
-            #[cfg(windows)]
-            Ok(PathBuf::from(
-                std::str::from_utf8(&output.stdout).from_err()?.trim_end(),
-            ))
-        } else {
-            Err(EdenFsError::Other(anyhow!(
-                "Failed to execute `{} {}`, stderr: {}, exit status: {:?}",
+        let mut args = Vec::with_capacity(5);
+        if no_create {
+            args.push("--no-create");
+        }
+        args.extend(["path", &checkout_path_str, "--subdir", &subdir]);
+        let command = || {
+            format!(
+                "{} {}",
                 mkscratch.display(),
-                shlex::try_join(args.iter().copied()).unwrap_or("<undecodeable>".to_string()),
+                shlex::try_join(args.iter().copied())
+                    .unwrap_or_else(|_| "<undecodable arguments>".to_owned()),
+            )
+        };
+        let output = Redirection::run_mkscratch(&mkscratch, &args)
+            .with_context(|| format!("Failed to execute mkscratch cmd: `{}`", command()))?;
+
+        match output.status {
+            MkscratchExitStatus::Exited(status) if status.success() => {
+                Redirection::parse_mkscratch_stdout(&output.stdout)
+            }
+            MkscratchExitStatus::RecoveredAfterReap => {
+                let path = Redirection::parse_mkscratch_stdout(&output.stdout)?;
+                tracing::info!(
+                    command = %command(),
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "mkscratch direct exit status was reaped; retry succeeded"
+                );
+                Ok(path)
+            }
+            status => Err(EdenFsError::Other(anyhow!(
+                "Failed to execute `{}`, stderr: {}, exit status: {:?}",
+                command(),
                 String::from_utf8_lossy(&output.stderr),
-                output.status,
-            )))
+                status,
+            ))),
         }
     }
 
     pub fn expand_target_abspath(
         &self,
-        #[cfg_attr(
-            not(target_os = "macos"),
-            expect(
-                unused_variables,
-                reason = "instance is only used on macOS for APFS bind redirection detection"
-            )
-        )]
         instance: &EdenFsInstance,
         checkout: &EdenFsCheckout,
     ) -> Result<Option<PathBuf>> {
+        self.resolve_target_abspath(instance, checkout, true)
+    }
+
+    fn ensure_target_abspath(
+        &self,
+        instance: &EdenFsInstance,
+        checkout: &EdenFsCheckout,
+    ) -> Result<Option<PathBuf>> {
+        self.resolve_target_abspath(instance, checkout, false)
+    }
+
+    fn resolve_target_abspath(
+        &self,
+        instance: &EdenFsInstance,
+        checkout: &EdenFsCheckout,
+        no_create: bool,
+    ) -> Result<Option<PathBuf>> {
         match self.redir_type {
-            #[cfg(target_os = "macos")]
-            RedirectionType::Bind => {
-                if Self::determine_bind_redirection_type(instance)
-                    == DarwinBindRedirectionType::APFS
-                {
-                    // Ideally we'd return information about the backing, but
-                    // it is a bit awkward to determine this in all contexts;
-                    // prior to creating the volume we don't know anything
-                    // about where it will reside.
-                    // After creating it, we could potentially parse the APFS
-                    // volume information and show something like the backing device.
-                    // We also have a transitional case where there is a small
-                    // population of users on disk image mounts; we actually don't
-                    // have enough knowledge in this code to distinguish between
-                    // a disk image and an APFS volume (but we can tell whether
-                    // either of those is mounted elsewhere in this file, provided
-                    // we have a MountTable to inspect).
-                    // Given our small user base at the moment, it doesn't seem
-                    // super critical to have this tool handle all these cases;
-                    // the same information can be extracted by a human running
-                    // `mount` and `diskutil list`.
-                    // So we just return the mount point path when we believe
-                    // that we can use APFS.
-                    Ok(Some(checkout.path().join(&self.repo_path)))
-                } else {
-                    Ok(Some(Redirection::make_scratch_dir(
-                        checkout,
-                        &self.repo_path,
-                    )?))
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            RedirectionType::Bind => Ok(Some(Redirection::make_scratch_dir(
-                checkout,
-                &self.repo_path,
-            )?)),
-            RedirectionType::Symlink => Ok(Some(Redirection::make_scratch_dir(
-                checkout,
-                &self.repo_path,
-            )?)),
             RedirectionType::Unknown => Ok(None),
+            RedirectionType::Bind | RedirectionType::Symlink
+                if self.uses_checkout_path_as_target(instance, checkout) =>
+            {
+                Ok(Some(checkout.path().join(&self.repo_path)))
+            }
+            RedirectionType::Bind | RedirectionType::Symlink => Ok(Some(
+                Self::resolve_scratch_dir(checkout, &self.repo_path, no_create)?,
+            )),
         }
     }
 
-    pub fn update_target_abspath(
-        &mut self,
+    #[cfg(target_os = "macos")]
+    fn uses_checkout_path_as_target(
+        &self,
         instance: &EdenFsInstance,
         checkout: &EdenFsCheckout,
-    ) -> Result<()> {
-        self.target = self
-            .expand_target_abspath(instance, checkout)
-            .with_context(|| {
-                format!(
-                    "Failed to update target abspath for redirection: {}",
-                    self.repo_path.display()
-                )
-            })?;
-        Ok(())
+    ) -> bool {
+        self.redir_type == RedirectionType::Bind
+            && !self.repo_path_is_symlink(checkout)
+            && Self::determine_bind_redirection_type(instance) == DarwinBindRedirectionType::APFS
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn uses_checkout_path_as_target(
+        &self,
+        _instance: &EdenFsInstance,
+        _checkout: &EdenFsCheckout,
+    ) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn repo_path_is_symlink(&self, checkout: &EdenFsCheckout) -> bool {
+        std::fs::symlink_metadata(self.expand_repo_path(checkout))
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
     }
 
     fn _dmg_file_name(&self, target: &Path) -> PathBuf {
@@ -692,37 +850,30 @@ impl Redirection {
     }
 
     #[cfg(target_os = "macos")]
-    fn _bind_unmount_darwin(
-        &self,
-        instance: &EdenFsInstance,
-        checkout: &EdenFsCheckout,
-    ) -> Result<()> {
+    fn _bind_unmount_darwin(&self, checkout: &EdenFsCheckout) -> Result<()> {
         let mount_path = checkout.path().join(&self.repo_path);
-        if Self::determine_bind_redirection_type(instance) == DarwinBindRedirectionType::SYMLINK {
-            let repo_path = self.expand_repo_path(checkout);
-            remove_symlink(&repo_path)
-                .with_context(|| format!("Failed to remove symlink {}", repo_path.display()))?;
-        } else {
-            // We use unmount instead of eject here since eject has caused issues
-            // by unmounting unrelated apfs volumes in the past. See S325232.
-            let args = &["unmount", "force", &mount_path.to_string_lossy()];
-            let output = Command::new("diskutil")
-                .args(args)
-                .output()
-                .from_err()
-                .with_context(|| {
-                    format!(
-                        "Failed to execute command `diskutil {}`",
-                        shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
-                    )
-                })?;
-            if !output.status.success() {
-                return Err(EdenFsError::Other(anyhow!(format!(
-                    "failed to remove bind mount. stderr: {}\n stdout: {}",
-                    String::from_utf8_lossy(&output.stderr),
-                    String::from_utf8_lossy(&output.stdout)
-                ))));
-            }
+        // Only reached for paths that are real mounts: remove_existing unlinks
+        // symlink-backed redirections based on disposition analysis first.
+        //
+        // We use unmount instead of eject here since eject has caused issues
+        // by unmounting unrelated apfs volumes in the past. See S325232.
+        let args = &["unmount", "force", &mount_path.to_string_lossy()];
+        let output = Command::new("diskutil")
+            .args(args)
+            .output()
+            .from_err()
+            .with_context(|| {
+                format!(
+                    "Failed to execute command `diskutil {}`",
+                    shlex::try_join(args.iter().copied()).unwrap(), // Unwrap OK, we know the args are valid
+                )
+            })?;
+        if !output.status.success() {
+            return Err(EdenFsError::Other(anyhow!(format!(
+                "failed to remove bind mount. stderr: {}\n stdout: {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ))));
         }
         Ok(())
     }
@@ -747,10 +898,10 @@ impl Redirection {
     #[cfg(target_os = "macos")]
     async fn _bind_unmount(
         &self,
-        instance: &EdenFsInstance,
+        _instance: &EdenFsInstance,
         checkout: &EdenFsCheckout,
     ) -> Result<()> {
-        self._bind_unmount_darwin(instance, checkout)
+        self._bind_unmount_darwin(checkout)
     }
 
     #[cfg(target_os = "linux")]
@@ -1037,7 +1188,7 @@ To detect and kill such processes, follow https://fburl.com/edenfs-redirection-n
         }
 
         if self.redir_type == RedirectionType::Bind {
-            let target = self.expand_target_abspath(instance, checkout)?;
+            let target = self.ensure_target_abspath(instance, checkout)?;
             match target {
                 Some(t) => {
                     self._bind_mount(instance, &checkout.path(), &t, force)
@@ -1050,7 +1201,7 @@ To detect and kill such processes, follow https://fburl.com/edenfs-redirection-n
             }
         } else if self.redir_type == RedirectionType::Symlink {
             let target = self
-                .expand_target_abspath(instance, checkout)
+                .ensure_target_abspath(instance, checkout)
                 .with_context(|| {
                     format!(
                         "Failed to expand abspath for target {} in checkout {}",
@@ -1270,8 +1421,17 @@ pub fn get_effective_redirs_for_mount(
 
     redirections
         .values_mut()
-        .map(|v| v.update_target_abspath(instance, &checkout))
-        .collect::<Result<Vec<()>, _>>()
+        .try_for_each(|redir| -> Result<()> {
+            redir.target = redir
+                .expand_target_abspath(instance, &checkout)
+                .with_context(|| {
+                    format!(
+                        "Failed to expand target abspath for redirection: {}",
+                        redir.repo_path.display()
+                    )
+                })?;
+            Ok(())
+        })
         .with_context(|| anyhow!("failed to expand redirection target path"))?;
 
     Ok(redirections)
@@ -1332,24 +1492,43 @@ pub fn get_effective_redirections(
             checkout.path().display()
         )
     })?;
+
+    #[cfg(target_os = "macos")]
+    let bind_redirection_uses_symlink = configured_redirections
+        .values()
+        .any(|redir| redir.redir_type == RedirectionType::Bind)
+        && Redirection::determine_bind_redirection_type(instance)
+            == DarwinBindRedirectionType::SYMLINK;
+    #[cfg(target_os = "windows")]
+    let bind_redirection_uses_symlink = true;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let bind_redirection_uses_symlink = false;
+
     for (rel_path, mut redir) in configured_redirections {
         let is_in_mount_table = redirs.contains_key(&rel_path);
+        #[cfg(target_os = "macos")]
+        let bind_redirection_is_symlink =
+            redir.redir_type == RedirectionType::Bind && redir.repo_path_is_symlink(checkout);
+        #[cfg(not(target_os = "macos"))]
+        let bind_redirection_is_symlink = false;
+        let uses_symlink = redirection_uses_symlink(
+            redir.redir_type,
+            bind_redirection_uses_symlink,
+            bind_redirection_is_symlink,
+        );
         if is_in_mount_table {
             // The configured redirection entries take precedence over the mount table entries.
             // We overwrite them in the `redirs` map.
-            if redir.redir_type != RedirectionType::Bind {
+            //
+            // A symlink-backed redirection should never appear in the mount table; if
+            // one does, we don't know what is mounted there. Mount-backed binds found
+            // in the table are assumed to be mounted correctly.
+            if uses_symlink {
                 redir.state = RedirectionState::UnknownMount;
             }
-            // else: we expected them to be in the mount table and they were.
-            // we don't know enough to tell whether the mount points where
-            // we want it to point, so we just assume that it is in the right
-            // state.
-        } else if redir.redir_type == RedirectionType::Bind && !cfg!(windows) {
-            // We expected both of these types to be visible in the
-            // mount table, but they were not, so we consider them to
-            // be in the NOT_MOUNTED state.
+        } else if redir.redir_type == RedirectionType::Bind && !uses_symlink {
             redir.state = RedirectionState::NotMounted;
-        } else if redir.redir_type == RedirectionType::Symlink || cfg!(windows) {
+        } else if uses_symlink {
             if let Ok(is_correct) = is_symlink_correct(instance, &redir, checkout) {
                 if !is_correct {
                     redir.state = RedirectionState::SymlinkIncorrect;
@@ -1367,6 +1546,16 @@ pub fn get_effective_redirections(
     }
 
     Ok(redirs)
+}
+
+fn redirection_uses_symlink(
+    redirection_type: RedirectionType,
+    bind_redirection_uses_symlink: bool,
+    bind_redirection_is_symlink: bool,
+) -> bool {
+    redirection_type == RedirectionType::Symlink
+        || (redirection_type == RedirectionType::Bind
+            && (bind_redirection_uses_symlink || bind_redirection_is_symlink))
 }
 
 /// We should return success early iff:
@@ -1490,6 +1679,15 @@ fn resolve_repo_relative_path(checkout: &EdenFsCheckout, repo_rel_path: &Path) -
     }
 }
 
+fn redirection_needs_repair(state: &RedirectionState) -> bool {
+    matches!(
+        state,
+        RedirectionState::NotMounted
+            | RedirectionState::SymlinkMissing
+            | RedirectionState::SymlinkIncorrect
+    )
+}
+
 pub async fn try_add_redirection(
     instance: &EdenFsInstance,
     checkout: &EdenFsCheckout,
@@ -1556,8 +1754,7 @@ pub async fn try_add_redirection(
         let existing_redir_state = &existing_redir.state;
         if existing_redir.repo_path == redir.repo_path
             && !force_remount_bind_mounts
-            && *existing_redir_state != RedirectionState::NotMounted
-            && *existing_redir_state != RedirectionState::SymlinkMissing
+            && !redirection_needs_repair(existing_redir_state)
         {
             eprintln!(
                 "Skipping {}; it is already configured. (use \
@@ -1653,8 +1850,6 @@ pub mod scratch {
     use anyhow::Result;
     use edenfs_utils::metadata::MetadataExt;
     use rayon::prelude::*;
-    use subprocess::Exec;
-    use subprocess::Redirection as SubprocessRedirection;
 
     use super::Redirection;
 
@@ -1844,15 +2039,27 @@ pub mod scratch {
             "--subdir",
             &*scratch_subdir_str,
         ];
-        let mkscratch_res = Exec::cmd(mkscratch)
-            .args(&mkscratch_args)
-            .stdout(SubprocessRedirection::Pipe)
-            .stderr(SubprocessRedirection::Pipe)
-            .capture();
+        let mkscratch_res = Redirection::run_mkscratch(&mkscratch, &mkscratch_args);
 
         let scratch_path = match mkscratch_res {
-            Ok(output) if output.success() => PathBuf::from(output.stdout_str().trim()),
-            _ => return Ok(vec![]),
+            Ok(output) if output.status.success() => {
+                Redirection::parse_mkscratch_stdout(&output.stdout)?
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    status = ?output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "failed to query mkscratch path while finding orphaned redirections"
+                );
+                return Ok(vec![]);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to run mkscratch while finding orphaned redirections"
+                );
+                return Ok(vec![]);
+            }
         };
 
         get_orphaned_redirection_targets_impl(scratch_path, scratch_subdir, existing_redirections)
@@ -2031,22 +2238,268 @@ pub mod scratch {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::ErrorKind;
+    #[cfg(unix)]
+    use std::iter::once;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    use edenfs_error::EdenFsError;
     #[cfg(target_os = "windows")]
     use mkscratch::zzencode;
     use rand::distr::Alphanumeric;
     use rand::distr::SampleString;
     use serde_test::Token;
     use serde_test::assert_ser_tokens;
+    #[cfg(unix)]
+    use subprocess::CommunicateError;
+    #[cfg(unix)]
+    use subprocess::PopenError;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use crate::redirect::MKSCRATCH_SUCCESS_MARKER;
+    #[cfg(unix)]
+    use crate::redirect::MkscratchExitStatus;
     use crate::redirect::REPO_SOURCE;
     use crate::redirect::Redirection;
     use crate::redirect::RedirectionState;
     use crate::redirect::RedirectionType;
     use crate::redirect::RepoPathDisposition;
+    #[cfg(unix)]
+    use crate::redirect::SubprocessExitStatus;
+    use crate::redirect::redirection_needs_repair;
+    use crate::redirect::redirection_uses_symlink;
+
+    #[test]
+    fn test_broken_redirection_states_need_repair() {
+        assert!(redirection_needs_repair(&RedirectionState::NotMounted));
+        assert!(redirection_needs_repair(&RedirectionState::SymlinkMissing));
+        assert!(redirection_needs_repair(
+            &RedirectionState::SymlinkIncorrect
+        ));
+        assert!(!redirection_needs_repair(
+            &RedirectionState::MatchesConfiguration
+        ));
+        assert!(!redirection_needs_repair(&RedirectionState::UnknownMount));
+    }
+
+    #[test]
+    fn test_bind_redirection_with_symlink_backing_uses_symlink_state() {
+        assert!(
+            redirection_uses_symlink(RedirectionType::Symlink, false, false),
+            "explicit symlink redirections should use symlink state detection"
+        );
+        assert!(
+            redirection_uses_symlink(RedirectionType::Bind, true, false),
+            "bind redirections should use symlink state detection when configured"
+        );
+        assert!(
+            redirection_uses_symlink(RedirectionType::Bind, false, true),
+            "bind redirections should use symlink state detection when already backed by a symlink"
+        );
+        assert!(
+            !redirection_uses_symlink(RedirectionType::Bind, false, false),
+            "mount-backed bind redirections should use mount state detection"
+        );
+    }
+
+    #[test]
+    fn test_parse_mkscratch_stdout_preserves_success_path_behavior() {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                Redirection::parse_mkscratch_stdout(b"relative/scratch\n")
+                    .expect("mkscratch path should parse"),
+                PathBuf::from("relative/scratch"),
+            );
+            assert_eq!(
+                Redirection::parse_mkscratch_stdout(b"relative/scratch\r\n")
+                    .expect("CRLF-terminated mkscratch path should parse"),
+                PathBuf::from("relative/scratch\r"),
+            );
+            assert_eq!(
+                Redirection::parse_mkscratch_stdout(b"relative/\xff\n")
+                    .expect("non-UTF-8 mkscratch path should parse")
+                    .as_os_str()
+                    .as_bytes(),
+                b"relative/\xff",
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                Redirection::parse_mkscratch_stdout(b"relative\\scratch\r\n")
+                    .expect("mkscratch path should parse"),
+                PathBuf::from(r"relative\scratch"),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_requires_success_marker() {
+        let success = Redirection::classify_mkscratch_recovery(
+            SubprocessExitStatus::Undetermined,
+            b"/tmp/scratch\n".to_vec(),
+            [b"warning".as_slice(), MKSCRATCH_SUCCESS_MARKER].concat(),
+        )
+        .expect("marked output should prove success");
+        assert!(matches!(
+            success.status,
+            MkscratchExitStatus::RecoveredAfterReap
+        ));
+        assert_eq!(success.stdout, b"/tmp/scratch\n");
+        assert_eq!(success.stderr, b"warning");
+
+        assert_eq!(
+            Redirection::parse_mkscratch_stdout(&success.stdout)
+                .expect("successful output should contain a path"),
+            PathBuf::from("/tmp/scratch"),
+        );
+
+        assert!(
+            Redirection::classify_mkscratch_recovery(
+                SubprocessExitStatus::Undetermined,
+                b"/tmp/scratch\n".to_vec(),
+                b"warning".to_vec(),
+            )
+            .is_err(),
+            "unmarked output must not turn an unknown exit status into success",
+        );
+
+        assert!(
+            Redirection::classify_mkscratch_recovery(
+                SubprocessExitStatus::Exited(7),
+                b"/tmp/scratch\n".to_vec(),
+                [b"warning".as_slice(), MKSCRATCH_SUCCESS_MARKER].concat(),
+            )
+            .is_err(),
+            "a marker must not hide a known failure",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_resumes_interrupted_reads_and_waits() {
+        let (marker_start, marker_end) =
+            MKSCRATCH_SUCCESS_MARKER.split_at(MKSCRATCH_SUCCESS_MARKER.len() / 2);
+        let mut reads = [
+            Err(CommunicateError {
+                error: ErrorKind::Interrupted.into(),
+                capture: (Some(b"/tmp/".to_vec()), Some(b"war".to_vec())),
+            }),
+            Err(CommunicateError {
+                error: ErrorKind::Interrupted.into(),
+                capture: (
+                    Some(b"scratch\n".to_vec()),
+                    Some([b"ning".as_slice(), marker_start].concat()),
+                ),
+            }),
+            Ok((None, Some(marker_end.to_vec()))),
+        ]
+        .into_iter();
+        let mut waits = [
+            Err(PopenError::IoError(ErrorKind::Interrupted.into())),
+            Err(PopenError::IoError(ErrorKind::Interrupted.into())),
+            Ok(SubprocessExitStatus::Undetermined),
+        ]
+        .into_iter();
+
+        let output = Redirection::finish_mkscratch_recovery(
+            || reads.next().expect("must stop reading at EOF"),
+            || waits.next().expect("must stop waiting after completion"),
+        )
+        .expect("interrupted I/O must preserve the complete output and marker");
+
+        assert!(matches!(
+            output.status,
+            MkscratchExitStatus::RecoveredAfterReap
+        ));
+        assert_eq!(output.stdout, b"/tmp/scratch\n");
+        assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_preserves_read_errors() {
+        let mut reads = once(Err(CommunicateError {
+            error: ErrorKind::PermissionDenied.into(),
+            capture: (
+                Some(b"/tmp/scratch\n".to_vec()),
+                Some(MKSCRATCH_SUCCESS_MARKER.to_vec()),
+            ),
+        }));
+        let error = Redirection::finish_mkscratch_recovery(
+            || reads.next().expect("must not retry a non-interrupted read"),
+            || panic!("must propagate a read error before collecting exit status"),
+        )
+        .expect_err("even marked output must not hide an I/O failure");
+
+        let EdenFsError::Other(error) = error else {
+            panic!("expected the original communication error");
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<CommunicateError>()
+                .expect("must preserve the communication error")
+                .kind(),
+            ErrorKind::PermissionDenied,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_preserves_wait_errors() {
+        let mut reads = once(Ok((
+            Some(b"/tmp/scratch\n".to_vec()),
+            Some(MKSCRATCH_SUCCESS_MARKER.to_vec()),
+        )));
+        let mut waits = once(Err(PopenError::IoError(ErrorKind::PermissionDenied.into())));
+        let error = Redirection::finish_mkscratch_recovery(
+            || reads.next().expect("must not reread output while waiting"),
+            || waits.next().expect("must not retry a non-interrupted wait"),
+        )
+        .expect_err("even marked output must not hide a wait failure");
+
+        let EdenFsError::Other(error) = error else {
+            panic!("expected the original process error");
+        };
+        assert!(matches!(
+            error.downcast_ref::<PopenError>(),
+            Some(PopenError::IoError(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mkscratch_recovery_wrapper_reports_command_result() {
+        let success = Redirection::retry_mkscratch_after_reap(
+            Path::new("/bin/sh"),
+            &["-c", "printf '/tmp/scratch\\n'; printf warning >&2"],
+        )
+        .expect("successful retry should be recognized");
+        assert!(matches!(
+            success.status,
+            MkscratchExitStatus::RecoveredAfterReap
+        ));
+        assert_eq!(success.stdout, b"/tmp/scratch\n");
+        assert_eq!(success.stderr, b"warning");
+
+        assert!(
+            Redirection::retry_mkscratch_after_reap(
+                Path::new("/bin/sh"),
+                &["-c", "printf failure >&2; exit 7"],
+            )
+            .is_err(),
+            "a failed retry must remain a failure",
+        );
+    }
 
     #[test]
     fn test_apply_symlink() {

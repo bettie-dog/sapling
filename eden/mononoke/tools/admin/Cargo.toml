@@ -60,7 +60,7 @@ derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/rep
 derive_more = { version = "2.1.1", features = ["full"] }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
 directory_branch_cluster_manifest = { version = "0.1.0", path = "../../derived_data/directory_branch_cluster_manifest" }
-either = "1.17.0"
+either = "1.18.0"
 enabled_derived_data_types = { version = "0.1.0", path = "../../repo_attributes/enabled_derived_data_types" }
 ephemeral_blobstore = { version = "0.1.0", path = "../../blobstore/ephemeral_blobstore" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
@@ -69,7 +69,7 @@ fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git"
 fileblob = { version = "0.1.0", path = "../../blobstore/fileblob" }
 filenodes = { version = "0.1.0", path = "../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -145,10 +145,9 @@ sapling-renderdag = { version = "0.1.0", path = "../../../scm/lib/renderdag" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-sha2 = "0.10.6"
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 skeleton_manifest_v2 = { version = "0.1.0", path = "../../derived_data/skeleton_manifest_v2" }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
@@ -165,6 +164,7 @@ tokio-util = { version = "0.7.19", features = ["full"] }
 topo_sort = { version = "0.1.0", path = "../../common/topo_sort" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
+uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 walkdir = "2.3"
 
 [dev-dependencies]

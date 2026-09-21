@@ -1,8 +1,11 @@
 ---
+name: thrift-rust
 description: Rules for working with the Rust Thrift runtime (fbthrift crate)
-apply_to_regex: "fbcode/thrift/lib/rust/.*|xplat/thrift/lib/rust/.*"
-oncalls:
-  - rust_thrift
+metadata:
+  oncalls:
+    - rust_thrift
+  strict: true
+  apply_to_path: "fbcode/thrift/lib/rust/.*|xplat/thrift/lib/rust/.*"
 ---
 
 # Rust Thrift Runtime (fbthrift) Rules
@@ -69,6 +72,8 @@ oncalls:
 - Edit source files in `fbcode/thrift/lib/rust/`. Dirsync handles xplat.
 - Fix all warnings -- `#![deny(warnings)]` makes them hard errors.
 - Use `bail_err!` and `ensure_err!` macros for error handling (defined in `lib.rs`).
+- Use `ThriftEnum::variant_name()` (defaulted in `lib.rs`) to get a variant's static name; it returns `None` for
+  unknown open-enum values, so handle that case instead of unwrapping.
 - Run unit tests: `buck test fbsource//xplat/thrift/lib/rust:fbthrift-unittest`.
 - Run dep_tests for integration coverage: `buck2 test fbcode//thrift/lib/rust/src/dep_tests/...`.
 

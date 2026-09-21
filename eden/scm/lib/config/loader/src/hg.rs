@@ -836,6 +836,11 @@ pub fn maybe_refresh_internalconfig_on_disk(
                 // Attempt to create the directory (ex. ".git/sl") and try again.
                 fs::create_dir_all(&config_dir)?;
                 continue;
+            } else if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied {
+                // Restricted Windows environments can deny this probe even when writes work.
+                // Ensure the directory exists and let the actual write report any real error.
+                fs::create_dir_all(&config_dir)?;
+                break;
             } else {
                 return Err(IOError::new(
                     ErrorKind::PermissionDenied,
@@ -855,7 +860,7 @@ pub fn maybe_refresh_internalconfig_on_disk(
         version,
         repo_name.as_ref().map_or("no_repo", |r| r.as_ref()),
         canary.as_ref(),
-        &user_name,
+        user_name,
         client_network_override
             .map(|client_network| format!("# domain-override={}\n", client_network.to_str()))
             .unwrap_or_default(),

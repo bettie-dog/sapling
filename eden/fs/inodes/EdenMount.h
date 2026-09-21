@@ -107,6 +107,11 @@ class SharedRenameLock;
 
 constexpr int kMaxSymlinkChainDepth = 40; // max depth of symlink chain
 
+// Checkout carries RenameLock across async continuations, so release may run
+// on a different worker thread from acquire. Use the same SharedMutex
+// implementation without TSan's thread-affine rwlock annotations.
+using RenameMutex = folly::SharedMutexSuppressTSAN;
+
 /**
  * Represents an inode state transition and the duration it took for the event
  * to occur. Currently this tracks inode loads and inode materializations. This
@@ -670,22 +675,22 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
 
   /**
    * Record the outcome of a completed pressure-based GC run, updating
-   * isPressureGcStalled().
+   * isPressureGcBackedOff(). numUnloaded is what the run reclaimed: what its
+   * own sweep unloaded plus the remembered inodes forgotten while it ran.
    */
-  void recordPressureGcOutcome(
-      uint64_t numInvalidated,
-      uint64_t inodesBefore,
-      uint64_t inodesAfter);
+  void recordPressureGcOutcome(uint64_t numInvalidated, uint64_t numUnloaded);
 
   /**
-   * Whether the most recent pressure-based GC run failed to reclaim the
-   * inodes it invalidated. When EdenFS tracks FS refcounts the kernel no
-   * longer holds, GC invalidations fail (silently) with ENOENT and produce
-   * no FORGETs, so rerunning pressure GC just re-invalidates the same
-   * inodes to no effect.
+   * Whether pressure-based GC should wait the regular GC period before
+   * running again, because the most recent pressure-based run reclaimed too
+   * few of the inodes it invalidated or a run was cancelled for repeated
+   * tree-load failures. When EdenFS tracks FS refcounts the kernel no longer
+   * holds, GC invalidations fail (silently) with ENOENT and produce no
+   * FORGETs, so rerunning pressure GC just re-invalidates the same inodes to
+   * no effect. Cleared by the next pressure-based run that reclaims enough.
    */
-  bool isPressureGcStalled() const {
-    return pressureGcStalled_.load(std::memory_order_relaxed);
+  bool isPressureGcBackedOff() const {
+    return pressureGcBackoff_.load(std::memory_order_relaxed);
   }
 
   const CheckoutConfig* getCheckoutConfig() const {
@@ -1158,6 +1163,12 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   std::optional<InodeGCLease> tryStartInodeGC();
 
   /**
+   * Count a tree-load failure in the active GC run, cancelling it and backing
+   * off pressure-based GC when the configured failure limit is reached.
+   */
+  void recordInodeGCTreeLoadFailure();
+
+  /**
    * Cancel the active GC and supersede its lease. The returned lease prevents
    * new GCs from starting while the canceled GC finishes asynchronously.
    */
@@ -1416,7 +1427,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Any operation that modifies an existing InodeBase's location_ data must
    * hold the rename lock.
    */
-  mutable folly::SharedMutex renameMutex_;
+  mutable RenameMutex renameMutex_;
 
   /**
    * The IDs of the parent commit of the working directory.
@@ -1524,6 +1535,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   struct InodeGCState {
     bool gcRunning{false};
     uint64_t inhibitorCount{0};
+    uint64_t treeLoadFailureLimit{0};
+    uint64_t remainingTreeLoadFailures{0};
     folly::CancellationSource cancellationSource;
   };
   folly::Synchronized<InodeGCState> inodeGCState_;
@@ -1561,10 +1574,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       cachedPressurePolicy_;
 
   /**
-   * Whether the most recent pressure-based GC run failed to reclaim the
-   * inodes it invalidated. See recordPressureGcOutcome().
+   * Whether pressure-based GC should wait the regular GC period before
+   * running again. See isPressureGcBackedOff().
    */
-  std::atomic<bool> pressureGcStalled_{false};
+  std::atomic<bool> pressureGcBackoff_{false};
 };
 
 /**
@@ -1574,11 +1587,11 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
  * but it also provides a helper method to ensure that it is currently holding
  * a lock on the desired mount.
  */
-class RenameLock : public std::unique_lock<folly::SharedMutex> {
+class RenameLock : public std::unique_lock<RenameMutex> {
  public:
   RenameLock() {}
   explicit RenameLock(EdenMount* mount)
-      : std::unique_lock<folly::SharedMutex>{mount->renameMutex_} {}
+      : std::unique_lock<RenameMutex>{mount->renameMutex_} {}
 
   bool isHeld(EdenMount* mount) const {
     return owns_lock() && (mutex() == &mount->renameMutex_);
@@ -1588,10 +1601,10 @@ class RenameLock : public std::unique_lock<folly::SharedMutex> {
 /**
  * SharedRenameLock is a holder for an EdenMount's rename mutex in shared mode.
  */
-class SharedRenameLock : public std::shared_lock<folly::SharedMutex> {
+class SharedRenameLock : public std::shared_lock<RenameMutex> {
  public:
   explicit SharedRenameLock(EdenMount* mount)
-      : std::shared_lock<folly::SharedMutex>{mount->renameMutex_} {}
+      : std::shared_lock<RenameMutex>{mount->renameMutex_} {}
 
   bool isHeld(EdenMount* mount) const {
     return owns_lock() && (mutex() == &mount->renameMutex_);

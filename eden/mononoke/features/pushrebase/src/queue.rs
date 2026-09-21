@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,6 @@ use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::RepoConfigRef;
 use mononoke_macros::mononoke;
 use mononoke_types::CaseConflictTrie;
-use mononoke_types::ChangesetId;
 use mononoke_types::PrefixTrie;
 use pushrebase_hooks::RepoLockPushrebaseHook;
 use pushrebase_hooks::get_pushrebase_hooks;
@@ -25,7 +25,6 @@ use stats::prelude::*;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::MergedFileInfo;
 use crate::PushrebaseError;
 use crate::PushrebaseOutcome;
 use crate::PushrebaseQueueRepo;
@@ -74,8 +73,6 @@ mod service_stats {
 pub(super) struct QueuedPushrebaseRequest {
     pub(super) ctx: CoreContext,
     pub(super) stack: PushrebaseStack,
-    pub(super) conflict_check_base: ChangesetId,
-    pub(super) carried_merge_file_info: Vec<MergedFileInfo>,
     pub(super) retry_num: PushrebaseRetryNum,
     pub(super) response_tx:
         oneshot::Sender<Result<PushrebaseOutcome, SharedError<PushrebaseError>>>,
@@ -95,13 +92,24 @@ pub struct PushrebaseQueue {
 }
 
 impl PushrebaseQueue {
-    pub fn new<R, F>(batch_ctx: CoreContext, bookmark: BookmarkKey, resolve_repo: F) -> Self
+    pub fn new<R, F>(
+        batch_ctx: CoreContext,
+        repo_name: String,
+        bookmark: BookmarkKey,
+        resolve_repo: F,
+    ) -> Self
     where
         R: PushrebaseQueueRepo + 'static,
         F: Fn() -> Option<Arc<R>> + Send + 'static,
     {
         let (sender, receiver) = mpsc::channel(1000);
-        mononoke::spawn_task(run_queue(batch_ctx, bookmark, resolve_repo, receiver));
+        mononoke::spawn_task(run_queue(
+            batch_ctx,
+            repo_name,
+            bookmark,
+            resolve_repo,
+            receiver,
+        ));
         Self { sender }
     }
 
@@ -125,7 +133,6 @@ fn partition_requests(
     let mut batches = vec![];
     let mut conflicts = 0;
     let request_batches = requests.into_iter().map(|request| {
-        let conflict_check_base = request.stack.root;
         let ctx = pushrebase_context(&request.ctx, &request.flags);
         let mut flags = request.flags;
         // Attribution belongs to each request, not to the shared execution.
@@ -137,17 +144,34 @@ fn partition_requests(
             requests: vec![QueuedPushrebaseRequest {
                 ctx,
                 stack: request.stack,
-                conflict_check_base,
-                carried_merge_file_info: vec![],
                 retry_num: PushrebaseRetryNum(0),
                 response_tx: request.response_tx,
                 enqueued_at: request.enqueued_at,
             }],
         }
     });
-    let mut request_batches = retry_batches.into_iter().chain(request_batches).peekable();
+    let mut request_batches = retry_batches
+        .into_iter()
+        .chain(request_batches)
+        .map(|batch| {
+            // Merges may derive the onto manifest, so they need a persisted base.
+            let has_merge = batch
+                .requests
+                .iter()
+                .flat_map(|request| request.stack.changesets.iter())
+                .any(|changeset| changeset.is_merge());
+            (batch, has_merge)
+        })
+        .peekable();
 
-    while let Some(mut batch) = request_batches.next() {
+    while let Some((mut batch, has_merge)) = request_batches.next() {
+        // Rebase mappings and hooks are keyed by the original changeset ID.
+        let mut changeset_ids = batch
+            .requests
+            .iter()
+            .flat_map(|request| request.stack.changesets.iter())
+            .map(|changeset| changeset.get_changeset_id())
+            .collect::<HashSet<_>>();
         let mut changed_files = batch
             .requests
             .iter()
@@ -166,7 +190,8 @@ fn partition_requests(
                     )
                     .is_some();
 
-            while let Some(request_batch) = request_batches.peek_mut()
+            while !has_merge
+                && let Some((request_batch, false)) = request_batches.peek_mut()
                 && batch.flags == request_batch.flags
                 && batch.repo_lock == request_batch.repo_lock
             {
@@ -178,6 +203,11 @@ fn partition_requests(
                 if request_changed_files
                     .iter()
                     .any(|path| changed_files.has_path_conflict(path))
+                    || request_batch
+                        .requests
+                        .iter()
+                        .flat_map(|request| request.stack.changesets.iter())
+                        .any(|changeset| !changeset_ids.insert(changeset.get_changeset_id()))
                     || (batch.flags.casefolding_check
                         && (has_case_conflict
                             || case_conflicts
@@ -206,6 +236,7 @@ fn partition_requests(
 
 async fn run_queue<R, F>(
     batch_ctx: CoreContext,
+    repo_name: String,
     bookmark: BookmarkKey,
     resolve_repo: F,
     mut receiver: mpsc::Receiver<PushrebaseRequest>,
@@ -241,10 +272,12 @@ async fn run_queue<R, F>(
         };
         let max_batch_time = Duration::from_millis(justknobs::get_as::<u64>(
             "scm/mononoke:land_service_batch_time_ms",
-            None,
+            Some(&repo_name),
         ));
-        let max_batch_commits =
-            justknobs::get_as::<usize>("scm/mononoke:land_service_batch_max_commits", None);
+        let max_batch_commits = justknobs::get_as::<usize>(
+            "scm/mononoke:land_service_batch_max_commits",
+            Some(&repo_name),
+        );
         let sleep = tokio::time::sleep(max_batch_time);
         tokio::pin!(sleep);
 
@@ -281,33 +314,18 @@ async fn run_queue<R, F>(
         STATS::intra_batch_conflict_count.add_value(conflicts as i64);
 
         for mut batch in batches {
+            let batch_total_commits = batch
+                .requests
+                .iter()
+                .map(|request| request.stack.changesets.len())
+                .sum::<usize>();
             STATS::batch_size.add_value(batch.requests.len() as i64);
-            STATS::batch_total_commits.add_value(
-                batch
-                    .requests
-                    .iter()
-                    .map(|request| request.stack.changesets.len())
-                    .sum::<usize>() as i64,
-            );
-            for request in &batch.requests {
-                STATS::batch_queue_time_ms.add_value(
-                    request
-                        .enqueued_at
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(i64::MAX),
-                );
-                request
-                    .ctx
-                    .scuba()
-                    .clone()
-                    .add("batch_size", batch.requests.len())
-                    .log_with_msg("Batch received", None);
-            }
+            STATS::batch_total_commits.add_value(batch_total_commits as i64);
 
-            let max_requeue =
-                justknobs::get_as::<usize>("scm/mononoke:land_service_batch_max_requeue", None);
+            let max_requeue = justknobs::get_as::<usize>(
+                "scm/mononoke:land_service_batch_max_requeue",
+                Some(&repo_name),
+            );
             let Some(repo) = resolve_repo() else {
                 service_stats::record(false);
                 let error = SharedError::from(PushrebaseError::Error(anyhow!(
@@ -322,9 +340,36 @@ async fn run_queue<R, F>(
                 scuba
                     .add("repo_name", repo.repo_identity().name())
                     .add("bookmark", bookmark.to_string())
-                    .add("batch_size", batch.requests.len());
+                    .add("batch_size", batch.requests.len())
+                    .add("batch_total_commits", batch_total_commits);
                 scuba
             });
+            let batch_size = batch.requests.len();
+            for request in &mut batch.requests {
+                let queue_time_ms = request
+                    .enqueued_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(i64::MAX);
+                STATS::batch_queue_time_ms.add_value(queue_time_ms);
+                request.ctx = request.ctx.with_mutated_scuba(|mut scuba| {
+                    scuba
+                        .add("repo_name", repo.repo_identity().name())
+                        .add("bookmark", bookmark.as_str())
+                        .add("changesets_count", request.stack.changesets.len());
+                    scuba
+                });
+                request
+                    .ctx
+                    .scuba()
+                    .clone()
+                    .add("batch_size", batch_size)
+                    .add("batch_total_commits", batch_total_commits)
+                    .add("batch_queue_time_ms", queue_time_ms)
+                    .add("retry_num", request.retry_num.0)
+                    .log_with_msg("Batch received", None);
+            }
             let mut hooks = match get_pushrebase_hooks(
                 &ctx,
                 repo.as_ref(),
@@ -387,17 +432,23 @@ async fn run_queue<R, F>(
 
 #[cfg(test)]
 mod tests {
+    use blobstore::Loadable;
     use fbinit::FacebookInit;
     use mononoke_macros::mononoke;
     use mononoke_types::BonsaiChangesetMut;
+    use mononoke_types::ChangesetId;
     use mononoke_types::ContentId;
     use mononoke_types::FileChange;
     use mononoke_types::FileType;
     use mononoke_types::GitLfs;
     use mononoke_types::NonRootMPath;
     use mononoke_types::hash::Blake2;
+    use repo_blobstore::RepoBlobstoreRef;
+    use tests_utils::CreateCommitContext;
+    use tests_utils::bookmark;
 
     use super::*;
+    use crate::tests::PushrebaseTestRepo;
 
     fn request(fb: FacebookInit, path: &str) -> PushrebaseRequest {
         let id = ChangesetId::new(Blake2::from_byte_array([1; 32]));
@@ -427,6 +478,8 @@ mod tests {
                 changesets: vec![changeset],
                 head: id,
                 root: id,
+                conflict_check_base: id,
+                carried_merge_file_info: vec![],
             },
             flags: PushrebaseFlags::default(),
             repo_lock: RepoLockPolicy::Bypass,
@@ -450,6 +503,135 @@ mod tests {
             [1, 2]
         );
         assert_eq!(conflicts, 1);
+    }
+
+    #[mononoke::fbinit_test]
+    async fn isolates_requests_with_merges(fb: FacebookInit) -> anyhow::Result<()> {
+        for boundary in [true, false] {
+            let mut merge = request(fb, "merge");
+            let mut parent = merge.stack.changesets[0].clone().into_mut();
+            parent.parents = vec![merge.stack.root];
+            let parent = parent.freeze()?;
+            let other_parent = if boundary {
+                ChangesetId::new(Blake2::from_byte_array([3; 32]))
+            } else {
+                merge.stack.root
+            };
+            let head = BonsaiChangesetMut {
+                parents: vec![parent.get_changeset_id(), other_parent],
+                ..Default::default()
+            }
+            .freeze()?;
+            merge.stack.head = head.get_changeset_id();
+            merge.stack.changesets = vec![parent, head];
+            let (batches, _) = partition_requests(
+                vec![],
+                vec![
+                    request(fb, "a"),
+                    request(fb, "b"),
+                    merge,
+                    request(fb, "c"),
+                    request(fb, "d"),
+                ],
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(|batch| batch.requests.len())
+                    .collect::<Vec<_>>(),
+                [2, 1, 2]
+            );
+            let (batches, _) = partition_requests(batches, vec![]);
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(|batch| batch.requests.len())
+                    .collect::<Vec<_>>(),
+                [2, 1, 2],
+                "retry batches must keep merge requests isolated"
+            );
+        }
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn shared_empty_commits_land_in_separate_batches(fb: FacebookInit) -> anyhow::Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: PushrebaseTestRepo = test_repo_factory::build_empty(fb).await?;
+        let bookmark_name = BookmarkKey::new("master")?;
+        let root = CreateCommitContext::new_root(&ctx, &repo).commit().await?;
+        bookmark(&ctx, &repo, bookmark_name.clone())
+            .set_to(root)
+            .await?;
+        let mut empty_commits = vec![];
+        for message in ["first", "second"] {
+            let id = CreateCommitContext::new(&ctx, &repo, vec![root])
+                .set_message(message)
+                .commit()
+                .await?;
+            empty_commits.push(id.load(&ctx, repo.repo_blobstore()).await?);
+        }
+        let (requests, receivers): (Vec<_>, Vec<_>) = [0, 1, 1, 0]
+            .into_iter()
+            .map(|index| {
+                let (response_tx, response_rx) = oneshot::channel();
+                let changeset = &empty_commits[index];
+                (
+                    PushrebaseRequest {
+                        ctx: ctx.clone(),
+                        stack: PushrebaseStack {
+                            root,
+                            conflict_check_base: root,
+                            carried_merge_file_info: vec![],
+                            head: changeset.get_changeset_id(),
+                            changesets: vec![changeset.clone()],
+                            changed_files: vec![],
+                        },
+                        flags: PushrebaseFlags::default(),
+                        repo_lock: RepoLockPolicy::Bypass,
+                        response_tx,
+                        enqueued_at: tokio::time::Instant::now(),
+                    },
+                    response_rx,
+                )
+            })
+            .unzip();
+        let (batches, conflicts) = partition_requests(vec![], requests);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.requests.len())
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+        assert_eq!(conflicts, 1);
+        let (batches, conflicts) = partition_requests(batches, vec![]);
+        assert_eq!(batches.len(), 2, "retry batches must remain separate");
+        assert_eq!(conflicts, 1);
+        for batch in batches {
+            assert!(
+                do_batched_pushrebase(
+                    &ctx,
+                    &repo,
+                    &batch.flags,
+                    &bookmark_name,
+                    batch.requests,
+                    &[]
+                )
+                .await
+                .is_empty()
+            );
+        }
+        for (receiver, index) in receivers.into_iter().zip([0, 1, 1, 0]) {
+            let outcome = receiver.await??;
+            assert_eq!(outcome.rebased_changesets.len(), 1);
+            assert_eq!(
+                outcome.rebased_changesets[0].id_old,
+                empty_commits[index].get_changeset_id()
+            );
+            assert_eq!(outcome.rebased_changesets[0].id_new, outcome.head);
+        }
+        Ok(())
     }
 
     #[mononoke::fbinit_test]

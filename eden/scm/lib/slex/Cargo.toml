@@ -19,12 +19,12 @@ path = "benches/executor.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-crossfire = "3.1.19"
+crossfire = "3.1.20"
 num_cpus = "1.16"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 slex-items = { version = "0.1.0", path = "items" }
-smallvec = { version = "1.15.2", default-features = false }
+smallvec = { version = "1.16.1", default-features = false }
 tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]

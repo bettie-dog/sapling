@@ -31,6 +31,8 @@
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
+#include "eden/fs/inodes/InodeMetadata.h"
+#include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/OverlayFile.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/fscatalog/InodePath.h"
@@ -746,6 +748,29 @@ TEST_P(RawOverlayTest, max_inode_number_is_1_if_overlay_is_empty) {
 
   EXPECT_EQ(kRootNodeId, overlay->getMaxInodeNumber());
   EXPECT_EQ(2_ino, overlay->allocateInodeNumber());
+}
+
+// An unclean restart rediscovers the next inode number by scanning the
+// overlay, so numbers above the highest referenced one get handed out again.
+// Metadata records for those numbers belong to inodes that no longer exist,
+// and a new inode must not inherit them.
+TEST_P(RawOverlayTest, uncleanRestartDropsMetadataAboveNextInodeNumber) {
+  auto ino = overlay->allocateInodeNumber();
+  auto record = [] {
+    return InodeMetadata{S_IFLNK | 0755, 0, 0, InodeTimestamps{}};
+  };
+  // The root is the highest inode number the scan finds, so its record is
+  // the last one that must survive.
+  overlay->getInodeMetadataTable()->populateIfNotSet(kRootNodeId, record);
+  overlay->getInodeMetadataTable()->populateIfNotSet(ino, record);
+  ASSERT_TRUE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+
+  recreate(OverlayRestartMode::UNCLEAN);
+
+  EXPECT_TRUE(
+      overlay->getInodeMetadataTable()->getOptional(kRootNodeId).has_value());
+  EXPECT_FALSE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+  EXPECT_EQ(ino, overlay->allocateInodeNumber());
 }
 
 TEST_P(RawOverlayTest, allocateInodeNumbers) {
@@ -1724,6 +1749,88 @@ TEST(OverlayLoadWalTest, loadAppliesDelta) {
   EXPECT_FALSE(bundle.store->hasWal(parent));
 
   bundle.overlay->close();
+}
+
+// A WAL ADD the Overlay cannot represent, because its inode number was never
+// allocated or its mode has bits DirEntry cannot hold, is dropped from the
+// merged directory instead of aborting on the DirEntry or visitDirEntries
+// checks. The drop counts as a parse error, so the base is rewritten and the
+// WAL removed.
+class OverlayLoadCorruptWalTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    bundle_ = makeWalLifecycleOverlay(canonicalPath(tmp_.path().string()));
+    ASSERT_NE(nullptr, bundle_.store);
+    parent_ = bundle_.overlay->allocateInodeNumber();
+    DirContents base(kPathMapDefaultCaseSensitive);
+    base.emplace(
+        "a"_pc, S_IFREG | 0644, bundle_.overlay->allocateInodeNumber());
+    bundle_.overlay->saveOverlayDir(parent_, base);
+  }
+
+  void TearDown() override {
+    bundle_.overlay->close();
+  }
+
+  void appendAdd(PathComponentPiece name, int32_t mode, uint64_t inodeNumber) {
+    overlay::OverlayEntry entry;
+    entry.mode() = mode;
+    entry.inodeNumber() = inodeNumber;
+    bundle_.store->appendWalEntry(parent_, WalOpType::ADD, name, &entry);
+  }
+
+  void expectOnlyBaseEntrySurvives() {
+    auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+    EXPECT_EQ(1u, loaded.size());
+    EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+    EXPECT_FALSE(bundle_.store->hasWal(parent_));
+  }
+
+  folly::test::TemporaryDirectory tmp_{"eden_wal_load_corrupt"};
+  WalLifecycleOverlay bundle_;
+  InodeNumber parent_;
+};
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithUnallocatedInodeNumber) {
+  appendAdd(
+      "bogus"_pc,
+      S_IFREG | 0644,
+      bundle_.overlay->getMaxInodeNumber().get() + 1000);
+  expectOnlyBaseEntrySurvives();
+}
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithInvalidMode) {
+  appendAdd(
+      "bogus"_pc,
+      0x0f000000 | S_IFREG | 0644,
+      bundle_.overlay->allocateInodeNumber().get());
+  expectOnlyBaseEntrySurvives();
+}
+
+// fsck folds WAL entries into the base file without being able to check
+// their modes, so the base is validated the same way: an entry with a mode
+// DirEntry cannot hold is dropped and the base rewritten without it.
+TEST_F(OverlayLoadCorruptWalTest, dropsBaseEntryWithInvalidMode) {
+  overlay::OverlayEntry good;
+  good.mode() = S_IFREG | 0644;
+  good.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayEntry bad;
+  bad.mode() = 0x0f000000 | S_IFREG | 0644;
+  bad.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayDir dir;
+  dir.entries()->emplace("a", good);
+  dir.entries()->emplace("bogus", bad);
+  auto* catalog = bundle_.overlay->getRawInodeCatalog();
+  catalog->saveOverlayDir(parent_, std::move(dir));
+
+  auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+  EXPECT_EQ(1u, loaded.size());
+  EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+
+  auto rewritten = catalog->loadOverlayDir(parent_);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("a"));
 }
 
 TEST(OverlayLoadWalTest, collapsedAddRemoveIsApplied) {

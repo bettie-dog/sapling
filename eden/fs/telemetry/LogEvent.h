@@ -15,6 +15,8 @@
 #include "eden/common/os/ProcessId.h"
 #include "eden/common/telemetry/DynamicEvent.h"
 #include "eden/common/telemetry/LogEvent.h"
+#include "eden/common/utils/ProcessInfo.h"
+#include "eden/fs/telemetry/XplatKeys.h"
 
 namespace facebook::eden {
 
@@ -133,16 +135,19 @@ struct FetchHeavy : public EdenFSEvent {
   ProcessId pid;
   uint64_t fetch_count;
   std::optional<uint64_t> loaded_inodes;
+  std::optional<ProcessAttribution> client_attribution;
 
   FetchHeavy(
       std::string client_cmdline,
       ProcessId pid,
       uint64_t fetch_count,
-      std::optional<uint64_t> loaded_inodes)
+      std::optional<uint64_t> loaded_inodes,
+      std::optional<ProcessAttribution> client_attribution = std::nullopt)
       : client_cmdline(std::move(client_cmdline)),
         pid(std::move(pid)),
         fetch_count(fetch_count),
-        loaded_inodes(loaded_inodes) {}
+        loaded_inodes(loaded_inodes),
+        client_attribution(std::move(client_attribution)) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("client_cmdline", client_cmdline);
@@ -150,6 +155,11 @@ struct FetchHeavy : public EdenFSEvent {
     event.addInt("fetch_count", fetch_count);
     if (loaded_inodes.has_value()) {
       event.addTruncatedInt("loaded_inodes", loaded_inodes.value(), 8U);
+    }
+    if (client_attribution.has_value()) {
+      for (const auto& [name, value] : *client_attribution) {
+        event.addString(name, value);
+      }
     }
   }
 
@@ -187,6 +197,10 @@ struct DaemonStart : public EdenFSEvent {
   std::optional<bool> is_daemon_in_root_mount_namespace;
   std::optional<bool> is_privhelper_in_root_mount_namespace;
   std::optional<std::string> cgroup;
+  // Restarts already spent in the current backoff window. Set only when this
+  // daemon was relaunched by the privhelper, so its presence is itself the
+  // "this was an auto-restart" signal.
+  std::optional<uint64_t> num_restarts;
 
   DaemonStart(
       double duration,
@@ -198,7 +212,8 @@ struct DaemonStart : public EdenFSEvent {
       std::optional<uint64_t> privhelper_pid_namespace = std::nullopt,
       std::optional<bool> is_daemon_in_root_mount_namespace = std::nullopt,
       std::optional<bool> is_privhelper_in_root_mount_namespace = std::nullopt,
-      std::optional<std::string> cgroup = std::nullopt)
+      std::optional<std::string> cgroup = std::nullopt,
+      std::optional<uint64_t> num_restarts = std::nullopt)
       : duration(duration),
         is_takeover(is_takeover),
         success(success),
@@ -209,7 +224,8 @@ struct DaemonStart : public EdenFSEvent {
         is_daemon_in_root_mount_namespace(is_daemon_in_root_mount_namespace),
         is_privhelper_in_root_mount_namespace(
             is_privhelper_in_root_mount_namespace),
-        cgroup(std::move(cgroup)) {}
+        cgroup(std::move(cgroup)),
+        num_restarts(num_restarts) {}
 
   void populate(DynamicEvent& event) const override {
     event.addDouble("duration", duration);
@@ -246,6 +262,9 @@ struct DaemonStart : public EdenFSEvent {
     }
     if (cgroup.has_value()) {
       event.addString("cgroup", *cgroup);
+    }
+    if (num_restarts.has_value()) {
+      event.addInt("num_restarts", static_cast<int64_t>(*num_restarts));
     }
   }
 
@@ -572,6 +591,36 @@ struct TccInvalidationDenied : public EdenFSEvent {
   }
 };
 
+/**
+ * edenfs did not disclaim TCC responsibility for `process` ("daemon" or
+ * "privhelper") because its code signature carries a real team identifier
+ * that is not the expected one: a development certificate, or a rotated
+ * release team. Ad-hoc builds carry no team and are not reported.
+ */
+struct TccDisclaimSkipped : public EdenFSEvent {
+  std::string process;
+  std::string observed_team;
+  std::string expected_team;
+
+  TccDisclaimSkipped(
+      std::string process,
+      std::string observed_team,
+      std::string expected_team)
+      : process(std::move(process)),
+        observed_team(std::move(observed_team)),
+        expected_team(std::move(expected_team)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString(std::string{xplat_keys::kTccDisclaimProcess}, process);
+    event.addString(std::string{xplat_keys::kTccObservedTeam}, observed_team);
+    event.addString(std::string{xplat_keys::kTccExpectedTeam}, expected_team);
+  }
+
+  const char* getType() const override {
+    return "tcc_disclaim_skipped";
+  }
+};
+
 struct TooManyNfsClients : public EdenFSEvent {
   void populate(DynamicEvent& /*event*/) const override {}
 
@@ -725,6 +774,38 @@ struct WorkingCopyGc : public EdenFSEvent {
 
   const char* getType() const override {
     return "working_copy_gc";
+  }
+};
+
+/**
+ * A pin scan (`edenfs_privhelper --scan-pins`) that produced no usable
+ * report, so the GC run that asked for it treated pins as unknown. `reason`
+ * is one of spawn_error, poll_error, read_error, timeout, output_too_large,
+ * exit_status and malformed_output from running the helper, or
+ * mounts_unreadable and mount_not_covered from mapping its report to this
+ * daemon's mounts.
+ */
+struct PinScanFailure : public EdenFSEvent {
+  std::string reason;
+  // Errno text, exit status, or the mount the scan did not cover.
+  std::string detail;
+  std::string stdoutPrefix;
+  std::string stderrPrefix;
+  int64_t durationMs = 0;
+
+  PinScanFailure(std::string reason, std::string detail)
+      : reason(std::move(reason)), detail(std::move(detail)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("reason", reason);
+    event.addString("detail", detail);
+    event.addString("stdout_prefix", stdoutPrefix);
+    event.addString("stderr_prefix", stderrPrefix);
+    event.addInt("duration_ms", durationMs);
+  }
+
+  const char* getType() const override {
+    return "pin_scan_failure";
   }
 };
 

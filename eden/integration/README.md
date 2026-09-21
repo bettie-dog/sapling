@@ -12,7 +12,7 @@ e.g. `status_test.py` is testing sl status works correctly with Eden.
 
 ### Write a New Integration Test
 
-If you are starting a whole new group of new tests for testing a new sapling command, e.g. sl awesome, then you want to implement a new test class based on top of EdenHgTestCase.
+If you are starting a whole new group of new tests for testing a Sapling command, then you want to implement a new test class based on top of EdenHgTestCase.
 
 Otherwise, just identify the right testing file and testing class that matches your testing purpose and simply add a new test case for that.
 
@@ -51,7 +51,44 @@ You call `sl` command from the test by using this helper function
 
 **Run an Integration Test**
 
-See `eden/.claude/CLAUDE.md` → "Running Tests" for `buck2 test` commands and examples.
+See `.claude/CLAUDE.md` → "Verification" for the `buck2 test` command.
+
+### FUSE io_uring variants
+
+The repository, Hg, filtered-Hg, cached-status, and custom FUSE decorators add
+io_uring siblings on Linux. NFS variants are unchanged; plain `eden_test` classes
+opt in with `run_io_uring=True`. Decorators accept `run_io_uring=False` to opt out.
+Migration tests use transport-only siblings to preserve their repository setup.
+Saved-snapshot verification and mount-based fsck cases also exercise both transports;
+offline fsck cases and snapshot-generation commands are unchanged.
+The mount-based io_uring variants are Linux-only; platform-independent harness
+unit tests still run on macOS and Windows.
+
+io_uring tests require an fbk 6.13 or 6.16 kernel. Other kernels skip these variants.
+They enable `fuse:io-uring-pre-create-queues` so queue allocation failures can fall
+back before INIT. A successful devfuse fallback skips the io_uring test with a
+reason; it does not count as io_uring coverage. Startup errors, timeouts, and
+unexpected transport values still fail. Baseline FUSE variants explicitly select
+devfuse. A fallback on one mount cannot hide an invalid transport on another.
+Takeover suites and GC cases that perform takeover currently skip io_uring because
+in-flight request handoff can stall; remove those skips once validated on both
+supported kernels. Bind-redirection GC still runs without takeover.
+
+Successful clone, remount, restart, and takeover paths verify running FUSE mounts;
+custom asynchronous lifecycle paths
+should call `self.eden.assert_running_fuse_transports()` after mount readiness.
+
+Run the same suite on each supported kernel; a run on one does not validate the other:
+
+```bash
+buck2 test '@fbcode//mode/opt' fbcode//eden/integration/... -- --regex IoUring
+```
+
+When adding io_uring support for a new kernel, update `require_io_uring_kernel()`
+in [`lib/edenclient.py`](lib/edenclient.py), the kernel-gate tests in
+[`testcase_test.py`](testcase_test.py), and the supported versions documented here.
+Run the sweep above on that kernel and verify eligible io_uring variants execute
+rather than skip.
 
 ### Debug an Integration Test
 

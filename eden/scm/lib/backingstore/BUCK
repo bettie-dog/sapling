@@ -1,9 +1,19 @@
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
 load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
-load("//eden/scm:targets.bzl", "sl_rust_library")
+load("//eden/scm:targets.bzl", "edenfs_cas_select", "sl_rust_library")
 
 oncall("sapling")
+
+constraint(
+    name = "edenfs-cas",
+    default = "disabled",
+    values = [
+        "disabled",
+        "enabled",
+    ],
+    visibility = ["PUBLIC"],
+)
 
 cpp_library(
     name = "sapling_backingstore_error",
@@ -19,8 +29,13 @@ cpp_library(
     headers = glob(["include/**/*.h"]),
     undefined_symbols = True,
     deps = [
+        "//eden/common/telemetry:log_info",
+        "//eden/fs/telemetry:structured_logger",
+        "//folly:cpp_attributes",
         "//folly:try",
         "//folly/io:iobuf",
+        "//folly/json:dynamic",
+        "//folly/logging:logging",
     ],
     exported_deps = [
         "fbsource//third-party/rust:cxx-core",
@@ -55,7 +70,10 @@ sl_rust_library(
                     "sapling-indexedlog": {"features": ["configurable"]},
                 },
             },
-            "features": {"fb": ["sapling-configloader/fb"]},
+            "features": {
+                "cas": [],
+                "fb": ["sapling-configloader/fb"],
+            },
             "lib": {"name": "backingstore"},
             "package": {
                 "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
@@ -74,7 +92,7 @@ sl_rust_library(
     ],
     crate_root = "src/lib.rs",
     cxx_bridge = "src/ffi.rs",
-    features = ["scuba"],
+    features = ["scuba"] + edenfs_cas_select(["cas"]),
     test_deps = [
         "fbsource//third-party/rust:http",
         "fbsource//third-party/rust:rand_chacha",
@@ -88,6 +106,7 @@ sl_rust_library(
         "fbsource//third-party/rust:flume",
         "fbsource//third-party/rust:log",
         "fbsource//third-party/rust:parking_lot",
+        "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:tracing-subscriber",
@@ -114,7 +133,10 @@ sl_rust_library(
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util/testutil:testutil",
         "//eden/scm/lib/walkdetector:walkdetector",
-    ],
+    ]
+    + edenfs_cas_select([
+        "//eden/scm/lib/cas-client/facebook:casd-client",
+    ]),
 )
 
 cpp_unittest(
@@ -128,9 +150,14 @@ cpp_unittest(
         "fbsource//third-party/googletest:gtest",
         ":backingstore",  # @manual
         ":sapling_native_backingstore",
+        "//eden/common/telemetry:log_info",
         "//eden/common/utils:path",
         "//eden/fs/config:config",
         "//eden/fs/model:model",
         "//eden/fs/store/sl:sapling_object_id",
+        "//eden/fs/telemetry:structured_logger",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry:xplat_logger",
+        "//folly/testing:test_util",
     ],
 )

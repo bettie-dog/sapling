@@ -1,5 +1,8 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_command_alias")
 load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
 load("@prelude//utils:buckconfig.bzl", "read_bool")
 load("//eden:defs.bzl", "get_integration_test_env_and_deps")
 
@@ -97,7 +100,7 @@ _RT_ENV = {
     # Keep using hg_test binary for now. Tests still use "$ hg" commands and
     # expect HG-identity output. Will switch to sl_test after all tests are
     # converted to use "$ sl".
-    "HGEXECUTABLEPATH": "$(location //eden/scm:hg_test)",
+    "HGEXECUTABLEPATH": "$(exe_target :hg_test_with_sanitizer_env)",
     "HGRUNTEST_SKIP_ENV": "1",
     "HGTEST_BLOCKLIST": get_blocklist(),
     "HGTEST_CERTDIR": "$(location //eden/mononoke/tests/integration/certs/facebook:test_certs)",
@@ -105,7 +108,7 @@ _RT_ENV = {
     "HGTEST_DIR": "eden/scm/tests",
     "HGTEST_DUMMYSSH": "$(location :dummyssh3)",
     "HGTEST_EXCLUDED": get_sl_run_tests_excluded(),
-    "HGTEST_HG": "$(location //eden/scm:hg_test)",
+    "HGTEST_HG": "$(exe_target :hg_test_with_sanitizer_env)",
     "HGTEST_NORMAL_LAYOUT": "0",
     "HGTEST_PYTHON": "fbpython",
     "HGTEST_RUN_TESTS_PY": "$(location :run_tests_py)",
@@ -122,9 +125,45 @@ _RT_ENV = {
 
 _RT_RESOURCES = {
     "//eden/scm/tests:dummyssh3": "dummyssh3.par",
+    "//eden/scm/tests:tsan_suppressions": "tsan_suppressions.txt",
     "//eden/scm:hg_test": "hg.sh",
     "//eden/scm:hgpython_test": "hgpython.sh",
 }
+
+def get_hg_test_sanitizer_env():
+    return selects.apply(
+        sanitizers.get_sanitizer_v2(),
+        lambda sanitizer: (
+            {
+                "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:suppressions=$(location //eden/scm/tests:tsan_suppressions)",
+            }
+            if sanitizer and "thread" in sanitizer
+            else {}
+        ),
+    )
+
+def _get_test_sanitizer_env(sanitizer):
+    env = {}
+    if sanitizer and "address" in sanitizer:
+        env["SL_TEST_ASAN"] = "1"
+    if sanitizer and "thread" in sanitizer:
+        env["SL_TEST_TSAN"] = "1"
+    return env
+
+_TEST_SANITIZER_ENV = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    _get_test_sanitizer_env,
+)
+
+def _get_sanitizer_labels(sanitizer):
+    if sanitizer and "thread" in sanitizer:
+        return [tpx_labels.serialize_test_cases]
+    return []
+
+_SANITIZER_LABELS = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    _get_sanitizer_labels,
+)
 
 SRCS = dict(
     [("unittestify.py", "unittestify.py")],
@@ -174,6 +213,17 @@ def run_tests_target(name = None, watchman = False, eden = False, mononoke = Fal
             ENV[k] = v
         else:
             ENV.pop(k)
+    base_env = ENV
+    ENV = selects.apply(
+        _TEST_SANITIZER_ENV,
+        lambda sanitizer_env: dict(sanitizer_env, **base_env),
+    )
+    labels = kwargs.pop("labels", [])
+    if eden:
+        labels = selects.apply_n(
+            [labels, _SANITIZER_LABELS],
+            lambda labels, sanitizer_labels: labels + sanitizer_labels,
+        )
     python_unittest(
         name = name,
         srcs = SRCS,
@@ -182,6 +232,7 @@ def run_tests_target(name = None, watchman = False, eden = False, mononoke = Fal
             "//eden/scm:scm_prompt",
         ],
         env = ENV,
+        labels = labels,
         resources = resources,
         supports_static_listing = False,
         **kwargs,

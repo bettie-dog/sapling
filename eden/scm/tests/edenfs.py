@@ -95,7 +95,7 @@ overrides = {{}}
         overrides.update(
             {
                 "SCRATCH_CONFIG_PATH": str(scratch_config),
-                "INTEGRATION_TEST": "1",
+                "EDENFS_INTEGRATION_TEST": "1",
             }
         )
 
@@ -119,6 +119,9 @@ overrides = {{}}
 [experimental]
 enable-nfs-server = "true"
 allow-remote-get-batch = "false"
+
+[telemetry]
+enable-scribe-logging = "false"
 """
                     )
 

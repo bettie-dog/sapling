@@ -9,7 +9,9 @@
 #include <gtest/gtest.h>
 
 #include "eden/fs/inodes/FileInode.h"
+#include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/journal/Journal.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestChecks.h"
 #include "eden/fs/testharness/TestMount.h"
@@ -165,6 +167,207 @@ TEST_F(UnlinkTest, created) {
   EXPECT_FILE_INODE(file, contents, 0644);
 #endif
 }
+
+class RemoveRecursivelyTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    FakeTreeBuilder builder;
+    builder.setFiles({
+        {"dir/a.txt", "This is a.txt.\n"},
+        {"dir/keep.txt", "This is keep.txt.\n"},
+        {"other/sub/b.txt", "This is b.txt.\n"},
+        {"readme.txt", "File in the root directory.\n"},
+    });
+    mount_.initialize(builder);
+  }
+
+  void removeRecursively(const TreeInodePtr& dir, PathComponentPiece name) {
+    auto future = dir->removeRecursively(
+                         name,
+                         InvalidationRequired::No,
+                         ObjectFetchContext::getNullContext())
+                      .semi()
+                      .via(mount_.getServerExecutor().get());
+    mount_.drainServerExecutor();
+    std::move(future).get(0ms);
+  }
+
+  bool journalRecordsRemoval(
+      JournalDelta::SequenceNumber since,
+      RelativePathPiece path) {
+    auto delta = mount_.getEdenMount()->getJournal().accumulateRange(since);
+    if (!delta) {
+      return false;
+    }
+    auto it = delta->changedFilesInOverlay.find(RelativePath{path});
+    return it != delta->changedFilesInOverlay.end() &&
+        it->second.existedBefore && !it->second.existedAfter;
+  }
+
+  TestMount mount_;
+};
+
+// Removing a child whose inode is not loaded takes a fast path in
+// TreeInode::tryRemoveUnloadedChild. Like the loaded path it must
+// materialize the parent, so the removal survives a reload, and record the
+// removal in the journal.
+TEST_F(RemoveRecursivelyTest, unloadedFileInUnmaterializedDir) {
+  auto& journal = mount_.getEdenMount()->getJournal();
+  auto testStart = journal.observeLatest().value().sequenceID;
+
+  auto dir = mount_.getTreeInode("dir");
+  removeRecursively(dir, "a.txt"_pc);
+  EXPECT_THROW_ERRNO(dir->getChildInodeNumber("a.txt"_pc), ENOENT);
+  EXPECT_TRUE(dir->getContentsUnchecked().rlock()->isMaterialized());
+  EXPECT_TRUE(journalRecordsRemoval(testStart, "dir/a.txt"_relpath));
+  dir.reset();
+
+  // On Windows the overlay is reconciled with the on-disk PrjFS state on
+  // every start, and a materialized directory that is missing from disk is
+  // reset to its source control tree. TestMount puts nothing on disk, so a
+  // remount cannot show whether the removal was persisted there.
+#ifndef _WIN32
+  mount_.remount();
+  EXPECT_FALSE(mount_.hasFileAt("dir/a.txt"));
+  EXPECT_TRUE(mount_.hasFileAt("dir/keep.txt"));
+  EXPECT_TRUE(mount_.getTreeInode("dir")
+                  ->getContentsUnchecked()
+                  .rlock()
+                  ->isMaterialized());
+#endif
+}
+
+TEST_F(RemoveRecursivelyTest, unloadedDirInUnmaterializedDir) {
+  auto& journal = mount_.getEdenMount()->getJournal();
+  auto testStart = journal.observeLatest().value().sequenceID;
+
+  auto dir = mount_.getTreeInode("other");
+  removeRecursively(dir, "sub"_pc);
+  EXPECT_THROW_ERRNO(dir->getChildInodeNumber("sub"_pc), ENOENT);
+  EXPECT_TRUE(dir->getContentsUnchecked().rlock()->isMaterialized());
+  EXPECT_TRUE(journalRecordsRemoval(testStart, "other/sub"_relpath));
+  dir.reset();
+
+  // The remount is guarded for the reason given in
+  // unloadedFileInUnmaterializedDir.
+#ifndef _WIN32
+  mount_.remount();
+  EXPECT_FALSE(mount_.hasFileAt("other/sub/b.txt"));
+  EXPECT_THROW_ERRNO(mount_.getTreeInode("other/sub"), ENOENT);
+  EXPECT_TRUE(mount_.getTreeInode("other")
+                  ->getContentsUnchecked()
+                  .rlock()
+                  ->isMaterialized());
+#endif
+}
+
+// Removing an unloaded child can race with an in-flight load of that same
+// child: the fast path in TreeInode::tryRemoveUnloadedChild erases the entry
+// while the load is still running. If the name is used again before the load
+// finishes, TreeInode::inodeLoadComplete must not attach the inode it just
+// loaded to the unrelated entry that now holds the name.
+TEST(RemoveDuringLoadTest, loadFinishingAfterRemovalDoesNotClobberNewEntry) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/a.txt", "This is a.txt.\n");
+  TestMount mount{builder, /*startReady=*/false};
+  auto context = ObjectFetchContext::getNullContext();
+
+  auto root = mount.getEdenMount()->getRootInode();
+  auto loadFuture = root->getOrLoadChild("dir"_pc, context)
+                        .semi()
+                        .via(mount.getServerExecutor().get());
+  mount.drainServerExecutor();
+  ASSERT_FALSE(loadFuture.isReady());
+
+  auto removeFuture =
+      root->removeRecursively("dir"_pc, InvalidationRequired::No, context)
+          .semi()
+          .via(mount.getServerExecutor().get());
+  mount.drainServerExecutor();
+  std::move(removeFuture).get(0ms);
+
+  auto recreated =
+      root->mkdir("dir"_pc, S_IFDIR | 0755, InvalidationRequired::No);
+  auto recreatedNumber = recreated->getNodeId();
+  recreated.reset();
+
+  builder.setReady("dir");
+  mount.drainServerExecutor();
+  ASSERT_TRUE(loadFuture.isReady());
+
+  EXPECT_THROW_ERRNO(std::move(loadFuture).get(0ms), ENOENT);
+  EXPECT_EQ(recreatedNumber, mount.getTreeInode("dir")->getNodeId());
+}
+
+#ifndef _WIN32
+// Clearing a directory must leave the overlay state of a loaded child alone.
+// The child can still be in use, by another thread or by the kernel, and like
+// every other removal path it frees its own overlay state when it is
+// unloaded.
+TEST(RemoveAllChildrenTest, loadedChildKeepsItsOverlayStateUntilUnloaded) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/sub/file.txt", "This is file.txt.\n");
+  TestMount mount{builder};
+  mount.overwriteFile("dir/sub/file.txt", "This is the new file.txt.\n");
+
+  auto dir = mount.getTreeInode("dir");
+  auto sub = mount.getTreeInode("dir/sub");
+  auto subNumber = sub->getNodeId();
+  auto* metadata = mount.getEdenMount()->getInodeMetadataTable();
+  auto* overlay = mount.getEdenMount()->getOverlay();
+  ASSERT_TRUE(overlay->hasOverlayDir(subNumber));
+  ASSERT_TRUE(metadata->getOptional(subNumber).has_value());
+
+  {
+    auto renameLock = mount.getEdenMount()->acquireRenameLock();
+    dir->removeAllChildrenRecursively(
+        InvalidationRequired::No,
+        ObjectFetchContext::getNullContext(),
+        renameLock);
+  }
+
+  EXPECT_TRUE(overlay->hasOverlayDir(subNumber));
+  EXPECT_TRUE(metadata->getOptional(subNumber).has_value());
+  EXPECT_NO_THROW(sub->getMetadata());
+
+  sub.reset();
+  EXPECT_FALSE(overlay->hasOverlayDir(subNumber));
+  EXPECT_FALSE(metadata->getOptional(subNumber).has_value());
+}
+
+// The same holds for a loaded file: it stays readable, and its overlay file
+// and metadata record are freed only when it is unloaded.
+TEST(RemoveAllChildrenTest, loadedFileKeepsItsOverlayStateUntilUnloaded) {
+  FakeTreeBuilder builder;
+  builder.setFile("dir/file.txt", "This is file.txt.\n");
+  TestMount mount{builder};
+  mount.overwriteFile("dir/file.txt", "This is the new file.txt.\n");
+
+  auto dir = mount.getTreeInode("dir");
+  auto file = mount.getFileInode("dir/file.txt");
+  auto fileNumber = file->getNodeId();
+  auto* metadata = mount.getEdenMount()->getInodeMetadataTable();
+  auto* overlay = mount.getEdenMount()->getOverlay();
+  ASSERT_TRUE(overlay->hasOverlayFile(fileNumber));
+  ASSERT_TRUE(metadata->getOptional(fileNumber).has_value());
+
+  {
+    auto renameLock = mount.getEdenMount()->acquireRenameLock();
+    dir->removeAllChildrenRecursively(
+        InvalidationRequired::No,
+        ObjectFetchContext::getNullContext(),
+        renameLock);
+  }
+
+  EXPECT_TRUE(overlay->hasOverlayFile(fileNumber));
+  EXPECT_TRUE(metadata->getOptional(fileNumber).has_value());
+  EXPECT_FILE_INODE(file, "This is the new file.txt.\n", 0644);
+
+  file.reset();
+  EXPECT_FALSE(overlay->hasOverlayFile(fileNumber));
+  EXPECT_FALSE(metadata->getOptional(fileNumber).has_value());
+}
+#endif
 
 // TODO: It would be nice to adds some tests for concurrent load+unlink
 // However, loading a FileInode does not wait for the file data to be loaded

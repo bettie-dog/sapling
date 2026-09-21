@@ -60,6 +60,7 @@ cpp_library(
         "//eden/common/utils:throw",
         "//eden/common/utils:utils",
         "//eden/fs/config:config",
+        "//eden/fs/facebook:normalized_hostname",
         "//eden/fs/service:thrift_util",
         "//eden/fs/telemetry:error_info",
         "//eden/fs/telemetry:log_info",
@@ -79,6 +80,7 @@ cpp_library(
     exported_deps = [
         "fbsource//third-party/googletest:gtest",
         "fbsource//third-party/googletest:gtest_headers",
+        "fbsource//third-party/googletest:gtest_prod_headers",
         ":sapling_backing_store_options",
         ":sapling_import_request_queue",
         "//eden/common/telemetry:telemetry",

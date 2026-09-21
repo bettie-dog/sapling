@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+from __future__ import annotations
 
 import errno
 import os
@@ -14,7 +14,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
+from unittest import mock
 
 from eden.fs.cli import mtab
 from eden.fs.cli.doctor import check_stale_mounts
@@ -44,6 +45,11 @@ class MountTest(testcase.EdenRepoTest):
     # pyre-fixme[13]: Attribute `expected_mount_entries` is never initialized.
     expected_mount_entries: Set[str]
     enable_fault_injection: bool = True
+
+    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
+        configs = super().edenfs_extra_config() or {}
+        configs.setdefault("fuse", []).append('vfs-type = "fuse.edenfs"')
+        return configs
 
     def populate_repo(self) -> None:
         self.maxDiff = None
@@ -133,6 +139,36 @@ class MountTest(testcase.EdenRepoTest):
         os.close(fd)
 
     async def test_mount_init_state(self) -> None:
+        await self._exercise_mount_init_state()
+
+    async def test_mount_init_fallback_reaps_cli(self) -> None:
+        processes = []
+        popen = subprocess.Popen
+
+        def record_process(*args: Any, **kwargs: Any) -> subprocess.Popen:
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            self.addCleanup(process.wait, timeout=30)
+            return process
+
+        with (
+            mock.patch.object(subprocess, "Popen", side_effect=record_process),
+            mock.patch.object(
+                self.eden,
+                "assert_running_fuse_transports",
+                side_effect=unittest.SkipTest("simulated devfuse fallback"),
+            ) as verify_transport,
+        ):
+            with self.assertRaisesRegex(
+                unittest.SkipTest, "simulated devfuse fallback"
+            ):
+                await self._exercise_mount_init_state()
+        verify_transport.assert_called_once()
+        self.assertTrue(processes)
+        for process in processes:
+            self.assertIsNotNone(process.returncode, f"unreaped CLI: {process.args}")
+
+    async def _exercise_mount_init_state(self) -> None:
         self.eden.run_cmd("unmount", self.mount)
         self.assertEqual({self.mount: "NOT_RUNNING"}, self.eden.list_cmd_simple())
 
@@ -173,11 +209,10 @@ class MountTest(testcase.EdenRepoTest):
             await client.unblockFault(
                 UnblockFaultArg(keyClass="mount", keyValueRegex=".*")
             )
+            mount_proc.wait(timeout=60)
             await self._wait_for_mount_running(client)
 
             self.assertEqual({self.mount: "RUNNING"}, self.eden.list_cmd_simple())
-
-            mount_proc.wait()
 
     async def _assert_thrift_calls_fail_during_mount_init(self, client) -> None:
         error_regex = "mount point .* is still initializing"
@@ -287,6 +322,7 @@ class MountTest(testcase.EdenRepoTest):
             )
 
         # A subsequent attempt to remount should not crash the Eden daemon
+        self.eden.wait_for_checkout_removed(self.mount)
         self.eden.run_cmd("mount", self.mount)
 
         # Eden should be running and the checkout should be mounted
@@ -310,6 +346,7 @@ class MountTest(testcase.EdenRepoTest):
             return None
 
         await poll_until_async(mount_running, timeout=60)
+        self.eden.assert_running_fuse_transports()
 
     async def _wait_until_alive(self, client: EdenService.Async) -> None:
         async def is_alive() -> Optional[bool]:
@@ -319,6 +356,7 @@ class MountTest(testcase.EdenRepoTest):
             return None
 
         await poll_until_async(is_alive, timeout=60)
+        self.eden.assert_running_fuse_transports()
 
     def test_remount_creates_mount_point_dir(self) -> None:
         """Test that eden will automatically create the mount point directory if
@@ -480,23 +518,33 @@ class MountTest(testcase.EdenRepoTest):
                 len(errored_mount_list) == 0, f"errored mounts: {errored_mount_list}"
             )
 
+    @unittest.skipIf(sys.platform != "linux", "FUSE subtypes are Linux-only")
+    @unittest.skipUnless(
+        os.environ.get("EDENFS_PRIVHELPER_PATH"),
+        "mounts are made by the installed privhelper unless "
+        "EDENFS_PRIVHELPER_PATH points at the privhelper under test",
+    )
+    def test_fuse_mount_advertises_edenfs_subtype(self) -> None:
+        if self.use_nfs():
+            self.skipTest("only FUSE mounts carry a subtype")
 
-@testcase.eden_repo_test(run_on_nfs=False)
+        mount_entries = [
+            mount
+            for mount in mtab.new().read()
+            if mount.mount_point.decode() == self.mount
+        ]
+        self.assertEqual(len(mount_entries), 1, f"mount entries: {mount_entries}")
+        self.assertEqual(mount_entries[0].vfstype, b"fuse.edenfs")
+
+
+@testcase.eden_repo_test(run_on_nfs=False, run_io_uring=False)
+@unittest.skipIf(
+    os.environ.get("EDEN_TEST_TSAN") == "1",
+    "FUSE io_uring uses kernel shared rings that TSan reports as liburing races",
+)
 @unittest.skipIf(sys.platform != "linux", "FUSE connection abort is Linux-only")
-class FuseIoUringMountTest(testcase.EdenRepoTest):
+class FuseIoUringMountTest(testcase.IoUringTestMixin, testcase.EdenRepoTest):
     git_test_supported: bool = False
-
-    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
-        configs = super().edenfs_extra_config()
-        if configs is None:
-            configs = {}
-        configs.setdefault("fuse", []).extend(
-            [
-                "use-io-uring = true",
-                'io-uring-kernel-release-regex = ".*"',
-            ]
-        )
-        return configs
 
     def populate_repo(self) -> None:
         self.repo.write_file("hello", "hola\n")
@@ -507,10 +555,7 @@ class FuseIoUringMountTest(testcase.EdenRepoTest):
             mounts = await client.listMounts()
             mount = self._find_mount(mounts)
             self.assertIsNotNone(mount)
-            if mount.fuseTransport != "io_uring":
-                self.skipTest(
-                    f"FUSE io_uring was not negotiated: {mount.fuseTransport!r}"
-                )
+            self.assertEqual("io_uring", mount.fuseTransport)
 
         connection_id = os.lstat(self.mount).st_dev
         abort_path = Path("/sys/fs/fuse/connections") / str(connection_id) / "abort"

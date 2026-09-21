@@ -56,6 +56,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -156,6 +157,9 @@ define_stats! {
 
 const MAX_REBASE_ATTEMPTS: usize = 100;
 
+/// Ancestry probes over a baseline's recorded successors. Normally one.
+const BASELINE_SUCCESSOR_CONCURRENCY: usize = 5;
+
 pub const MUTATION_KEYS: &[&str] = &["mutpred", "mutuser", "mutdate", "mutop", "mutsplit"];
 
 pub const FAIL_PUSHREBASE_EXTRA: &str = "failpushrebase";
@@ -194,12 +198,50 @@ pub enum PushrebaseError {
     RebaseOverMerge,
     #[error("Root is too far behind")]
     RootTooFarBehind,
+    #[error("baseline {baseline} {rejection} (onto {onto})")]
+    UnplaceableBaseline {
+        baseline: ChangesetId,
+        onto: ChangesetId,
+        rejection: BaselineRejection,
+    },
     #[error(
         "Force failed pushrebase, please do a manual rebase. (Bonsai changeset id that triggered it is {0})"
     )]
     ForceFailPushrebase(ChangesetId),
+    #[error("manifest not derived for {0}")]
+    ManifestNotDerived(ChangesetId),
+    #[error("stack changes {paths} paths, over the limit of {max_paths}")]
+    TooManyPaths { paths: usize, max_paths: usize },
     #[error(transparent)]
     Error(#[from] Error),
+}
+
+/// Why `rebase_stack_onto_with_baseline` could not place a stack on the
+/// branch. Displays as the clause after "baseline <id>"; the wording is
+/// client-visible through Multi-Repo Land's conflict descriptions, where the
+/// stack head is called "the target".
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BaselineRejection {
+    /// The stack head does not descend from the baseline.
+    NotAncestorOfHead,
+    /// Off the branch, and no rewritten form of it is on the branch either.
+    NotOnBranch,
+    /// Rewritten onto the branch, but sharing no single fork point with the
+    /// head to bound the server range.
+    NoSingleForkPoint,
+}
+
+impl std::fmt::Display for BaselineRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotAncestorOfHead => "is not an ancestor of the target",
+            Self::NotOnBranch => {
+                "is not an ancestor of the current head and no rewritten form of it is on \
+                 the branch; refusing to rebase across a force-move or unrelated history"
+            }
+            Self::NoSingleForkPoint => "has no single fork point on the current head",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -289,6 +331,52 @@ pub struct PushrebaseStack {
     pub head: ChangesetId,
     /// Root of the pushed stack.
     pub root: ChangesetId,
+    conflict_check_base: ChangesetId,
+    carried_merge_file_info: Vec<MergedFileInfo>,
+}
+
+impl PushrebaseStack {
+    /// Precomputes conflict information against a bookmark snapshot.
+    /// Calling this method is optional; the batch worker performs any remaining work.
+    pub async fn precompute(
+        &mut self,
+        ctx: &CoreContext,
+        repo: &impl Repo,
+        flags: &PushrebaseFlags,
+        bookmark: &BookmarkKey,
+    ) -> Result<(), PushrebaseError> {
+        let ctx = pushrebase_context(ctx, flags);
+        let start = Instant::now();
+        let onto = get_bookmark_value(&ctx, repo, bookmark)
+            .await?
+            .unwrap_or(self.root);
+        let checked = check_pushrebase_conflicts(
+            &ctx,
+            repo,
+            flags,
+            self.root,
+            self.conflict_check_base,
+            onto,
+            &self.changesets,
+            &self.changed_files,
+        )
+        .await?;
+        self.carried_merge_file_info = reconcile_merge_file_info(
+            &self.carried_merge_file_info,
+            &checked.merged_file_overrides.unwrap_or_default(),
+        );
+        self.conflict_check_base = onto;
+        ctx.scuba()
+            .clone()
+            .add("repo_name", repo.repo_identity().name())
+            .add("bookmark", bookmark.as_str())
+            .add(
+                "pushrebase_preparation_duration_ms",
+                start.elapsed().as_millis() as i64,
+            )
+            .log_with_msg("pushrebase_prepared", None);
+        Ok(())
+    }
 }
 
 pub trait Repo = BookmarksRef
@@ -406,6 +494,8 @@ pub async fn index_pushrebase_request(
         changesets: client_bcs,
         head,
         root,
+        conflict_check_base: root,
+        carried_merge_file_info: vec![],
     })
 }
 
@@ -416,6 +506,11 @@ pub struct RebasedStack {
     /// NOT yet saved; the caller must persist before referencing.
     pub rebased_bonsais: Vec<BonsaiChangeset>,
     pub merge_summary: MergeResolutionSummary,
+    /// Commits skipped because their new parent already had every change.
+    /// Only `rebase_stack_onto_manifest` drops; the other entries reject.
+    pub dropped: Vec<ChangesetId>,
+    /// Old id -> paths whose content was 3-way merged in that commit.
+    pub merged_paths: HashMap<ChangesetId, Vec<NonRootMPath>>,
 }
 
 /// Rebases the linear stack `root..head` onto `onto` with pushrebase's
@@ -424,7 +519,9 @@ pub struct RebasedStack {
 /// Runs no hooks; honors the caller's merge resolution setting. With it on, a
 /// replay of an already-landed stack merges to a no-op rather than conflicting
 /// on paths, so callers relying on replay failing closed must keep it off or
-/// rely on the no-op merge commit rejection. Requires `rewritedates == false`
+/// rely on the no-op merge commit rejection. Overlaps whose server content
+/// still equals the base are taken as-is; a replay differs from the base and
+/// is unaffected. Requires `rewritedates == false`
 /// (checked) — date stamping makes the rewrite non-deterministic, breaking
 /// callers' retry termination. Rejects merge commits in the stack; uses
 /// content-manifest range diffs so repos without HG derived data work.
@@ -445,8 +542,12 @@ pub async fn rebase_stack_onto(
 /// They differ only when `root` was itself rewritten by an earlier land: the
 /// author's stack still descends from `root`, so it stays the range base and
 /// the re-parent source, but `root` is no longer on the branch and cannot
-/// bound the server range. `conflict_base` is its rewritten form, which is.
-/// Pass `root` for both to get the ordinary behaviour.
+/// bound the server range. `conflict_base` is where the stack left the
+/// branch, so the range covers everything the stack has not seen, including
+/// the root's own landed form. Overlaps the server never changed relative to
+/// the root are the stack's own earlier commits and are taken as-is; the
+/// caller must have proven the root landed under another identity. Pass
+/// `root` for both to get the ordinary behaviour.
 pub async fn rebase_stack_onto_with_conflict_base(
     ctx: &CoreContext,
     repo: &impl Repo,
@@ -517,6 +618,7 @@ pub async fn rebase_stack_onto_with_conflict_base(
         &client_bcs,
         &client_cf,
         RangeDiffManifests::ContentCompat,
+        UnchangedOverlap::TakeClient,
     )
     .await?;
 
@@ -539,7 +641,311 @@ pub async fn rebase_stack_onto_with_conflict_base(
         rebased_changesets: rebased_changesets_into_pairs(rebased_changesets),
         rebased_bonsais,
         merge_summary: conflict_result.merge_summary,
+        dropped: Vec::new(),
+        merged_paths: HashMap::new(),
     })
+}
+
+/// `rebase_stack_onto` for a caller that knows where its stack was built
+/// (`baseline`) but not whether that point is still on the branch, because
+/// an earlier pushrebase may have rewritten it. A baseline on the branch is
+/// the ordinary case. One off the branch is resolved through the pushrebase
+/// mutation mapping: when exactly one recorded successor is an ancestor of
+/// `onto`, the stack's base landed under another identity and the server
+/// range starts at the fork point of `baseline` and `onto`. Anything else is
+/// `UnplaceableBaseline`, never a parent-swap onto unrelated history.
+pub async fn rebase_stack_onto_with_baseline(
+    ctx: &CoreContext,
+    repo: &(impl Repo + PushrebaseMutationMappingRef),
+    config: &PushrebaseFlags,
+    baseline: ChangesetId,
+    head: ChangesetId,
+    onto: ChangesetId,
+) -> Result<RebasedStack, PushrebaseError> {
+    let unplaceable = |rejection| PushrebaseError::UnplaceableBaseline {
+        baseline,
+        onto,
+        rejection,
+    };
+    let (baseline_precedes_onto, baseline_precedes_head) = try_join(
+        repo.commit_graph().is_ancestor(ctx, baseline, onto),
+        repo.commit_graph().is_ancestor(ctx, baseline, head),
+    )
+    .await
+    .map_err(PushrebaseError::Error)?;
+    if !baseline_precedes_head {
+        return Err(unplaceable(BaselineRejection::NotAncestorOfHead));
+    }
+    let conflict_base = if baseline_precedes_onto {
+        baseline
+    } else {
+        if !rewritten_baseline_is_on_branch(ctx, repo, baseline, onto).await {
+            return Err(unplaceable(BaselineRejection::NotOnBranch));
+        }
+        match repo
+            .commit_graph()
+            .common_base(ctx, baseline, onto)
+            .await
+            .map_err(PushrebaseError::Error)?
+            .as_slice()
+        {
+            [fork_point] => *fork_point,
+            _ => return Err(unplaceable(BaselineRejection::NoSingleForkPoint)),
+        }
+    };
+    rebase_stack_onto_with_conflict_base(ctx, repo, config, baseline, conflict_base, head, onto)
+        .await
+}
+
+/// Rebases `root..head` onto `onto` with no assumption about the ancestry
+/// between them: the server side is the difference between the two
+/// manifests over the stack's own paths, so `onto` may be older than or
+/// divergent from `root`. Never derives; both manifests must exist.
+/// Commits whose every change is already in their new parent are dropped,
+/// as `sl rebase` does. Moves no bookmark, runs no hooks, writes no
+/// changesets; merged content is stored when merge resolution is on.
+/// Requires `rewritedates == false`. `max_paths` bounds the stack's changed
+/// paths, which is what the manifest lookups scale with.
+pub async fn rebase_stack_onto_manifest(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    root: ChangesetId,
+    head: ChangesetId,
+    onto: ChangesetId,
+    max_paths: usize,
+) -> Result<RebasedStack, PushrebaseError> {
+    if config.rewritedates {
+        return Err(PushrebaseError::Error(anyhow!(
+            "rebase_stack_onto_manifest requires rewritedates to be off"
+        )));
+    }
+    if !repo
+        .commit_graph()
+        .is_ancestor(ctx, root, head)
+        .await
+        .map_err(PushrebaseError::Error)?
+    {
+        return Err(PushrebaseError::Error(anyhow!(
+            "rebase_stack_onto_manifest: root {root} must be an ancestor of head {head}, but is not"
+        )));
+    }
+
+    let (root_mf, onto_mf) = try_join(
+        fetch_root_manifest_id(ctx, repo, root),
+        fetch_root_manifest_id(ctx, repo, onto),
+    )
+    .await
+    .map_err(PushrebaseError::Error)?;
+    let root_mf = root_mf.ok_or(PushrebaseError::ManifestNotDerived(root))?;
+    let onto_mf = onto_mf.ok_or(PushrebaseError::ManifestNotDerived(onto))?;
+
+    let client_bcs = fetch_bonsai_range_ancestor_not_included(ctx, repo, root, head).await?;
+    if client_bcs.is_empty() {
+        return Err(PushrebaseError::Error(anyhow!(
+            "rebase_stack_onto_manifest: empty stack between root {root} and head {head}"
+        )));
+    }
+    if let Some(merge) = client_bcs.iter().find(|bcs| bcs.is_merge()) {
+        return Err(PushrebaseError::Error(anyhow!(
+            "rebase_stack_onto_manifest does not support merge commits in the stack: {}",
+            merge.get_changeset_id()
+        )));
+    }
+    let client_cf = find_changed_files_with(
+        ctx,
+        repo,
+        root,
+        head,
+        &client_bcs,
+        RangeDiffManifests::ContentCompat,
+    )
+    .await?;
+    if client_cf.len() > max_paths {
+        return Err(PushrebaseError::TooManyPaths {
+            paths: client_cf.len(),
+            max_paths,
+        });
+    }
+
+    let (base_states, onto_states) = try_join(
+        lookup_manifest_states(ctx, repo, root_mf, &client_cf),
+        lookup_manifest_states(ctx, repo, onto_mf, &client_cf),
+    )
+    .await
+    .map_err(PushrebaseError::Error)?;
+    let server_cf = manifest_overlaps(&client_cf, &base_states, &onto_states);
+
+    let reponame = repo.repo_identity().name();
+    let (overrides, conflict_files_count) = match intersect_changed_files(server_cf, client_cf) {
+        Ok(()) => (None, 0),
+        Err(PushrebaseError::Conflicts(conflicts)) => {
+            let merge_enabled = match config.merge_resolution_override {
+                MergeResolutionOverride::ForceOn => true,
+                MergeResolutionOverride::ForceOff => false,
+                MergeResolutionOverride::UseJk => justknobs::eval(
+                    "scm/mononoke:pushrebase_enable_merge_resolution",
+                    None,
+                    Some(reponame),
+                ),
+            };
+            if !merge_enabled {
+                return Err(PushrebaseError::Conflicts(conflicts));
+            }
+            let max_conflicts: usize = justknobs::get_as::<usize>(
+                "scm/mononoke:pushrebase_max_merge_conflicts",
+                Some(reponame),
+            );
+            let max_file_size: u64 = justknobs::get_as::<u64>(
+                "scm/mononoke:pushrebase_max_merge_file_size",
+                Some(reponame),
+            );
+            match collect_overlap_states(
+                &conflicts,
+                &client_bcs,
+                &base_states,
+                &onto_states,
+                max_conflicts,
+                max_file_size,
+                &config.merge_resolution_excluded_path_prefixes,
+            ) {
+                Ok(overrides) => (Some(overrides), conflicts.len() as u64),
+                Err(err) => {
+                    ctx.scuba()
+                        .clone()
+                        .add("repo_name", reponame)
+                        .add("merge_resolution_outcome", format!("{err}"))
+                        .log_with_msg("Pushrebase merge resolution failed", None);
+                    return Err(PushrebaseError::Conflicts(conflicts));
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut no_hooks: Vec<Box<dyn PushrebaseCommitHook>> = Vec::new();
+    let set = create_rebased_changesets_with(
+        ctx,
+        repo,
+        config,
+        &client_bcs,
+        root,
+        head,
+        onto,
+        &mut no_hooks,
+        overrides,
+        NoopPolicy::Drop,
+    )
+    .await?;
+
+    let merge_summary = if conflict_files_count == 0 {
+        MergeResolutionSummary::NotNeeded
+    } else {
+        let resolved: HashSet<&NonRootMPath> = set.merged_paths.values().flatten().collect();
+        MergeResolutionSummary::Succeeded {
+            conflict_files_count,
+            resolved_files_count: resolved.len() as u64,
+            resolved_paths_sample: resolved
+                .into_iter()
+                .take(MR_PATH_SAMPLE_CAP)
+                .cloned()
+                .collect(),
+        }
+    };
+    Ok(RebasedStack {
+        new_head: set.new_head,
+        rebased_changesets: rebased_changesets_into_pairs(set.rebased),
+        rebased_bonsais: set.bonsais,
+        merge_summary,
+        dropped: set.dropped,
+        merged_paths: set.merged_paths,
+    })
+}
+
+/// Whether an earlier pushrebase rewrote `baseline` into a commit that is an
+/// ancestor of `onto`: the proof that the stack's base is on the branch under
+/// another identity.
+///
+/// A candidate must be an ancestor of `onto`, so a bad row cannot place a
+/// stack on unrelated history. Ambiguity, no row, a read failure, or a chain
+/// (one hop only) all mean "no"; a read failure is logged rather than
+/// propagated so the caller's rejection stays a rejection.
+async fn rewritten_baseline_is_on_branch(
+    ctx: &CoreContext,
+    repo: &(impl Repo + PushrebaseMutationMappingRef),
+    baseline: ChangesetId,
+    onto: ChangesetId,
+) -> bool {
+    match try_resolve_rewritten_baseline(ctx, repo, baseline, onto).await {
+        Ok(resolved) => resolved.is_some(),
+        Err(err) => {
+            ctx.scuba()
+                .clone()
+                .add("log_tag", "orphaned_baseline_resolution_failed")
+                .add("repo", repo.repo_identity().name())
+                .add("old_target", baseline.to_string())
+                .add("error", format!("{err:#}"))
+                .unsampled()
+                .log();
+            false
+        }
+    }
+}
+
+async fn try_resolve_rewritten_baseline(
+    ctx: &CoreContext,
+    repo: &(impl Repo + PushrebaseMutationMappingRef),
+    baseline: ChangesetId,
+    onto: ChangesetId,
+) -> Result<Option<ChangesetId>> {
+    let repo_name = repo.repo_identity().name();
+    // Deduped: no unique constraint, so a retried land can record a pair twice.
+    let successors: HashSet<ChangesetId> = repo
+        .pushrebase_mutation_mapping()
+        .get_successor_ids(ctx, baseline)
+        .await
+        .with_context(|| {
+            format!("reading recorded successors of baseline {baseline} in {repo_name}")
+        })?
+        .into_iter()
+        .collect();
+
+    let on_branch: Vec<ChangesetId> =
+        stream::iter(successors.iter().copied().map(|successor| async move {
+            let reachable = repo
+                .commit_graph()
+                .is_ancestor(ctx, successor, onto)
+                .await
+                .with_context(|| {
+                    format!("checking whether recorded successor {successor} is on the branch")
+                })?;
+            anyhow::Ok(reachable.then_some(successor))
+        }))
+        .buffer_unordered(BASELINE_SUCCESSOR_CONCURRENCY)
+        .try_filter_map(|candidate| async move { Ok(candidate) })
+        .try_collect()
+        .await?;
+
+    // Exactly one, or we do not guess.
+    let resolved = match on_branch.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    };
+    // 0/0 is "no row"; n/0 is "recorded but off-branch".
+    ctx.scuba()
+        .clone()
+        .add("log_tag", "orphaned_baseline_resolution")
+        .add("repo", repo_name)
+        .add("old_target", baseline.to_string())
+        .add("recorded_successors", successors.len())
+        .add("candidates_on_branch", on_branch.len())
+        .add(
+            "resolved_to",
+            resolved.map_or_else(|| "none".to_string(), |cs| cs.to_string()),
+        )
+        .unsampled()
+        .log();
+    Ok(resolved)
 }
 
 /// A successfully rebased request pending the CAS bookmark update.
@@ -634,15 +1040,13 @@ async fn do_batched_pushrebase(
     while let Some(mut request) = requests_iter.next() {
         let request_ctx = pushrebase_context(&request.ctx, flags);
         let bookmark_val = old_bookmark_value.unwrap_or(request.stack.root);
-        // Narrow-range scan: use conflict_check_base as ancestor so retries
-        // only scan the delta since the last attempt. On first attempt,
-        // conflict_check_base == root, so the full range is scanned.
+        // Only scan the delta since preparation or the last attempt.
         let conflict_result = match check_pushrebase_conflicts(
             &request_ctx,
             repo,
             flags,
             request.stack.root,
-            request.conflict_check_base,
+            request.stack.conflict_check_base,
             bookmark_val,
             &request.stack.changesets,
             &request.stack.changed_files,
@@ -659,11 +1063,11 @@ async fn do_batched_pushrebase(
         // Reconcile carried merge info with delta info from this attempt
         let reconciled_overrides = match conflict_result.merged_file_overrides {
             Some(delta_info) => Some(reconcile_merge_file_info(
-                &request.carried_merge_file_info,
+                &request.stack.carried_merge_file_info,
                 &delta_info,
             )),
-            None if !request.carried_merge_file_info.is_empty() => {
-                Some(request.carried_merge_file_info.clone())
+            None if !request.stack.carried_merge_file_info.is_empty() => {
+                Some(request.stack.carried_merge_file_info.clone())
             }
             None => None,
         };
@@ -676,14 +1080,15 @@ async fn do_batched_pushrebase(
         // MR previously succeeded — otherwise a clean delta on retry would
         // hide a successful MR run. `carried_merge_file_info` is the
         // signal: non-empty means an earlier attempt resolved conflicts.
-        let merge_summary = synthesize_carried_summary(&request.carried_merge_file_info)
+        let merge_summary = synthesize_carried_summary(&request.stack.carried_merge_file_info)
             .map(|carried| {
                 MergeResolutionSummary::combine(carried, conflict_result.merge_summary.clone())
             })
             .unwrap_or(conflict_result.merge_summary);
 
         // Store reconciled overrides on the request for carry-forward on re-queue
-        request.carried_merge_file_info = reconciled_overrides.clone().unwrap_or_default();
+        request.stack.carried_merge_file_info = reconciled_overrides.clone().unwrap_or_default();
+        request.stack.conflict_check_base = bookmark_val;
 
         let pushrebase_distance = match try_join(
             repo.commit_graph()
@@ -750,8 +1155,6 @@ async fn do_batched_pushrebase(
                     .map(|p| p.request)
                     .chain(requests_iter)
                     .map(|mut req| {
-                        req.conflict_check_base =
-                            old_bookmark_value.unwrap_or(req.conflict_check_base);
                         req.retry_num = PushrebaseRetryNum(req.retry_num.0 + 1);
                         req
                     })
@@ -828,6 +1231,7 @@ async fn do_batched_pushrebase(
                 STATS::commits_rebased.add_value(all_rebased_pairs.len() as i64, repo_args);
             }
 
+            let batch_size = pending.len();
             for p in pending {
                 // Per-request: the batch success sample above is per-batch, so
                 // record each landed request's retries-until-success separately.
@@ -853,6 +1257,10 @@ async fn do_batched_pushrebase(
                 let mut sample = request_ctx.scuba().clone();
                 sample
                     .add("repo_name", repo.repo_identity().name())
+                    .add("bookmark_log_id", log_id.0)
+                    .add("batch_size", batch_size)
+                    .add("batch_total_commits", all_rebased_pairs.len())
+                    .add("rebased_changesets", stack_pairs.len())
                     .add("retry_num", p.request.retry_num.0 as i64);
                 // Clone for Scuba so the original can be moved into the
                 // returned PushrebaseOutcome below; see rebase_with_lock
@@ -874,7 +1282,7 @@ async fn do_batched_pushrebase(
             vec![]
         }
         Ok(None) => {
-            // CAS failed — update conflict_check_base and return for re-queue.
+            // CAS failed — return for re-queue with the saved conflict checks.
             if emit_all_bookmarks {
                 bookmarks::saturation::record_pushrebase_failure(
                     repo.repo_identity().name(),
@@ -888,8 +1296,6 @@ async fn do_batched_pushrebase(
             pending
                 .into_iter()
                 .map(|mut p| {
-                    p.request.conflict_check_base =
-                        old_bookmark_value.unwrap_or(p.request.conflict_check_base);
                     p.request.retry_num = PushrebaseRetryNum(p.request.retry_num.0 + 1);
                     // carried_merge_file_info is already updated on the request
                     p.request
@@ -948,9 +1354,10 @@ async fn check_filenodes_backfilled(
 #[derive(Clone, Debug, PartialEq)]
 struct MergedFileInfo {
     path: NonRootMPath,
-    base_content_id: ContentId,
-    server_content_id: ContentId,
-    file_type: FileType,
+    /// `None`: absent in the old parent.
+    base: Option<BaseFile>,
+    /// `None`: absent in the new parent.
+    server: Option<BaseFile>,
 }
 
 struct ConflictCheckResult {
@@ -965,6 +1372,17 @@ struct ConflictCheckResult {
     /// (the standalone "Pushrebase merge resolution failed" Scuba sample
     /// captures them); they ride with PushrebaseError in a follow-up.
     merge_summary: MergeResolutionSummary,
+}
+
+/// An overlapping path whose server content still equals the base: only the
+/// stack changed it, so there is nothing to merge.
+#[derive(Clone, Copy)]
+enum UnchangedOverlap {
+    /// Report it like any other overlap.
+    Conflict,
+    /// Take the stack's content; needed when the range holds the root's own
+    /// landed form.
+    TakeClient,
 }
 
 /// Checks for server-side conflicts against the client's pushed stack.
@@ -990,6 +1408,7 @@ async fn check_pushrebase_conflicts(
         client_bcs,
         client_cf,
         RangeDiffManifests::FromKnob,
+        UnchangedOverlap::Conflict,
     )
     .await
 }
@@ -1004,6 +1423,7 @@ async fn check_pushrebase_conflicts_with(
     client_bcs: &[BonsaiChangeset],
     client_cf: &[MPath],
     manifests: RangeDiffManifests,
+    unchanged: UnchangedOverlap,
 ) -> Result<ConflictCheckResult, PushrebaseError> {
     let server_bcs =
         fetch_bonsai_range_ancestor_not_included(ctx, repo, ancestor, descendant).await?;
@@ -1037,6 +1457,36 @@ async fn check_pushrebase_conflicts_with(
         }),
         Err(PushrebaseError::Conflicts(conflicts)) => {
             let reponame = repo.repo_identity().name();
+            let (conflicts, bases) = match unchanged {
+                UnchangedOverlap::Conflict => (conflicts, Bases::ProbeThenRead),
+                UnchangedOverlap::TakeClient => {
+                    let total = conflicts.len();
+                    let (remaining, bases) = without_unchanged_overlaps(
+                        ctx,
+                        repo,
+                        conflicts,
+                        root,
+                        descendant,
+                        &server_bcs,
+                    )
+                    .await?;
+                    if remaining.len() < total {
+                        ctx.scuba()
+                            .clone()
+                            .add("repo_name", reponame)
+                            .add("unchanged_overlaps_taken", (total - remaining.len()) as i64)
+                            .log_with_msg("Pushrebase unchanged overlaps taken", None);
+                    }
+                    if remaining.is_empty() {
+                        return Ok(ConflictCheckResult {
+                            server_changeset_count: server_bcs_len,
+                            merged_file_overrides: None,
+                            merge_summary: MergeResolutionSummary::NotNeeded,
+                        });
+                    }
+                    (remaining, Bases::Precomputed(bases))
+                }
+            };
             let conflict_files_count = conflicts.len() as u64;
             STATS::conflict_rejections.add_value(1, (reponame.to_string(),));
             STATS::conflict_files_count.add_value(conflicts.len() as i64, (reponame.to_string(),));
@@ -1071,6 +1521,7 @@ async fn check_pushrebase_conflicts_with(
                         repo,
                         &conflicts,
                         root,
+                        bases,
                         &server_bcs,
                         client_bcs,
                         max_merge_conflicts,
@@ -1574,7 +2025,7 @@ async fn speculative_batch_check(
             repo,
             flags,
             request.stack.root,
-            request.conflict_check_base,
+            request.stack.conflict_check_base,
             bookmark_val,
             &request.stack.changesets,
             &request.stack.changed_files,
@@ -1702,14 +2153,14 @@ async fn rebase_batch_under_lock(
         }
 
         let reconciled_overrides = if merge_info.is_empty() {
-            if !request.carried_merge_file_info.is_empty() {
-                Some(request.carried_merge_file_info.clone())
+            if !request.stack.carried_merge_file_info.is_empty() {
+                Some(request.stack.carried_merge_file_info.clone())
             } else {
                 None
             }
         } else {
             Some(reconcile_merge_file_info(
-                &request.carried_merge_file_info,
+                &request.stack.carried_merge_file_info,
                 &merge_info,
             ))
         };
@@ -1720,11 +2171,12 @@ async fn rebase_batch_under_lock(
 
         // Fold in any carried summary from prior CAS-failure retries
         // (mirrors the legacy non-pessimistic batched loop's semantics).
-        if let Some(carried) = synthesize_carried_summary(&request.carried_merge_file_info) {
+        if let Some(carried) = synthesize_carried_summary(&request.stack.carried_merge_file_info) {
             merge_summary = MergeResolutionSummary::combine(carried, merge_summary);
         }
 
-        request.carried_merge_file_info = reconciled_overrides.clone().unwrap_or_default();
+        request.stack.carried_merge_file_info = reconciled_overrides.clone().unwrap_or_default();
+        request.stack.conflict_check_base = auth_value.unwrap_or(request.stack.root);
 
         let request_old_bookmark_value = running_head;
         let onto = running_head.unwrap_or(request.stack.root);
@@ -1763,7 +2215,6 @@ async fn rebase_batch_under_lock(
                     .map(|p| p.request)
                     .chain(checked_iter.map(|c| c.request))
                     .map(|mut req| {
-                        req.conflict_check_base = auth_value.unwrap_or(req.conflict_check_base);
                         req.retry_num = PushrebaseRetryNum(req.retry_num.0 + 1);
                         req
                     })
@@ -1864,6 +2315,7 @@ fn dispatch_batch_results(
     log_id: u64,
     all_rebased_pairs: &[PushrebaseChangesetPair],
 ) {
+    let batch_size = pending.len();
     for p in pending {
         let stack_pairs: Vec<PushrebaseChangesetPair> = all_rebased_pairs
             .iter()
@@ -1881,6 +2333,10 @@ fn dispatch_batch_results(
         let mut sample = request_ctx.scuba().clone();
         sample
             .add("repo_name", repo.repo_identity().name())
+            .add("bookmark_log_id", log_id)
+            .add("batch_size", batch_size)
+            .add("batch_total_commits", all_rebased_pairs.len())
+            .add("rebased_changesets", stack_pairs.len())
             .add("retry_num", p.request.retry_num.0 as i64);
         p.merge_summary.add_to_scuba(&mut sample);
         sample.log_with_msg("batched_pushrebase_request_complete", None);
@@ -2389,6 +2845,34 @@ async fn id_to_root_manifest_id(
     }
 }
 
+/// `id_to_root_manifest_id` without derivation: `None` if not derived yet.
+async fn fetch_root_manifest_id(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    bcs_id: ChangesetId,
+) -> Result<Option<compat::ContentManifestId>, Error> {
+    let repo_name = repo.repo_identity().name();
+    let use_content_manifests = justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(repo_name),
+    );
+
+    if use_content_manifests {
+        Ok(repo
+            .repo_derived_data()
+            .fetch_derived::<RootContentManifestId>(ctx, bcs_id)
+            .await?
+            .map(|id| id.into_content_manifest_id().into()))
+    } else {
+        Ok(repo
+            .repo_derived_data()
+            .fetch_derived::<RootFsnodeId>(ctx, bcs_id)
+            .await?
+            .map(|id| id.into_fsnode_id().into()))
+    }
+}
+
 // from smaller generation number to larger
 async fn fetch_bonsai_range_ancestor_not_included(
     ctx: &CoreContext,
@@ -2535,11 +3019,11 @@ fn intersect_changed_files(left: Vec<MPath>, right: Vec<MPath>) -> Result<(), Pu
     }
 }
 
-/// Whether the root manifest [`fetch_manifest_file`] would read for `cs_id` is
-/// already derived, so merge resolution can run without paying for derivation
-/// inside the pushrebase critical section.
+/// Whether the root manifest `base_files` would read for `cs_id` is already
+/// derived, so merge resolution can run without paying for derivation inside
+/// the pushrebase critical section.
 ///
-/// This must probe the same manifest type `fetch_manifest_file` derives --
+/// This must probe the same manifest type `id_to_root_manifest_id` derives --
 /// probing fsnodes on a repo that has migrated to content manifests would
 /// report "not derived" forever and silently disable merge resolution.
 async fn root_manifest_is_derived(
@@ -2547,53 +3031,367 @@ async fn root_manifest_is_derived(
     repo: &impl Repo,
     cs_id: ChangesetId,
 ) -> Result<bool> {
-    let repo_name = repo.repo_identity().name();
-    let use_content_manifests = justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(repo_name),
-    );
+    Ok(fetch_root_manifest_id(ctx, repo, cs_id).await?.is_some())
+}
 
-    if use_content_manifests {
-        Ok(repo
-            .repo_derived_data()
-            .fetch_derived::<RootContentManifestId>(ctx, cs_id)
-            .await?
-            .is_some())
-    } else {
-        Ok(repo
-            .repo_derived_data()
-            .fetch_derived::<RootFsnodeId>(ctx, cs_id)
-            .await?
-            .is_some())
+/// What the stack saw at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BaseFile {
+    content_id: ContentId,
+    file_type: FileType,
+}
+
+/// Base content for `paths` from `root`'s manifest, `None` meaning absent,
+/// in one batched lookup. Derives the manifest if it is not there yet, so
+/// callers holding the bookmark lock must probe first.
+async fn base_files(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    root: ChangesetId,
+    paths: &[NonRootMPath],
+) -> Result<HashMap<NonRootMPath, Option<BaseFile>>> {
+    let root_id = id_to_root_manifest_id(ctx, repo, root).await?;
+    base_files_from_manifest(ctx, repo, root_id, paths).await
+}
+
+/// `base_files` for an already-resolved manifest; never derives.
+async fn base_files_from_manifest(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    root_id: compat::ContentManifestId,
+    paths: &[NonRootMPath],
+) -> Result<HashMap<NonRootMPath, Option<BaseFile>>> {
+    use manifest::Entry;
+
+    let found: HashMap<MPath, _> = root_id
+        .find_entries(
+            ctx.clone(),
+            repo.repo_blobstore().clone(),
+            paths.iter().cloned(),
+        )
+        .try_collect()
+        .await?;
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let base = match found.get(&MPath::from(path.clone())) {
+                Some(Entry::Leaf(file)) => {
+                    let file: compat::ContentManifestFile = file.clone().into();
+                    Some(BaseFile {
+                        content_id: file.content_id(),
+                        file_type: file.file_type(),
+                    })
+                }
+                _ => None,
+            };
+            (path.clone(), base)
+        })
+        .collect())
+}
+
+/// What a manifest holds at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestState {
+    File { file: BaseFile, size: u64 },
+    Tree(compat::ContentManifestId),
+    Absent,
+}
+
+impl ManifestState {
+    fn is_file(self) -> bool {
+        matches!(self, ManifestState::File { .. })
     }
 }
 
-/// Fetch manifest file entry for a given path from a changeset's manifest.
-/// Returns the ContentManifestFile which provides access to content_id and file_type.
-/// Uses content_manifest or fsnode depending on the JustKnobs gate.
-async fn fetch_manifest_file(
+/// State of every path in `paths` and of each of its non-root ancestors,
+/// in one manifest walk; never derives.
+async fn lookup_manifest_states(
     ctx: &CoreContext,
     repo: &impl Repo,
-    cs_id: ChangesetId,
-    path: &NonRootMPath,
-) -> Result<Option<compat::ContentManifestFile>> {
+    root_id: compat::ContentManifestId,
+    paths: &[MPath],
+) -> Result<HashMap<MPath, ManifestState>> {
     use manifest::Entry;
 
-    let root_id = id_to_root_manifest_id(ctx, repo, cs_id).await?;
-
-    let entry = root_id
-        .find_entry(
+    let wanted: HashSet<MPath> = paths
+        .iter()
+        .flat_map(|path| path.clone().into_ancestors())
+        .filter(|path| !path.is_root())
+        .collect();
+    let found: HashMap<MPath, ManifestState> = root_id
+        .find_entries(
             ctx.clone(),
             repo.repo_blobstore().clone(),
-            path.clone().into(),
+            wanted.iter().cloned(),
         )
+        .map_ok(|(path, entry)| {
+            let state = match entry {
+                Entry::Leaf(file) => {
+                    let file: compat::ContentManifestFile = file.into();
+                    ManifestState::File {
+                        file: BaseFile {
+                            content_id: file.content_id(),
+                            file_type: file.file_type(),
+                        },
+                        size: file.size(),
+                    }
+                }
+                Entry::Tree(id) => ManifestState::Tree(id),
+            };
+            (path, state)
+        })
+        .try_collect()
         .await?;
+    Ok(wanted
+        .into_iter()
+        .map(|path| {
+            let state = found.get(&path).copied().unwrap_or(ManifestState::Absent);
+            (path, state)
+        })
+        .collect())
+}
 
-    match entry {
-        Some(Entry::Leaf(file)) => Ok(Some(file.into())),
-        _ => Ok(None),
+/// Server-side list for `intersect_changed_files` when the server side is
+/// the difference between two manifests over the stack's own paths: the
+/// path when its entry differs, else its shallowest ancestor that is a file
+/// on one side only.
+fn manifest_overlaps(
+    client_cf: &[MPath],
+    base: &HashMap<MPath, ManifestState>,
+    onto: &HashMap<MPath, ManifestState>,
+) -> Vec<MPath> {
+    let state = |map: &HashMap<MPath, ManifestState>, path: &MPath| {
+        map.get(path).copied().unwrap_or(ManifestState::Absent)
+    };
+    let mut overlaps: Vec<MPath> = client_cf
+        .iter()
+        .filter_map(|path| {
+            let mut ancestors: Vec<MPath> = path
+                .clone()
+                .into_ancestors()
+                .filter(|p| !p.is_root())
+                .collect();
+            ancestors.reverse();
+            ancestors.into_iter().find(|p| {
+                let (b, o) = (state(base, p), state(onto, p));
+                if p == path {
+                    b != o
+                } else {
+                    b.is_file() != o.is_file()
+                }
+            })
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    overlaps.sort_unstable();
+    overlaps
+}
+
+/// Manifest-mode counterpart of `collect_merge_file_info`. The cascade
+/// decides per commit whether an overlap is already applied, mergeable, or
+/// a conflict; this rejects only what can never merge. An overlap whose
+/// first change in the stack already matches `onto` needs no merge.
+fn collect_overlap_states(
+    conflicts: &[PushrebaseConflict],
+    client_bcs: &[BonsaiChangeset],
+    base: &HashMap<MPath, ManifestState>,
+    onto: &HashMap<MPath, ManifestState>,
+    max_conflicts: usize,
+    max_file_size: u64,
+    excluded_path_prefixes: &PrefixTrie,
+) -> Result<Vec<MergedFileInfo>, MergeResolutionError> {
+    if conflicts.iter().any(|c| c.left != c.right) {
+        return Err(MergeResolutionError::Skipped(
+            "prefix conflicts present".to_string(),
+        ));
     }
+    if conflicts.len() > max_conflicts {
+        return Err(MergeResolutionError::TooManyConflicts);
+    }
+
+    let state = |map: &HashMap<MPath, ManifestState>, path: &MPath| {
+        map.get(path).copied().unwrap_or(ManifestState::Absent)
+    };
+    conflicts
+        .iter()
+        .map(|conflict| {
+            let path = conflict
+                .left
+                .clone()
+                .into_optional_non_root_path()
+                .ok_or_else(|| MergeResolutionError::Skipped("root path conflict".to_string()))?;
+            if excluded_path_prefixes.contains_prefix(&path) {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {path} is under an excluded path prefix",
+                )));
+            }
+            let as_file = |state: ManifestState| match state {
+                ManifestState::File { file, size } => Ok(Some((file, size))),
+                ManifestState::Absent => Ok(None),
+                ManifestState::Tree(_) => Err(MergeResolutionError::Skipped(format!(
+                    "path {path} is a directory in base or destination",
+                ))),
+            };
+            let base_entry = as_file(state(base, &conflict.left))?;
+            let onto_entry = as_file(state(onto, &conflict.left))?;
+            let base_state = base_entry.map(|(file, _)| file);
+            let onto_state = onto_entry.map(|(file, _)| file);
+
+            let changes: Vec<&FileChange> = client_bcs
+                .iter()
+                .filter_map(|bcs| bcs.file_changes_map().get(&path))
+                .collect();
+            if changes.is_empty() {
+                return Err(MergeResolutionError::Skipped(format!(
+                    "file {path} not a tracked change in pushed changeset",
+                )));
+            }
+            // Safe to skip the merge guards below: the cascade equalises both
+            // parent states at the first touch, so no later commit merges here.
+            let first_applied = changes.first().is_some_and(|fc| match fc {
+                FileChange::Change(tc) => onto_state.is_some_and(|onto| {
+                    onto.content_id == tc.content_id() && onto.file_type == tc.file_type()
+                }),
+                FileChange::Deletion => onto_state.is_none(),
+                FileChange::UntrackedChange(_) | FileChange::UntrackedDeletion => false,
+            });
+            if !first_applied {
+                let ((base_file, base_size), (_, onto_size)) = match (base_entry, onto_entry) {
+                    (Some(base), Some(onto)) => (base, onto),
+                    _ => {
+                        return Err(MergeResolutionError::Skipped(format!(
+                            "file {path} missing in base or destination",
+                        )));
+                    }
+                };
+                if onto_size > max_file_size || base_size > max_file_size {
+                    return Err(MergeResolutionError::Skipped(format!(
+                        "file {path} is too large in base or destination",
+                    )));
+                }
+                for fc in &changes {
+                    let tc = match fc {
+                        FileChange::Change(tc) => tc,
+                        _ => {
+                            return Err(MergeResolutionError::Skipped(format!(
+                                "file {path} not a tracked change in pushed changeset",
+                            )));
+                        }
+                    };
+                    if tc.copy_from().is_some() {
+                        return Err(MergeResolutionError::Skipped(format!(
+                            "file {path} has copy-from info",
+                        )));
+                    }
+                    if tc.git_lfs().is_lfs_pointer() {
+                        return Err(MergeResolutionError::Skipped(format!(
+                            "file {path} is LFS-tracked",
+                        )));
+                    }
+                    if tc.size() > max_file_size {
+                        return Err(MergeResolutionError::Skipped(format!(
+                            "file {path} is too large ({} bytes)",
+                            tc.size(),
+                        )));
+                    }
+                    if tc.file_type() != base_file.file_type
+                        || onto_state.is_some_and(|onto| onto.file_type != tc.file_type())
+                    {
+                        return Err(MergeResolutionError::Skipped(format!(
+                            "file {path} has type mismatch",
+                        )));
+                    }
+                }
+            }
+            Ok(MergedFileInfo {
+                path,
+                base: base_state,
+                server: onto_state,
+            })
+        })
+        .collect()
+}
+
+/// Drops overlaps whose server state still equals the base: only the stack
+/// changed those, so taking its content is plain rebase, not a merge, and no
+/// merge guard applies. Also returns the bases so merge resolution can reuse
+/// them. Reads manifests on demand: this route holds no bookmark lock.
+async fn without_unchanged_overlaps(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    conflicts: Vec<PushrebaseConflict>,
+    root: ChangesetId,
+    onto: ChangesetId,
+    server_bcs: &[BonsaiChangeset],
+) -> Result<
+    (
+        Vec<PushrebaseConflict>,
+        HashMap<NonRootMPath, Option<BaseFile>>,
+    ),
+    PushrebaseError,
+> {
+    let paths: Vec<NonRootMPath> = conflicts
+        .iter()
+        .filter(|c| c.left == c.right)
+        .filter_map(|c| c.left.clone().into_optional_non_root_path())
+        .collect();
+    let bases = base_files(ctx, repo, root, &paths)
+        .await
+        .map_err(PushrebaseError::Error)?;
+    // A merge's bonsai omits paths it kept from a single parent, so only a
+    // linear range can be replayed from file changes; otherwise read `onto`.
+    let server_state: HashMap<NonRootMPath, Option<BaseFile>> =
+        if server_bcs.iter().any(BonsaiChangeset::is_merge) {
+            base_files(ctx, repo, onto, &paths)
+                .await
+                .map_err(PushrebaseError::Error)?
+        } else {
+            // Latest wins: server_bcs is oldest-to-newest.
+            server_bcs
+                .iter()
+                .flat_map(|bcs| bcs.file_changes_map().iter())
+                .map(|(path, fc)| {
+                    let state = match fc {
+                        FileChange::Change(tc) => Some(BaseFile {
+                            content_id: tc.content_id(),
+                            file_type: tc.file_type(),
+                        }),
+                        // Snapshot-only variants never reach a landed range.
+                        FileChange::Deletion
+                        | FileChange::UntrackedChange(_)
+                        | FileChange::UntrackedDeletion => None,
+                    };
+                    (path.clone(), state)
+                })
+                .collect()
+        };
+
+    let unchanged: HashSet<MPath> = paths
+        .into_iter()
+        .filter(|path| match (bases.get(path), server_state.get(path)) {
+            (Some(Some(base)), Some(Some(server))) => {
+                base.content_id == server.content_id && base.file_type == server.file_type
+            }
+            (Some(None), Some(None)) => true,
+            _ => false,
+        })
+        .map(MPath::from)
+        .collect();
+
+    let remaining = conflicts
+        .into_iter()
+        .filter(|c| !(c.left == c.right && unchanged.contains(&c.left)))
+        .collect();
+    Ok((remaining, bases))
+}
+
+/// Where merge resolution gets the base content it needs.
+enum Bases {
+    /// Read already, outside any bookmark lock; no derivation probe needed.
+    Precomputed(HashMap<NonRootMPath, Option<BaseFile>>),
+    /// Not read yet: probe for derived manifests first, then read.
+    ProbeThenRead,
 }
 
 /// Outcome of attempting a three-way merge on a single file.
@@ -2669,6 +3467,7 @@ async fn collect_merge_file_info(
     repo: &impl Repo,
     conflicts: &[PushrebaseConflict],
     root: ChangesetId,
+    bases: Bases,
     server_bcs: &[BonsaiChangeset],
     client_bcs: &[BonsaiChangeset],
     max_conflicts: usize,
@@ -2693,16 +3492,28 @@ async fn collect_merge_file_info(
     // If derive_fsnodes is false, check if the root manifest is already
     // derived. If not, skip merge resolution to avoid expensive derivation in
     // the pushrebase critical section.
-    if !derive_fsnodes {
-        let is_derived = root_manifest_is_derived(ctx, repo, root)
-            .await
-            .map_err(MergeResolutionError::InternalError)?;
-        if !is_derived {
-            return Err(MergeResolutionError::Skipped(
-                "root manifest not derived for base commit".to_string(),
-            ));
+    let bases = match bases {
+        Bases::Precomputed(bases) => bases,
+        Bases::ProbeThenRead => {
+            if !derive_fsnodes {
+                let is_derived = root_manifest_is_derived(ctx, repo, root)
+                    .await
+                    .map_err(MergeResolutionError::InternalError)?;
+                if !is_derived {
+                    return Err(MergeResolutionError::Skipped(
+                        "root manifest not derived for base commit".to_string(),
+                    ));
+                }
+            }
+            let base_paths: Vec<NonRootMPath> = exact_conflicts
+                .iter()
+                .filter_map(|c| c.left.clone().into_optional_non_root_path())
+                .collect();
+            base_files(ctx, repo, root, &base_paths)
+                .await
+                .map_err(MergeResolutionError::InternalError)?
         }
-    }
+    };
 
     // Build a map of path -> FileChange from the client changesets
     let client_changes: HashMap<&NonRootMPath, &FileChange> = client_bcs
@@ -2753,6 +3564,14 @@ async fn collect_merge_file_info(
             )));
         }
 
+        // An LFS-tracked file's bonsai content is the blob behind the pointer;
+        // merged bytes would exist on no LFS server.
+        if client_fc.git_lfs().is_lfs_pointer() {
+            return Err(MergeResolutionError::Skipped(format!(
+                "file {path} is LFS-tracked",
+            )));
+        }
+
         // Skip files that are too large
         if client_fc.size() > max_file_size {
             return Err(MergeResolutionError::Skipped(format!(
@@ -2771,6 +3590,12 @@ async fn collect_merge_file_info(
                 )));
             }
         };
+
+        if server_fc.git_lfs().is_lfs_pointer() {
+            return Err(MergeResolutionError::Skipped(format!(
+                "file {path} is LFS-tracked on server",
+            )));
+        }
 
         // Also check server file size
         if server_fc.size() > max_file_size {
@@ -2793,29 +3618,22 @@ async fn collect_merge_file_info(
             )));
         }
 
-        // Fetch base content from root manifest — capture the content ID
-        // so the cascading merge in create_rebased_changesets can reuse it.
-        let base_file = match fetch_manifest_file(ctx, repo, root, &non_root_path).await {
-            Ok(Some(f)) => f,
-            Ok(None) => {
+        // The cascading merge in create_rebased_changesets reuses this id.
+        let base_file = match bases.get(&non_root_path) {
+            Some(Some(f)) => f,
+            _ => {
                 return Err(MergeResolutionError::Skipped(format!(
                     "file {non_root_path} not found in base",
                 )));
             }
-            Err(e) => return Err(MergeResolutionError::InternalError(e)),
         };
 
-        if base_file.file_type() != local_file_type {
+        if base_file.file_type != local_file_type {
             return Err(MergeResolutionError::Skipped(format!(
                 "file {} has type mismatch: base={:?}, local={:?}",
-                non_root_path,
-                base_file.file_type(),
-                local_file_type,
+                non_root_path, base_file.file_type, local_file_type,
             )));
         }
-
-        let base_content_id = base_file.content_id();
-        let server_content_id = server_fc.content_id().clone();
 
         // Record metadata for the cascading merge in
         // create_rebased_changesets. The actual 3-way merge is deferred
@@ -2823,9 +3641,11 @@ async fn collect_merge_file_info(
         // base/local/other for each commit in the stack.
         merged_file_changes.push(MergedFileInfo {
             path: non_root_path,
-            base_content_id,
-            server_content_id,
-            file_type: local_file_type,
+            base: Some(*base_file),
+            server: Some(BaseFile {
+                content_id: server_fc.content_id().clone(),
+                file_type: local_file_type,
+            }),
         });
     }
 
@@ -2872,7 +3692,7 @@ fn reconcile_merge_file_info(
     for info in delta {
         match by_path.entry(info.path.clone()) {
             Entry::Occupied(mut e) => {
-                e.get_mut().server_content_id = info.server_content_id;
+                e.get_mut().server = info.server;
             }
             Entry::Vacant(e) => {
                 e.insert(info.clone());
@@ -2896,7 +3716,63 @@ async fn get_bookmark_value(
     Ok(maybe_cs_id)
 }
 
+/// What to do with a commit whose every change is already in its new
+/// parent.
+#[derive(Clone, Copy)]
+enum NoopPolicy {
+    /// Reject the stack per `pushrebase_reject_noop_merge_commits`.
+    RejectPerKnob,
+    /// Skip the commit and alias it to its rebased parent, as `sl rebase`
+    /// does.
+    Drop,
+}
+
+struct RebaseOutput {
+    new_head: ChangesetId,
+    /// Excludes dropped commits.
+    rebased: RebasedChangesets,
+    bonsais: Vec<BonsaiChangeset>,
+    /// Old ids skipped as already applied, in stack order.
+    dropped: Vec<ChangesetId>,
+    /// Old id -> paths content-merged in that commit.
+    merged_paths: HashMap<ChangesetId, Vec<NonRootMPath>>,
+}
+
 async fn create_rebased_changesets(
+    ctx: &CoreContext,
+    repo: &impl Repo,
+    config: &PushrebaseFlags,
+    rebased_set: &[BonsaiChangeset],
+    root: ChangesetId,
+    head: ChangesetId,
+    onto: ChangesetId,
+    hooks: &mut [Box<dyn PushrebaseCommitHook>],
+    merged_file_overrides: Option<Vec<MergedFileInfo>>,
+) -> Result<(ChangesetId, RebasedChangesets, Vec<BonsaiChangeset>), PushrebaseError> {
+    let set = create_rebased_changesets_with(
+        ctx,
+        repo,
+        config,
+        rebased_set,
+        root,
+        head,
+        onto,
+        hooks,
+        merged_file_overrides,
+        NoopPolicy::RejectPerKnob,
+    )
+    .await?;
+    Ok((set.new_head, set.rebased, set.bonsais))
+}
+
+fn same_path_conflict(path: &NonRootMPath) -> PushrebaseError {
+    PushrebaseError::Conflicts(vec![PushrebaseConflict {
+        left: MPath::from(path.clone()),
+        right: MPath::from(path.clone()),
+    }])
+}
+
+async fn create_rebased_changesets_with(
     ctx: &CoreContext,
     repo: &impl Repo,
     config: &PushrebaseFlags,
@@ -2908,7 +3784,8 @@ async fn create_rebased_changesets(
     onto: ChangesetId,
     hooks: &mut [Box<dyn PushrebaseCommitHook>],
     merged_file_overrides: Option<Vec<MergedFileInfo>>,
-) -> Result<(ChangesetId, RebasedChangesets, Vec<BonsaiChangeset>), PushrebaseError> {
+    noop: NoopPolicy,
+) -> Result<RebaseOutput, PushrebaseError> {
     let rebased_set_ids: HashSet<_> = rebased_set.iter().map(|cs| cs.get_changeset_id()).collect();
 
     let date = if config.rewritedates {
@@ -2917,49 +3794,31 @@ async fn create_rebased_changesets(
         None
     };
 
-    // rebased_set already sorted in topological order (oldest first), which
-    // guarantees that all required nodes will be updated by the time they
-    // are needed.
-    //
-    // Cascading merge: when merge resolution is active, we perform a
-    // per-commit 3-way merge instead of applying overrides only to HEAD.
-    // This ensures every intermediate commit has correct content.
-    //
-    // We track two maps for merge paths:
-    //   old_parent_content: content in the ORIGINAL parent chain (pre-rebase)
-    //   new_parent_content: content in the REBASED parent chain (post-rebase)
-    // For each commit that touches a merge path, we merge:
-    //   merge(old_parent_content, commit_content, new_parent_content)
-    // then update both maps for the next commit in the stack.
-
-    // Initialize cascading merge state from MergedFileInfo. The base and
-    // server content IDs were already captured by collect_merge_file_info,
-    // so no additional fsnode fetches are needed here.
+    // Cascading merge: each commit touching a merge path is merged against
+    // its own old and new parent state. `old_parent_content` follows the
+    // original chain, `new_parent_content` the rebased one; `None` is
+    // absent.
     let mut merge_paths: HashSet<NonRootMPath> = HashSet::new();
-    let mut old_parent_content: HashMap<NonRootMPath, ContentId> = HashMap::new();
-    let mut new_parent_content: HashMap<NonRootMPath, ContentId> = HashMap::new();
-    let mut merge_file_types: HashMap<NonRootMPath, FileType> = HashMap::new();
+    let mut old_parent_content: HashMap<NonRootMPath, Option<BaseFile>> = HashMap::new();
+    let mut new_parent_content: HashMap<NonRootMPath, Option<BaseFile>> = HashMap::new();
 
     if let Some(ref overrides) = merged_file_overrides {
         for info in overrides {
             merge_paths.insert(info.path.clone());
-            old_parent_content.insert(info.path.clone(), info.base_content_id);
-            new_parent_content.insert(info.path.clone(), info.server_content_id);
-            merge_file_types.insert(info.path.clone(), info.file_type);
+            old_parent_content.insert(info.path.clone(), info.base);
+            new_parent_content.insert(info.path.clone(), info.server);
         }
     }
 
     // Create a fake timestamp, it doesn't matter what timestamp root has
-
     let mut remapping = hashmap! { root => (onto, Timestamp::now()) };
     let mut rebased = Vec::new();
-    // Tracks commits whose every file_change resolved to a duplicate of trunk
-    // content via merge resolution — these would land as no-op commits.
     let mut noop_commits: Vec<(ChangesetId, Vec<NonRootMPath>)> = Vec::new();
+    let mut dropped = Vec::new();
+    let mut merged_paths: HashMap<ChangesetId, Vec<NonRootMPath>> = HashMap::new();
     for bcs_old in rebased_set.iter().cloned() {
         let id_old = bcs_old.get_changeset_id();
 
-        // Compute per-commit merge overrides via cascading merge.
         let mut overrides_for_this: Vec<(NonRootMPath, FileChange)> = Vec::new();
         let mut duplicate_paths: HashSet<NonRootMPath> = HashSet::new();
         for (path, fc) in bcs_old.file_changes_map() {
@@ -2967,46 +3826,50 @@ async fn create_rebased_changesets(
                 continue;
             }
 
-            let local_content_id = match fc {
-                FileChange::Change(tc) => tc.content_id().clone(),
+            let local = match fc {
+                FileChange::Change(tc) => Some(BaseFile {
+                    content_id: tc.content_id().clone(),
+                    file_type: tc.file_type(),
+                }),
+                FileChange::Deletion => None,
+                FileChange::UntrackedChange(_) | FileChange::UntrackedDeletion => continue,
+            };
+            let (base, other) = match (old_parent_content.get(path), new_parent_content.get(path)) {
+                (Some(base), Some(other)) => (*base, *other),
                 _ => continue,
             };
 
-            let base_id = match old_parent_content.get(path) {
-                Some(id) => *id,
-                None => continue,
-            };
-            let other_id = match new_parent_content.get(path) {
-                Some(id) => *id,
-                None => continue,
-            };
-
-            // If the new parent has the same content as the old parent,
-            // there's nothing to merge — just update tracking.
-            if base_id == other_id {
-                old_parent_content.insert(path.clone(), local_content_id);
-                new_parent_content.insert(path.clone(), local_content_id);
+            // Only the stack changed this path: plain rebase.
+            if base == other {
+                old_parent_content.insert(path.clone(), local);
+                new_parent_content.insert(path.clone(), local);
                 continue;
             }
 
-            // Client wrote identical content to what's already on the server.
-            // After rebase, this file_change becomes a no-op (its content
-            // matches the new parent's content at this path). Skip the merge
-            // entirely and record the path so we can classify the commit.
-            if local_content_id == other_id {
+            // Already applied in the new parent.
+            if local == other {
                 duplicate_paths.insert(path.clone());
-                old_parent_content.insert(path.clone(), local_content_id);
-                new_parent_content.insert(path.clone(), local_content_id);
+                old_parent_content.insert(path.clone(), local);
+                new_parent_content.insert(path.clone(), local);
                 continue;
             }
 
-            let file_type = merge_file_types
-                .get(path)
-                .copied()
-                .unwrap_or(FileType::Regular);
+            let (base, local_file, other_file) = match (base, local, other) {
+                (Some(base), Some(local_file), Some(other_file)) => (base, local_file, other_file),
+                // Range mode never merged deletions; keep applying them as-is.
+                _ if matches!(noop, NoopPolicy::RejectPerKnob) => continue,
+                _ => return Err(same_path_conflict(path)),
+            };
 
-            match merge_file_by_content_ids(ctx, repo, path, base_id, local_content_id, other_id)
-                .await
+            match merge_file_by_content_ids(
+                ctx,
+                repo,
+                path,
+                base.content_id,
+                local_file.content_id,
+                other_file.content_id,
+            )
+            .await
             {
                 FileMergeOutcome::Clean(merged_bytes) => {
                     let size = merged_bytes.len() as u64;
@@ -3018,52 +3881,67 @@ async fn create_rebased_changesets(
                         stream::once(future::ok(merged_bytes)),
                     )
                     .await?;
+                    let merged = Some(BaseFile {
+                        content_id: meta.content_id,
+                        file_type: local_file.file_type,
+                    });
 
                     overrides_for_this.push((
                         path.clone(),
                         FileChange::tracked(
                             meta.content_id,
-                            file_type,
+                            local_file.file_type,
                             meta.total_size,
                             None,
                             GitLfs::FullContent,
                         ),
                     ));
+                    merged_paths.entry(id_old).or_default().push(path.clone());
+                    if matches!(noop, NoopPolicy::Drop) && meta.content_id == other_file.content_id
+                    {
+                        duplicate_paths.insert(path.clone());
+                    }
 
-                    // Update tracking for downstream commits.
-                    old_parent_content.insert(path.clone(), local_content_id);
-                    new_parent_content.insert(path.clone(), meta.content_id);
+                    old_parent_content.insert(path.clone(), local);
+                    new_parent_content.insert(path.clone(), merged);
                 }
                 FileMergeOutcome::Conflict(description) => {
-                    // Cascading merge failed — fall back to the standard
-                    // conflict rejection. This surfaces as a normal
-                    // pushrebase conflict error to the client.
                     warn!("Cascading merge conflict on {}: {}", path, description,);
-                    return Err(PushrebaseError::Conflicts(vec![PushrebaseConflict {
-                        left: MPath::from(path.clone()),
-                        right: MPath::from(path.clone()),
-                    }]));
+                    return Err(same_path_conflict(path));
                 }
                 FileMergeOutcome::Error(err) => {
                     warn!("Cascading merge error on {}: {:#}", path, err);
-                    return Err(PushrebaseError::Conflicts(vec![PushrebaseConflict {
-                        left: MPath::from(path.clone()),
-                        right: MPath::from(path.clone()),
-                    }]));
+                    return Err(same_path_conflict(path));
                 }
             }
         }
 
-        // Classify the commit: if every file_change it touches was a duplicate
-        // of trunk content, the rebased commit will land as a no-op. Track for
-        // post-loop logging + optional rejection.
         let real_change_count = bcs_old
             .file_changes_map()
             .keys()
             .filter(|p| !duplicate_paths.contains(*p))
             .count();
         if real_change_count == 0 && !duplicate_paths.is_empty() {
-            noop_commits.push((id_old, duplicate_paths.iter().cloned().collect()));
+            match noop {
+                NoopPolicy::Drop if bcs_old.subtree_changes().is_empty() => {
+                    let parent = bcs_old.parents().next().ok_or_else(|| {
+                        PushrebaseError::Error(anyhow!("commit {id_old} has no parent"))
+                    })?;
+                    let alias = *remapping.get(&parent).ok_or_else(|| {
+                        PushrebaseError::Error(anyhow!(
+                            "parent {parent} of {id_old} is not in the rebase set"
+                        ))
+                    })?;
+                    remapping.insert(id_old, alias);
+                    dropped.push(id_old);
+                    merged_paths.remove(&id_old);
+                    continue;
+                }
+                NoopPolicy::Drop => {}
+                NoopPolicy::RejectPerKnob => {
+                    noop_commits.push((id_old, duplicate_paths.iter().cloned().collect()));
+                }
+            }
         }
 
         let overrides_ref = if overrides_for_this.is_empty() {
@@ -3132,19 +4010,23 @@ async fn create_rebased_changesets(
         }
     }
 
-    Ok((
-        remapping
-            .get(&head)
-            .map(|(cs, _)| cs)
-            .cloned()
-            .unwrap_or(head),
-        // `root` wasn't rebased, so let's remove it
-        remapping
+    let new_head = remapping
+        .get(&head)
+        .map(|(cs, _)| cs)
+        .cloned()
+        .unwrap_or(head);
+    let dropped_ids: HashSet<ChangesetId> = dropped.iter().copied().collect();
+    Ok(RebaseOutput {
+        new_head,
+        // `root` wasn't rebased and dropped commits have no successor.
+        rebased: remapping
             .into_iter()
-            .filter(|(id_old, _)| *id_old != root)
+            .filter(|(id_old, _)| *id_old != root && !dropped_ids.contains(id_old))
             .collect(),
-        rebased,
-    ))
+        bonsais: rebased,
+        dropped,
+        merged_paths,
+    })
 }
 
 async fn rebase_changeset(
@@ -3189,23 +4071,19 @@ async fn rebase_changeset(
     }
 
     // Copy information in bonsai changeset contains a commit parent. So parent changes, then
-    // copy information for all copied/moved files needs to be updated
+    // copy information for all copied/moved files needs to be updated. Only the copy source
+    // changes; the rest of the change, including how Git serves it, is kept as authored.
     let mut file_changes = bcs.file_changes;
     for file_change in file_changes.values_mut() {
         match file_change {
             FileChange::Change(tc) => {
-                *file_change = FileChange::tracked(
-                    tc.content_id().clone(),
-                    tc.file_type(),
-                    tc.size(),
-                    tc.copy_from().map(|(path, cs)| {
-                        (
-                            path.clone(),
-                            remapping.get(cs).map(|(cs, _)| cs).cloned().unwrap_or(*cs),
-                        )
-                    }),
-                    GitLfs::FullContent,
-                );
+                let copy_from = tc.copy_from().map(|(path, cs)| {
+                    (
+                        path.clone(),
+                        remapping.get(cs).map(|(cs, _)| cs).cloned().unwrap_or(*cs),
+                    )
+                });
+                *file_change = FileChange::Change(tc.with_new_copy_from(copy_from));
             }
             FileChange::Deletion
             | FileChange::UntrackedDeletion

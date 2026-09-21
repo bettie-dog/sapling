@@ -20,11 +20,11 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 cmdlib_caching = { version = "0.1.0", path = "../../../cmdlib/caching" }
 connection_security_checker = { version = "0.1.0", path = "../../../common/connection_security_checker" }
 context = { version = "0.1.0", path = "../../slapi/slapi_server/context" }
-either = "1.17.0"
+either = "1.18.0"
 environment = { version = "0.1.0", path = "../../../cmdlib/environment" }
 executor_lib = { version = "0.1.0", path = "../../../cmdlib/sharding" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1.10", features = ["rust_backend"], default-features = false }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_env = { version = "0.1.0", path = "../../../git/git_env" }
@@ -39,7 +39,7 @@ gotham = "0.8.1"
 gotham_derive = "0.8.1"
 gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
 http = "1.5.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 import_direct = { version = "0.1.0", path = "../../../git/import_direct" }
 import_tools = { version = "0.1.0", path = "../../../git/import_tools" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }

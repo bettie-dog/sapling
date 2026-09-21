@@ -215,6 +215,7 @@ class BasicTest(BasicTestBase):
             self.assertTrue(self.eden.in_proc_mounts(self.mount))
 
         self.eden.remove(self.mount)
+        self.eden.wait_for_checkout_removed(self.mount)
 
         if sys.platform != "win32":
             self.assertFalse(self.eden.in_proc_mounts(self.mount))
@@ -306,6 +307,17 @@ class PosixTest(BasicTestBase):
         self.assertEqual(st.st_uid, os.getuid())
         self.assertEqual(st.st_gid, os.getgid())
         self.assertEqual(st.st_mode & 0o600, 0o600)
+
+    def test_create_strips_setuid_setgid_sticky_bits(self) -> None:
+        if self.use_nfs():
+            self.skipTest("privilege bits are only stripped on the FUSE path")
+        created = os.path.join(self.mount, "setuid-create")
+        os.close(os.open(created, os.O_CREAT | os.O_WRONLY, 0o4755))
+        self.assertEqual(0o755, os.lstat(created).st_mode & 0o7777)
+
+        made = os.path.join(self.mount, "setgid-mknod")
+        os.mknod(made, stat.S_IFREG | 0o2644)
+        self.assertEqual(0o644, os.lstat(made).st_mode & 0o7777)
 
     def test_statvfs(self) -> None:
         hello_path = os.path.join(self.mount, "hello")

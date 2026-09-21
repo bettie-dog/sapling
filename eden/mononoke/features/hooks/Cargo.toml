@@ -25,15 +25,15 @@ content_manifest_derivation = { version = "0.1.0", path = "../../derived_data/co
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
-either = "1.17.0"
-fancy-regex = "0.19.0"
+either = "1.18.0"
+fancy-regex = "0.19.2"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 gix-config = { version = "0.56.0", features = ["sha1"] }
 hook_manager = { version = "0.1.0", path = "../../repo_attributes/hook_manager/hook_manager" }
 http = "1.5.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper-tls = "0.6"
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 ipnetwork = { version = "0.21.1", features = ["serde"] }

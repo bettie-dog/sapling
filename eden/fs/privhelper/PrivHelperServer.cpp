@@ -378,8 +378,16 @@ bool spawnEdenFs(
 
   try {
     SpawnedProcess proc(argv, std::move(opts));
-    XLOGF(INFO, "relaunched edenfs as pid {}", proc.pid());
-    std::move(proc).detach();
+    XLOGF(
+        INFO,
+        "relaunched edenfs as pid {}; waiting for startup to finish",
+        proc.pid());
+    const auto status = proc.waitOrTerminateOrKill(
+        kSupervisorStartupTimeout, kRestartTerminationTimeout);
+    if (status.state() != ProcessStatus::Exited || status.exitStatus() != 0) {
+      throw std::runtime_error(
+          folly::to<std::string>("relaunched edenfs process ", status.str()));
+    }
     return true;
   } catch (const std::exception& ex) {
     XLOGF(ERR, "failed to relaunch edenfs: {}", folly::exceptionStr(ex));
@@ -638,8 +646,20 @@ PrivHelperServer::FuseMountResult PrivHelperServer::fuseMountByFd(
       gid_,
       fuseDev.fd());
 
-  auto fsFd = fsOpen(vfsType);
+  // fsopen(2) resolves only the base filesystem type. Unlike mount(2), it does
+  // not turn a dotted type such as "fuse.edenfs" into a FUSE subtype, so pass
+  // the suffix explicitly to keep the advertised type identical on both paths.
+  folly::StringPiece fsType{vfsType};
+  folly::StringPiece subtype;
+  if (const auto dot = fsType.find('.'); dot != folly::StringPiece::npos) {
+    subtype = fsType.subpiece(dot + 1);
+    fsType = fsType.subpiece(0, dot);
+  }
+  auto fsFd = fsOpen(fsType);
   fsConfigString(fsFd.fd(), "source", kEdenFsMountSource);
+  if (!subtype.empty()) {
+    fsConfigString(fsFd.fd(), "subtype", subtype);
+  }
   fsConfigCommaSeparatedOptions(fsFd.fd(), mountOpts);
   fsConfigSet(fsFd.fd(), FSCONFIG_CMD_CREATE, nullptr, nullptr);
 
@@ -715,8 +735,9 @@ void PrivHelperServer::nfsMount(
    * Enables or disables rdirplus (readdirplus) based on EdenConfig value
    * Sets the mount type to soft/hard (but make it interruptible) based on an
    *   EdenConfig value. While in theory we would always want the mount to be
-   *   soft, macOS force a maximum timeout of 60s, which in some case is too
-   *   short for files to be fetched, thus make it configurable.
+   *   soft, the macOS kernel gives up on a soft-mount request at most 30s
+   *   (NFS_MAXTIMEO / 2) after EdenFS stops answering promptly, which in some
+   *   cases is too short for files to be fetched, thus make it configurable.
    * Possibly specifies dumbtimer behavior, iff an EdenConfig value is
    *   explicitly set.
    * Suppresses macOS kernel JUKEBOX retry logging (NFS_MFLAG_MUTEJUKEBOX),
@@ -1110,11 +1131,12 @@ UnixSocket::Message PrivHelperServer::processTakeoverStartupMsg(
   // Skip stale bind mount cleanup on takeover: the kernel preserves live
   // redirections (e.g. buck-out) across a graceful restart, so unmounting
   // them here would destroy legitimate user state.
-  auto sanityResult = sanityCheckMountPoint(
-      mountPath,
-      /*isNFS=*/false,
-      /*isHardMount=*/false,
-      /*performBindMountCleanup=*/false);
+  //
+  // Skip the stale mount check too: the daemon is already serving this mount
+  // when it sends the takeover startup request, so there is nothing stale to
+  // detect.
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forTakeover());
 
   registerMountPoint(mountPath);
   auto response = makeResponse();
@@ -1133,7 +1155,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
 
 #ifndef __APPLE__
   if (useModernMountApi()) {
-    auto checkedMount = openAndSanityCheckMountPoint(mountPath);
+    auto checkedMount = openAndSanityCheckMountPoint(
+        mountPath, SanityCheckOptions::forFuseMount());
     auto mountResult = fuseMountByFd(
         std::move(checkedMount.targetFd),
         mountPath.c_str(),
@@ -1157,7 +1180,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult = sanityCheckMountPoint(mountPath);
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forFuseMount());
   auto fuseDev = fuseMount(mountPath.c_str(), readOnly, vfsType.c_str());
   registerMountPoint(mountPath);
 
@@ -1177,7 +1201,8 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
 #ifndef __APPLE__
   if (useModernMountApi()) {
     auto checkedMount = openAndSanityCheckMountPoint(
-        mountPath, /*isNFS=*/true, !options.useSoftMount);
+        mountPath,
+        SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
     registerMountPoint(
         mountPath,
         nfsMountByFd(std::move(checkedMount.targetFd), mountPath, options));
@@ -1198,8 +1223,9 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult =
-      sanityCheckMountPoint(mountPath, /*isNFS=*/true, !options.useSoftMount);
+  auto sanityResult = sanityCheckMountPoint(
+      mountPath,
+      SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
   nfsMount(mountPath, std::move(options));
   registerMountPoint(mountPath);
 
@@ -1765,9 +1791,9 @@ PrivHelperServer::prepareRestart() {
       return std::nullopt;
   }
 
-  // Read before producing a plan so launchRestart() is unreachable without a
-  // command that the privileged parent parsed and validated.
-  auto command = sentinel_->readRelaunchCommand();
+  // Obtained before producing a plan so launchRestart() is unreachable without
+  // a command.
+  auto command = sentinel_->relaunchCommand();
   if (!command.has_value()) {
     return std::nullopt;
   }
@@ -1850,6 +1876,16 @@ void PrivHelperServer::run() {
   // This normally means the parent process exited, so we can clean up and exit
   // too.
   XLOG(DBG5, "privhelper process exiting");
+
+#ifdef __APPLE__
+  if (peerExited_) {
+    if (const auto plan = prepareRestart()) {
+      if (launchRestart(*plan)) {
+        return;
+      }
+    }
+  }
+#endif
 
   // Unmount all active mount points
   cleanupMountPoints();
@@ -2009,6 +2045,7 @@ UnixSocket::Message PrivHelperServer::processMessage(
 }
 
 void PrivHelperServer::eofReceived() noexcept {
+  peerExited_ = true;
   eventBase_->terminateLoopSoon();
 }
 

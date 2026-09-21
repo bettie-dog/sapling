@@ -42,7 +42,6 @@ cpp_unittest(
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
         "//folly/io/async:event_base_thread",
-        "//folly/json:dynamic",
         "//folly/portability:fcntl",
         "//folly/synchronization:baton",
         "//folly/synchronization:saturating_semaphore",
@@ -59,6 +58,7 @@ cpp_unittest(
     srcs = ["PinScanTest.cpp"],
     compatible_with = [
         "ovr_config//os:linux",
+        "ovr_config//os:macos",
     ],
     network_access = network_access_utils.none(),
     deps = [

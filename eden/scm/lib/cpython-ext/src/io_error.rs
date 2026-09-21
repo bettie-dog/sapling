@@ -10,21 +10,32 @@ use cpython::exc;
 use util::path_error_details;
 
 pub fn translate_io_error(py: Python, e: &std::io::Error) -> cpython::PyErr {
-    if let Some(details) = path_error_details(e) {
-        let e = details.original_io_error;
-        let errno = io_error_errno(e);
-        return cpython::PyErr::new::<exc::OSError, _>(
-            py,
-            (
-                errno,
-                io_error_strerror(e, errno),
-                details.path.display().to_string(),
-            ),
-        );
-    }
-
+    let (e, filename) = match path_error_details(e) {
+        Some(details) => (
+            details.original_io_error,
+            Some(details.path.display().to_string()),
+        ),
+        None => (e, None),
+    };
     let errno = io_error_errno(e);
-    cpython::PyErr::new::<exc::OSError, _>(py, (errno, io_error_strerror(e, errno)))
+    let strerror = io_error_strerror(e, errno);
+    let error_type = py.get_type::<exc::OSError>();
+
+    let instance = if cfg!(windows) && e.raw_os_error().is_some() {
+        // CPython translates winerror to errno before selecting the subclass.
+        error_type.call(py, (errno, strerror, filename, e.raw_os_error()), None)
+    } else if let Some(filename) = filename {
+        error_type.call(py, (errno, strerror, filename), None)
+    } else {
+        error_type.call(py, (errno, strerror), None)
+    };
+
+    // Use PyErr::from_instance instead of PyErr::new because Python < 3.11
+    // can otherwise match against OSError and miss FileNotFoundError handlers.
+    match instance {
+        Ok(instance) => cpython::PyErr::from_instance(py, instance),
+        Err(err) => err,
+    }
 }
 
 fn io_error_strerror(e: &std::io::Error, errno: Option<i32>) -> String {
@@ -82,5 +93,88 @@ fn io_error_errno(e: &std::io::Error) -> Option<i32> {
         TimedOut => Some(libc::ETIMEDOUT),
         Interrupted => Some(libc::EINTR),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use cpython::ObjectProtocol;
+
+    use super::*;
+
+    #[test]
+    fn test_io_error_subclasses() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        for (kind, errno, exception_type) in [
+            (
+                io::ErrorKind::NotFound,
+                Some(libc::ENOENT),
+                py.get_type::<exc::FileNotFoundError>(),
+            ),
+            (
+                io::ErrorKind::PermissionDenied,
+                Some(libc::EPERM),
+                py.get_type::<exc::PermissionError>(),
+            ),
+            (io::ErrorKind::Other, None, py.get_type::<exc::OSError>()),
+        ] {
+            let err = translate_io_error(py, &io::Error::new(kind, "test error"));
+            assert!(err.matches(py, exception_type));
+            assert_eq!(
+                err.matches(py, py.get_type::<exc::FileNotFoundError>()),
+                kind == io::ErrorKind::NotFound,
+            );
+            let value = err.pvalue.unwrap();
+            assert_eq!(
+                value
+                    .getattr(py, "errno")
+                    .unwrap()
+                    .extract::<Option<i32>>(py)
+                    .unwrap(),
+                errno,
+            );
+            assert_eq!(
+                value
+                    .getattr(py, "strerror")
+                    .unwrap()
+                    .extract::<String>(py)
+                    .unwrap(),
+                "test error",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_io_error_codes() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        // ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND both map to ENOENT.
+        for winerror in [2, 3] {
+            let err = translate_io_error(py, &io::Error::from_raw_os_error(winerror));
+            assert!(err.matches(py, py.get_type::<exc::FileNotFoundError>()));
+            let value = err.pvalue.unwrap();
+            assert_eq!(
+                value
+                    .getattr(py, "errno")
+                    .unwrap()
+                    .extract::<i32>(py)
+                    .unwrap(),
+                libc::ENOENT,
+            );
+            assert_eq!(
+                value
+                    .getattr(py, "winerror")
+                    .unwrap()
+                    .extract::<i32>(py)
+                    .unwrap(),
+                winerror,
+            );
+        }
     }
 }

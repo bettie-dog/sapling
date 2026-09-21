@@ -7,9 +7,13 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string_view>
+
 #include <folly/File.h>
 #include <folly/Range.h>
 #include <folly/portability/SysStat.h>
+#include <folly/portability/SysTypes.h>
 
 #include "eden/common/utils/PathFuncs.h"
 
@@ -115,12 +119,24 @@ class EdenStateDir {
   AbsolutePath getDaemonArgsPath() const;
 
   /**
-   * Get the path to the restart sentinel, whose existence tells a surviving
-   * privhelper that the daemon died rather than stopped.
+   * Get the path to one daemon generation's restart sentinel, whose existence
+   * tells a surviving privhelper that the daemon died rather than stopped.
    *
-   * Shared by every daemon generation in this state dir, not per-process.
+   * @param pid the arming daemon's pid.
+   * @param token regenerated on every arm, so that a re-arm by the same pid
+   *    gets a name the previous arm cannot unlink.
    */
-  AbsolutePath getRestartSentinelPath() const;
+  AbsolutePath getRestartSentinelPath(pid_t pid, uint64_t token) const;
+
+  /**
+   * Get the file name prefix every generation's restart sentinel shares.
+   *
+   * Includes the separator that precedes the pid.
+   */
+  std::string_view getRestartSentinelNamePrefix() const;
+
+  /** Get the path that serializes restart arming and deliberate SIGKILL. */
+  AbsolutePath getRestartSentinelLockPath() const;
 
   /**
    * Get the path to the directory where state for a specific checkout is

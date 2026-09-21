@@ -5,24 +5,59 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use blob::Blob;
+use configmodel::Config;
 use futures::stream::BoxStream;
 pub use types::CasDigest;
 pub use types::CasDigestType;
 
-/// Per-digest results from one batch returned by [`CasClient::fetch`].
-///
-/// Each entry associates a digest with its blob, a CAS not-found result
-/// (`Ok(None)`), or an error specific to that digest.
-pub type CasBatch = Vec<(CasDigest, Result<Option<Blob>>)>;
+mod manager;
+
+pub use manager::CasFetchGuard;
+pub use manager::CasFetchManager;
+pub use manager::CasFetchManagerBuilder;
+pub use manager::CasFetchOutcome;
+
+/// Creates the registered CAS client, if one is available in this process.
+pub fn new(config: Arc<dyn Config>) -> Result<Option<Arc<CasFetchManager>>> {
+    match factory::call_constructor::<_, Arc<dyn CasClient>>(&config as &dyn Config) {
+        Ok(client) => Ok(Some(Arc::new(CasFetchManager::from_config(
+            client,
+            config.as_ref(),
+        )?))),
+        Err(error) if factory::is_error_from_constructor(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct CasBackendStats {
+    pub total_bytes_zdb: u64,
+    pub total_bytes_zgw: u64,
+    pub total_bytes_manifold: u64,
+    pub total_bytes_hedwig: u64,
+    pub queries_zdb: u64,
+    pub queries_zgw: u64,
+    pub queries_manifold: u64,
+    pub queries_hedwig: u64,
+}
+
+/// One result batch returned by [`CasClient::fetch`].
+pub struct CasBatch {
+    pub backend_stats: CasBackendStats,
+    pub results: Vec<(CasDigest, Result<Option<Blob>>)>,
+}
 
 /// Fetches content-addressed blobs in batches.
 pub trait CasClient: Send + Sync {
-    /// Performs optional eager initialization.
+    /// Performs synchronous initialization required before fetching.
     ///
-    /// Implementations that initialize lazily can use the default no-op. This
-    /// method lets callers surface setup failures separately from fetches.
+    /// Callers should invoke this from a blocking context before the first
+    /// [`fetch`](Self::fetch). Implementations requiring no setup may use the
+    /// default no-op.
     fn init(&self) -> Result<()> {
         Ok(())
     }
@@ -31,7 +66,8 @@ pub trait CasClient: Send + Sync {
     ///
     /// Implementations may split the input into multiple batches and yield
     /// results out of input order, so callers must associate results using the
-    /// digest in each entry.
+    /// digest in each entry. Successful blobs must match the size declared by
+    /// their digest.
     fn fetch<'a>(
         &'a self,
         digests: &'a [CasDigest],

@@ -478,6 +478,7 @@ mod tests {
             indexedlog_local: Some(indexedlog_local),
             indexedlog_cache: None,
             edenapi: None,
+            cas_manager: None,
             lfs_client,
             metrics: FileStoreMetrics::new(),
             activity_logger: None,

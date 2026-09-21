@@ -45,7 +45,9 @@ cpp_unittest(
         "//folly:file",
         "//folly:random",
         "//folly:scope_guard",
+        "//folly:synchronized",
         "//folly/executors:global_executor",
+        "//folly/logging:logging",
         "//folly/test:test_utils",
     ],
 )

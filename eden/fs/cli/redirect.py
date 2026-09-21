@@ -7,7 +7,6 @@
 # pyre-strict
 
 
-import argparse
 import enum
 import errno
 import json
@@ -23,10 +22,8 @@ from typing import Dict, Iterable, Optional, Set
 
 from thrift.python.exceptions import ApplicationError, ApplicationErrorType
 
-from . import cmd_util, configutil, mtab, subcmd as subcmd_mod, tabulate
-from .config import CheckoutConfig, EdenCheckout, EdenInstance, load_toml_config
-from .prompt import prompt_confirmation
-from .subcmd import Subcmd
+from . import configutil, mtab, tabulate
+from .config import EdenCheckout, EdenInstance, load_toml_config
 from .util import mkscratch_bin
 
 
@@ -34,15 +31,12 @@ if sys.platform == "win32":
     from .util import remove_unc_prefix
 
 
-redirect_cmd = subcmd_mod.Decorator()
-
 log: logging.Logger = logging.getLogger(__name__)
 
 USER_REDIRECTION_SOURCE = ".eden/client/config.toml:redirections"
 REPO_SOURCE = ".eden-redirections"
 PLEASE_RESTART = "Please run `eden restart` to pick up the new redirections feature set"
 APFS_HELPER = "/usr/local/libexec/eden/eden_apfs_mount_helper"
-WINDOWS_SCRATCH_DIR = Path("c:\\open\\scratch")
 
 
 def have_apfs_helper() -> bool:
@@ -62,6 +56,9 @@ def determine_bind_redirection_type(instance: EdenInstance) -> str:
     config_value = instance.get_config_value(
         "redirections.darwin-redirection-type", "apfs"
     )
+    if config_value == "symlink":
+        return config_value
+
     default_type = "apfs" if have_apfs_helper() else "dmg"
     if config_value not in ["symlink", "apfs", "dmg"]:
         print(
@@ -92,6 +89,13 @@ def is_bind_mount(path: Path) -> bool:
         return False
 
 
+def _resolve_symlink_target(symlink_path: Path, *, strict: bool) -> Path:
+    target = symlink_path.readlink()
+    if not target.is_absolute():
+        target = symlink_path.parent / target
+    return target.resolve(strict=strict)
+
+
 def is_valid_symlink(expected_target: Optional[Path], mount_path: Path) -> bool:
     """Detect symlink usage and checks if the symlink is valid
     Symlinks can be used on any system but are the only redirect on Windows"""
@@ -100,7 +104,7 @@ def is_valid_symlink(expected_target: Optional[Path], mount_path: Path) -> bool:
         if expected_target:
             expected_target = expected_target.resolve()
         symlink_path = os.fsdecode(mount_path)
-        target = Path(symlink_path).readlink()
+        target = _resolve_symlink_target(Path(symlink_path), strict=False)
         if target != expected_target:
             print(
                 f"EXPECTED redirect to resolve to {expected_target}, got {target}",
@@ -168,24 +172,25 @@ def is_valid_windows_symlink(expected_target: Optional[Path], mount_path: Path) 
         raise Exception(errMsg)
 
 
-def make_scratch_dir(checkout: EdenCheckout, subdir: Path) -> Path:
+def make_scratch_dir(
+    checkout: EdenCheckout, subdir: Path, *, no_create: bool = False
+) -> Path:
     sub = Path("edenfs") / Path("redirections") / subdir
 
     mkscratch = mkscratch_bin()
-
-    return Path(
-        subprocess.check_output(
-            [
-                os.fsdecode(mkscratch),
-                "path",
-                os.fsdecode(checkout.path),
-                "--subdir",
-                os.fsdecode(sub),
-            ]
-        )
-        .decode("utf-8")
-        .strip()
+    args = [os.fsdecode(mkscratch)]
+    if no_create:
+        args.append("--no-create")
+    args.extend(
+        [
+            "path",
+            os.fsdecode(checkout.path),
+            "--subdir",
+            os.fsdecode(sub),
+        ]
     )
+
+    return Path(subprocess.check_output(args).decode("utf-8").strip())
 
 
 class RedirectionState(enum.Enum):
@@ -215,10 +220,10 @@ class RepoPathDisposition(enum.Enum):
 
     @classmethod
     def analyze(cls, path: Path) -> "RepoPathDisposition":
-        if not path.exists():
-            return cls.DOES_NOT_EXIST
         if path.is_symlink():
             return cls.IS_SYMLINK
+        if not path.exists():
+            return cls.DOES_NOT_EXIST
         if path.is_dir():
             if is_bind_mount(path):
                 return cls.IS_BIND_MOUNT
@@ -295,38 +300,29 @@ class Redirection:
         return res
 
     def expand_target_abspath(self, checkout: EdenCheckout) -> Optional[Path]:
-        if self.type == RedirectionType.BIND:
-            if (
-                sys.platform == "darwin"
-                and determine_bind_redirection_type(checkout.instance) == "apfs"
-            ):
-                # Ideally we'd return information about the backing, but
-                # it is a bit awkward to determine this in all contexts;
-                # prior to creating the volume we don't know anything
-                # about where it will reside.
-                # After creating it, we could potentially parse the APFS
-                # volume information and show something like the backing device.
-                # We also have a transitional case where there is a small
-                # population of users on disk image mounts; we actually don't
-                # have enough knowledge in this code to distinguish between
-                # a disk image and an APFS volume (but we can tell whether
-                # either of those is mounted elsewhere in this file, provided
-                # we have a MountTable to inspect).
-                # Given our small user base at the moment, it doesn't seem
-                # super critical to have this tool handle all these cases;
-                # the same information can be extracted by a human running
-                # `mount` and `diskutil list`.
-                # So we just return the mount point path when we believe
-                # that we can use APFS.
-                return checkout.path / self.repo_path
-            else:
-                return make_scratch_dir(checkout, self.repo_path)
-        elif self.type == RedirectionType.SYMLINK:
-            return make_scratch_dir(checkout, self.repo_path)
-        elif self.type == RedirectionType.UNKNOWN:
+        return self._resolve_target_abspath(checkout, no_create=True)
+
+    def ensure_target_abspath(self, checkout: EdenCheckout) -> Optional[Path]:
+        return self._resolve_target_abspath(checkout, no_create=False)
+
+    def _resolve_target_abspath(
+        self, checkout: EdenCheckout, *, no_create: bool
+    ) -> Optional[Path]:
+        if self.type == RedirectionType.UNKNOWN:
             return None
-        else:
-            raise Exception(f"expand_target_abspath not impl for {self.type}")
+        if self.type not in (RedirectionType.BIND, RedirectionType.SYMLINK):
+            raise Exception(f"target abspath not impl for {self.type}")
+        if self._uses_checkout_path_as_target(checkout):
+            return checkout.path / self.repo_path
+        return make_scratch_dir(checkout, self.repo_path, no_create=no_create)
+
+    def _uses_checkout_path_as_target(self, checkout: EdenCheckout) -> bool:
+        return (
+            self.type == RedirectionType.BIND
+            and sys.platform == "darwin"
+            and not self.expand_repo_path(checkout).is_symlink()
+            and determine_bind_redirection_type(checkout.instance) == "apfs"
+        )
 
     def expand_repo_path(self, checkout: EdenCheckout) -> Path:
         return checkout.path / self.repo_path
@@ -405,12 +401,12 @@ class Redirection:
 
     def _bind_unmount_darwin(self, checkout: EdenCheckout) -> None:
         mount_path = checkout.path / self.repo_path
-        if determine_bind_redirection_type(checkout.instance) == "symlink":
-            mount_path.unlink()
-        else:
-            # We use unmount instead of eject here since eject has caused issues
-            # by unmounting unrelated apfs volumes in the past. See S325232.
-            run_cmd_quietly(["diskutil", "unmount", "force", mount_path])
+        # Only reached for paths that are real mounts: remove_existing unlinks
+        # symlink-backed redirections based on disposition analysis first.
+        #
+        # We use unmount instead of eject here since eject has caused issues
+        # by unmounting unrelated apfs volumes in the past. See S325232.
+        run_cmd_quietly(["diskutil", "unmount", "force", mount_path])
 
     def _bind_mount_linux(
         self, instance: EdenInstance, checkout_path: Path, target: Path
@@ -657,11 +653,11 @@ class Redirection:
         if disposition == RepoPathDisposition.IS_FILE:
             raise Exception(f"Cannot redirect {self.repo_path} because it is a file")
         if self.type == RedirectionType.BIND:
-            target = self.expand_target_abspath(checkout)
+            target = self.ensure_target_abspath(checkout)
             assert target is not None
             self._bind_mount(checkout.instance, checkout.path, target)
         elif self.type == RedirectionType.SYMLINK:
-            target = self.expand_target_abspath(checkout)
+            target = self.ensure_target_abspath(checkout)
             assert target is not None
             self._apply_symlink(checkout.path, target)
         else:
@@ -785,32 +781,52 @@ def get_effective_redirections(
                 state=RedirectionState.UNKNOWN_MOUNT,
             )
 
-    for rel_path, redir in get_configured_redirections(checkout).items():
+    configured_redirections = get_configured_redirections(checkout)
+    bind_redirection_uses_symlink = sys.platform == "win32" or (
+        sys.platform == "darwin"
+        and any(
+            redir.type == RedirectionType.BIND
+            for redir in configured_redirections.values()
+        )
+        and instance.get_config_value("redirections.darwin-redirection-type", "apfs")
+        == "symlink"
+    )
+
+    for rel_path, redir in configured_redirections.items():
         is_in_mount_table = rel_path in redirs
+        bind_redirection_is_symlink = (
+            sys.platform == "darwin"
+            and redir.type == RedirectionType.BIND
+            and redir.expand_repo_path(checkout).is_symlink()
+        )
+        uses_symlink = redir.type == RedirectionType.SYMLINK or (
+            redir.type == RedirectionType.BIND
+            and (bind_redirection_uses_symlink or bind_redirection_is_symlink)
+        )
         if is_in_mount_table:
-            if redir.type != RedirectionType.BIND:
+            # A symlink-backed redirection should never appear in the mount
+            # table; if one does, we don't know what is mounted there.
+            # Mount-backed binds found in the table are assumed to be mounted
+            # correctly.
+            if uses_symlink:
                 redir.state = RedirectionState.UNKNOWN_MOUNT
-            # else: we expected them to be in the mount table and they were.
-            # we don't know enough to tell whether the mount points where
-            # we want it to point, so we just assume that it is in the right
-            # state.
         else:
-            if redir.type == RedirectionType.BIND and sys.platform != "win32":
-                # We expected both of these types to be visible in the
-                # mount table, but they were not, so we consider them to
-                # be in the NOT_MOUNTED state.
+            if redir.type == RedirectionType.BIND and not uses_symlink:
                 redir.state = RedirectionState.NOT_MOUNTED
-            elif redir.type == RedirectionType.SYMLINK or sys.platform == "win32":
+            elif uses_symlink:
                 try:
-                    # Resolve to normalize extended-length path on Windows
+                    # Resolve to verify the target exists and normalize
+                    # extended-length paths on Windows.
                     expected_target = redir.expand_target_abspath(checkout)
                     if expected_target:
-                        expected_target = expected_target.resolve()
-                    symlink_path = os.fsdecode(redir.expand_repo_path(checkout))
+                        expected_target = expected_target.resolve(strict=True)
+                    symlink_path = redir.expand_repo_path(checkout)
                     try:
-                        target = Path(symlink_path).readlink()
                         if sys.platform == "win32":
+                            target = symlink_path.readlink()
                             target = remove_unc_prefix(target)
+                        else:
+                            target = _resolve_symlink_target(symlink_path, strict=True)
                     except ValueError as exc:
                         # Windows throws ValueError when the target is not a symlink
                         raise OSError(errno.EINVAL) from exc
@@ -845,28 +861,21 @@ def check_redirection(redir: Redirection, checkout: EdenCheckout) -> bool:
         # looking for the file not existing here.
         return not is_bind_mount(mount_path)
 
-    if sys.platform == "win32":
-        """Special casing for windows projFS since it treats bind mounts as symlinks"""
-        if redir.type != RedirectionType.SYMLINK:
-            return False
+    uses_symlink = redir.type == RedirectionType.SYMLINK or (
+        redir.type == RedirectionType.BIND
+        and (
+            sys.platform == "win32"
+            or (sys.platform == "darwin" and mount_path.is_symlink())
+        )
+    )
+    if uses_symlink:
         expected_target = redir.expand_target_abspath(checkout)
-        return is_valid_windows_symlink(expected_target, mount_path)
-    else:
-        # There should now be a symlink or bind mount at this point
-        if redir.type == RedirectionType.BIND:
-            return is_bind_mount(mount_path)
-        elif redir.type == RedirectionType.SYMLINK:
-            expected_target = redir.expand_target_abspath(checkout)
-            return is_valid_symlink(expected_target, mount_path)
-        else:
-            # Unknown type
-            return False
+        if sys.platform == "win32":
+            return is_valid_windows_symlink(expected_target, mount_path)
+        return is_valid_symlink(expected_target, mount_path)
+    if redir.type == RedirectionType.BIND:
+        return is_bind_mount(mount_path)
     return False
-
-
-def file_size(path: Path) -> int:
-    st = path.lstat()
-    return st.st_size
 
 
 # pyre-fixme[2]: Parameter must be annotated.
@@ -897,26 +906,6 @@ def run_cmd_quietly(args, check: bool = True) -> int:
     return proc.returncode
 
 
-def apply_redirection_configs_to_checkout_config(
-    checkout: EdenCheckout, redirs: Iterable[Redirection]
-) -> CheckoutConfig:
-    """Translate the redirections into a new CheckoutConfig"""
-
-    config = checkout.get_config()
-    redirections = {}
-    for r in redirs:
-        if r.source != REPO_SOURCE:
-            normalized = os.fsdecode(r.repo_path)
-            if sys.platform == "win32":
-                # TODO: on Windows we replace backslash \ with / since
-                # python-toml doesn't escape them correctly when used as key
-                normalized = normalized.replace("\\", "/")
-            redirections[normalized] = r.type
-    return config._replace(
-        redirections=redirections,
-    )
-
-
 def is_empty_dir(path: Path) -> bool:
     for ent in path.iterdir():
         if ent not in (".", ".."):
@@ -928,12 +917,6 @@ def prepare_redirection_list(checkout: EdenCheckout, instance: EdenInstance) -> 
     mount_table = mtab.new()
     redirs = get_effective_redirections(checkout, mount_table, instance)
     return create_redirection_configs(checkout, redirs.values(), False)
-
-
-def print_redirection_configs(
-    checkout: EdenCheckout, redirs: Iterable[Redirection], use_json: bool
-) -> None:
-    print(create_redirection_configs(checkout, redirs, use_json))
 
 
 def create_redirection_configs(
@@ -949,501 +932,20 @@ def create_redirection_configs(
         return tabulate.tabulate(columns, data)
 
 
-@redirect_cmd("list", "List redirections")
-class ListCmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--mount", help="The EdenFS mount point path.", default=None
-        )
-        parser.add_argument(
-            "--json",
-            help="output in json rather than human readable text",
-            action="store_true",
-        )
+def unmount_redirections(instance: EdenInstance, checkout: EdenCheckout) -> int:
+    """Unmount all effective redirections for the checkout, preserving the
+    configuration so that a subsequent `edenfsctl redirect fixup` restores
+    them."""
+    mount_table = mtab.new()
+    redirs = get_effective_redirections(checkout, mount_table, instance)
 
-    def run(self, args: argparse.Namespace) -> int:
-        instance, checkout, _rel_path = cmd_util.require_checkout(args, args.mount)
+    for redir in redirs.values():
+        redir.remove_existing(checkout)
 
-        mount_table = mtab.new()
-        redirs = get_effective_redirections(checkout, mount_table, instance)
-        print_redirection_configs(checkout, redirs.values(), args.json)
-        return 0
-
-
-@redirect_cmd("cleanup-apfs", "Delete stale apfs volumes")
-class CleanupApfsCmd(Subcmd):
-    def run(self, args: argparse.Namespace) -> int:
-        if sys.platform != "darwin" or not have_apfs_helper():
-            raise Exception(f"Unsupported platform {sys.platform}")
-
-        instance = cmd_util.get_eden_instance(args)
-        mounts = instance.get_mounts()
-
-        stdout = subprocess.check_output(
-            [
-                APFS_HELPER,
-                "list-stale-volumes",
-            ]
-            + [str(path) for path in mounts]
-            + ["--json"]
-        ).decode("utf-8")
-        stale_volumes = json.loads(stdout)
-
-        if not stale_volumes:
-            print("No stale volumes detected")
-            return 0
-
-        if sys.stdin.isatty():
-            volumes_str = "\n  ".join(stale_volumes)
-            print(
-                f"""\
-Warning: this operation will permanently delete the following volumes:
-  {volumes_str}
-"""
-            )
-            if not prompt_confirmation("Proceed?"):
-                print("Not deleting volumes")
-                return 2
-
-        return_code = 0
-        for vol in stale_volumes:
-            result = subprocess.run(
-                [
-                    APFS_HELPER,
-                    "delete-volume",
-                    vol,
-                ],
-            )
-            if result.returncode:
-                print(f"Failed to delete volume {vol} due to {result.stderr}")
-                return_code = 1
-            else:
-                print(f"Deleted volume: {vol}")
-
-        return return_code
-
-
-@redirect_cmd(
-    "unmount",
-    (
-        "Unmount all effective redirection configuration, but preserve "
-        "the configuration so that a subsequent fixup will restore it"
-    ),
-)
-class UnmountCmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--mount", help="The EdenFS mount point path.", default=None
-        )
-
-    def run(self, args: argparse.Namespace) -> int:
-        instance, checkout, _rel_path = cmd_util.require_checkout(args, args.mount)
-        mount_table = mtab.new()
-        redirs = get_effective_redirections(checkout, mount_table, instance)
-
-        for redir in redirs.values():
-            redir.remove_existing(checkout)
-            if redir.type == RedirectionType.UNKNOWN:
-                continue
-
-        # recompute and display the current state
-        redirs = get_effective_redirections(checkout, mount_table, instance)
-        ok = True
-        for redir in redirs.values():
-            if redir.state == RedirectionState.MATCHES_CONFIGURATION:
-                ok = False
-        return 0 if ok else 1
-
-
-@redirect_cmd(
-    "fixup",
-    (
-        "Fixup redirection configuration; redirect things that "
-        "should be redirected and remove things that should not be redirected"
-    ),
-)
-class FixupCmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--mount", help="The EdenFS mount point path.", default=None
-        )
-        parser.add_argument(
-            "--force-remount-bind-mounts",
-            help=(
-                "Unmount and re-bind mount any bind mount redirections "
-                "to ensure that they are pointing to the right place.  "
-                "This is not the default behavior in the interest of "
-                "preserving kernel caches"
-            ),
-            action="store_true",
-        )
-        parser.add_argument(
-            "--only-repo-source",
-            help=(
-                "By default, paths from all sources are fixed. Setting this "
-                "flag to true will fix paths only from the .eden-redirections "
-                "source."
-            ),
-            default=False,
-            action="store_true",
-        )
-
-    @staticmethod
-    def _log_fixup_failure(
-        instance, checkout, redir, e: Exception, action: str
-    ) -> None:
-        print(
-            f"Unable to {action} redirection `{redir.repo_path}`: {e}",
-            file=sys.stderr,
-        )
-        with instance.get_telemetry_logger().new_sample(
-            "redirect_fixup_failure"
-        ) as tel_logger:
-            tel_logger.add_string("checkout", str(checkout.path))
-            tel_logger.add_string("repo_path", str(redir.repo_path))
-            tel_logger.add_string("redir_type", str(redir.type))
-            tel_logger.add_string("initial_state", str(redir.state))
-            tel_logger.add_string("source", redir.source)
-            tel_logger.add_string("error_reason", str(e))
-
-    def run(self, args: argparse.Namespace) -> int:
-        instance, checkout, _rel_path = cmd_util.require_checkout(args, args.mount)
-        mount_table = mtab.new()
-        redirs = get_effective_redirections(checkout, mount_table, instance)
-        for redir in redirs.values():
-            if redir.state == RedirectionState.MATCHES_CONFIGURATION and not (
-                args.force_remount_bind_mounts and redir.type == RedirectionType.BIND
-            ):
-                continue
-
-            if args.only_repo_source and redir.source != REPO_SOURCE:
-                continue
-
-            print(f"Fixing {redir.repo_path}", file=sys.stderr)
-            if redir.type == RedirectionType.UNKNOWN:
-                try:
-                    redir.remove_existing(checkout)
-                except Exception as e:
-                    self._log_fixup_failure(instance, checkout, redir, e, "remove")
-                continue
-            try:
-                redir.apply(checkout)
-            except Exception as e:
-                self._log_fixup_failure(instance, checkout, redir, e, "apply")
-
-        # recompute and display the current state
-        redirs = get_effective_redirections(checkout, mount_table, instance)
-        ok = True
-        for redir in redirs.values():
-            if redir.state != RedirectionState.MATCHES_CONFIGURATION:
-                # When --only-repo-source is passed, we may fail to fixup some
-                # redirections. This scenario is ok and should not be
-                # considered a failure.
-                if not args.only_repo_source or redir.source == REPO_SOURCE:
-                    ok = False
-        return 0 if ok else 1
-
-
-def resolve_repo_relative_path(checkout_path: Path, repo_rel_path: Path) -> Path:
-    """Given a path, verify that it is an appropriate repo-root-relative path
-    and return the resolved form of that path.
-    The ideal is that they pass in `foo` and we return `foo`, but we also
-    allow for the path to be absolute path to `foo`, in which case we resolve
-    it and verify that it falls with the repo and then return the relative
-    path to `foo`."""
-
-    if repo_rel_path.is_absolute():
-        # Well, the original intent was to only interpret paths as relative
-        # to the repo root, but it's a bit burdensome to require the caller
-        # to correctly relativize for that case, so we'll allow an absolute
-        # path to be specified.
-        try:
-            canonical_repo_path = repo_rel_path.resolve()
-            return canonical_repo_path.relative_to(checkout_path)
-        except ValueError:
-            raise RuntimeError(
-                (
-                    f"The redirection path `{repo_rel_path}` doesn't resolve "
-                    f"to a path inside the repo `{checkout_path}`"
-                )
-            )
-
-    # Otherwise, the path must be interpreted as being relative to the repo
-    # root, so let's resolve that and verify that it lies within the repo
-    candidate = (checkout_path / repo_rel_path).resolve()
-    try:
-        relative = candidate.relative_to(checkout_path)
-    except ValueError:
-        raise RuntimeError(
-            (
-                f"The repo-root-relative redirection path `{repo_rel_path}` "
-                f"doesn't resolve to a path inside the repo `{checkout_path}`. "
-                "Specify either a canonical absolute path to the redirection, or "
-                "a canonical (without `..` components) path relative to the "
-                f"repository root at `{checkout_path}`."
-            )
-        )
-
-    # If the resolved and relativized path doesn't match the user-specified
-    # path then it means that they either used `..` or a path that resolved
-    # through a symlink.  The former is ambiguous, especially because it likely
-    # implies that the user is assuming that the path is current working directory
-    # relative instead of repo root relative, and the latter is problematic for
-    # all of the usual symlink reasons.
-    if relative != repo_rel_path:
-        raise RuntimeError(
-            (
-                f"The redirection path `{repo_rel_path}` resolves to `{relative}` "
-                "but must be a canonical repo-root-relative path. Specify either a "
-                "canonical absolute path to the redirection, or a canonical "
-                "(without `..` components) path "
-                f"relative to the repository root at `{checkout_path}`."
-            )
-        )
-
-    return repo_rel_path
-
-
-@redirect_cmd("add", "Add or change a redirection")
-class AddCmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--mount", help="The EdenFS mount point path.", default=None
-        )
-        parser.add_argument(
-            "repo_path", help="The path in the repo which should be redirected"
-        )
-        parser.add_argument(
-            "redir_type",
-            help="The type of the redirection",
-            choices=["bind", "symlink"],
-        )
-        parser.add_argument(
-            "--force-remount-bind-mounts",
-            help=(
-                "Unmount and re-bind mount any bind mount redirections "
-                "to ensure that they are pointing to the right place.  "
-                "This is not the default behavior in the interest of "
-                "preserving kernel caches"
-            ),
-            action="store_true",
-        )
-        parser.add_argument(
-            "--strict",
-            help=(
-                "force bind mount to fail if it would overwrite an existing directory"
-            ),
-            action="store_true",
-        )
-
-    def _should_return_success_early(
-        self,
-        redir_type: RedirectionType,
-        configured_redirections: Dict[str, Redirection],
-        checkout_path: Path,
-        repo_path: Path,
-    ) -> bool:
-        """We should return success early iff:
-        1) we're adding a symlink redirection
-        2) the symlink already exists
-        3) the symlink is already a redirection that's managed by EdenFS
-        """
-        if redir_type == RedirectionType.SYMLINK:
-            # We cannot use resolve_repo_relative_path() because it will essentially
-            # attempt to resolve any existing symlinks twice. This causes us to never
-            # return the correct path for existing symlinks. Instead, we skip resolving
-            # and simply check if the absolute path is relative to the checkout path
-            # and if any relative paths are pre-existing configured redirections.
-            relative_path = repo_path
-            if repo_path.is_absolute():
-                try:
-                    canonical_repo_path = repo_path
-                    relative_path = canonical_repo_path.relative_to(checkout_path)
-                except ValueError:
-                    raise RuntimeError(
-                        (
-                            f"The redirection  path `{repo_path}` doesn't resolve "
-                            f"to a path inside the repo `{checkout_path}`"
-                        )
-                    )
-
-            existing_redir = configured_redirections.get(str(relative_path), None)
-            if (
-                existing_redir
-                and existing_redir.type == RedirectionType.SYMLINK
-                and existing_redir.repo_path == relative_path
-                # A configured symlink is not necessarily effective: eden
-                # stop/rm and `eden redirect unmount` delete the symlink from
-                # disk while leaving it configured, and add must repair it.
-                and (checkout_path / relative_path).is_symlink()
-            ):
-                return True
-        return False
-
-    def run(self, args: argparse.Namespace) -> int:
-        redir_type = RedirectionType.from_arg_str(args.redir_type)
-
-        instance, checkout, _rel_path = cmd_util.require_checkout(args, args.mount)
-
-        # Get only the explicitly configured entries for the purposes of the
-        # add command, so that we avoid writing out any of the effective list
-        # of redirections to the local configuration.  That doesn't matter so
-        # much at this stage, but when we add loading in profile(s) later we
-        # don't want to scoop those up and write them out to this branch of
-        # the configuration.
-        redirs = get_configured_redirections(checkout)
-
-        # We are only checking for pre-existing symlinks in this method, so we
-        # can use the configured mounts instead of the effective mounts; the
-        # check verifies the symlink's on-disk presence itself.
-        if self._should_return_success_early(
-            redir_type, redirs, checkout.path, Path(args.repo_path)
-        ):
-            print("EdenFS managed symlink redirection already exists.")
-            return 0
-
-        # We need to query the status of the mounts to catch things like
-        # a redirect being configured but unmounted.  This improves the
-        # UX in the case where eg: buck is adding a redirect.  Without this
-        # we'd hit the skip case below because it is configured, but we wouldn't
-        # bring the redirection back online.
-        # However, we keep this separate from the `redirs` list below for
-        # the reasons stated in the comment above.
-        effective_redirs = get_effective_redirections(checkout, mtab.new(), instance)
-
-        try:
-            args.repo_path = str(
-                resolve_repo_relative_path(checkout.path, Path(args.repo_path))
-            )
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        redir = Redirection(
-            Path(args.repo_path), redir_type, None, USER_REDIRECTION_SOURCE
-        )
-        existing_redir = effective_redirs.get(args.repo_path, None)
-        if (
-            existing_redir
-            and existing_redir == redir
-            and not args.force_remount_bind_mounts
-            and existing_redir.state != RedirectionState.NOT_MOUNTED
-        ):
-            print(
-                f"Skipping {redir.repo_path}; it is already configured "
-                "(use --force-remount-bind-mounts to force reconfiguring "
-                "this redirection)",
-                file=sys.stderr,
-            )
-            return 0
-
-        # We should prevent users from accidentally overwriting existing
-        # directories. We only need to check this condition for bind mounts
-        # because symlinks should already fail if the target dir exists.
-        if redir_type == RedirectionType.BIND and redir.repo_path.is_dir():
-            print(
-                f"WARNING: {redir.repo_path} already exists.\nMounting over "
-                "an existing directory will overwrite its contents.\nYou can "
-                "use --strict to prevent overwriting existing directories.\n"
-            )
-            with instance.get_telemetry_logger().new_sample(
-                "redirection_overwrite"
-            ) as tel_logger:
-                tel_logger.add_string("existing_dir", str(redir.repo_path))
-                tel_logger.add_string("checkout", str(checkout.path))
-            if args.strict:
-                print(
-                    f"Not adding redirection {redir.repo_path} because "
-                    "the --strict option was used.\nIf you would like "
-                    "to add this redirection (not recommended), then "
-                    "rerun this command without --strict.",
-                    file=sys.stderr,
-                )
-                return 1
-
-        redir.apply(checkout)
-
-        # We expressly allow replacing an existing configuration in order to
-        # support a user with a local ad-hoc override for global- or profile-
-        # specified configuration.
-        redirs[args.repo_path] = redir
-        config = apply_redirection_configs_to_checkout_config(checkout, redirs.values())
-
-        # and persist the configuration so that we can re-apply it in a subsequent
-        # call to `edenfsctl redirect fixup`
-        checkout.save_config(config)
-        return 0
-
-
-@redirect_cmd("del", "Delete a redirection")
-class DelCmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--mount", help="The EdenFS mount point path.", default=None
-        )
-        parser.add_argument(
-            "repo_path",
-            help="The path in the repo which should no longer be redirected",
-        )
-
-    def run(self, args: argparse.Namespace) -> int:
-        instance, checkout, _rel_path = cmd_util.require_checkout(args, args.mount)
-
-        redirs = get_configured_redirections(checkout)
-        # Note that we're deliberately not using the same validation logic
-        # for args.repo_path that we do for the add case for now so that we
-        # provide a way to remove bogus redirection paths.  After we've deployed
-        # the improved `add` validation for a while, we can use it here also.
-        redir = redirs.get(args.repo_path)
-        if redir:
-            if redir.source == REPO_SOURCE:
-                # The deletion of a repo-defined redirection cannot be
-                # persisted: the persistence step only writes user-sourced
-                # entries, and this CLI cannot edit the source-controlled
-                # redirection file. Accepting it would tear the redirection
-                # down only for `redirect fixup` (which the daemon runs on
-                # every mount) to silently bring it back.
-                print(
-                    f"error: {args.repo_path} is defined by {REPO_SOURCE} and "
-                    f"cannot be removed using `edenfsctl redirect del "
-                    f"{args.repo_path}`. To temporarily unmount it, use "
-                    f"`edenfsctl redirect unmount`; to remove it permanently, "
-                    f"delete it from {REPO_SOURCE}.",
-                    file=sys.stderr,
-                )
-                return 1
-            redir.remove_existing(checkout)
-            del redirs[args.repo_path]
-            config = apply_redirection_configs_to_checkout_config(
-                checkout, redirs.values()
-            )
-            checkout.save_config(config)
-            return 0
-
-        redirs = get_effective_redirections(checkout, mtab.new(), instance)
-        redir = redirs.get(args.repo_path)
-        if redir:
-            # This path isn't possible to trigger until we add profiles,
-            # but let's be ready for it anyway.
-            print(
-                f"error: {args.repo_path} is defined by {redir.source} and "
-                "cannot be removed using `edenfsctl redirect del {args.repo_path}",
-                file=sys.stderr,
-            )
-            return 1
-
-        print(f"{args.repo_path} is not a known redirection", file=sys.stderr)
-        return 1
-
-
-class RedirectCmd(Subcmd):
-    NAME = "redirect"
-    HELP = "List and manipulate redirected paths"
-    ALIASES = ["redir"]
-
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        self.add_subcommands(parser, redirect_cmd.commands)
-
-    def run(self, args: argparse.Namespace) -> int:
-        # FIXME: I'd rather just show the help here automatically
-        print("Specify a subcommand! See `eden redirect --help`", file=sys.stderr)
-        return 1
+    # recompute and verify the current state
+    redirs = get_effective_redirections(checkout, mount_table, instance)
+    ok = True
+    for redir in redirs.values():
+        if redir.state == RedirectionState.MATCHES_CONFIGURATION:
+            ok = False
+    return 0 if ok else 1

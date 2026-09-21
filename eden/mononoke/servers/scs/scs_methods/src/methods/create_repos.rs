@@ -34,6 +34,7 @@ use git_source_of_truth::GitSourceOfTruth;
 use git_source_of_truth::GitSourceOfTruthConfig;
 use git_source_of_truth::RepositoryName;
 use git_source_of_truth::Staleness;
+use git_source_of_truth::flip_landed_mutation_to_mononoke;
 use git_symbolic_refs::GitSymbolicRefs;
 use git_symbolic_refs::GitSymbolicRefsEntry;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
@@ -1122,7 +1123,7 @@ fn make_repo_spec(
             make_top_level_acl_name_from_repo_name(&request.repo_name)
         },
         enabled: true,
-        readonly: false,
+        readonly: request.readonly.unwrap_or(false),
         default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
         enable_git_bundle_uri: None,
         tiers: tier_list_for_repo(&request.repo_name),
@@ -1206,6 +1207,7 @@ async fn prepare_repo_configs_mutation_nowait(
                     } else {
                         make_top_level_acl_name_from_repo_name(&request.repo_name)
                     },
+                    readonly: request.readonly.unwrap_or(false),
                     enable_git_bundle_uri: None,
                 },
             ))
@@ -1236,18 +1238,6 @@ async fn prepare_repo_configs_mutation_nowait(
         .await
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     Ok(mutation.id)
-}
-
-async fn update_source_of_truth_to_mononoke_for_mutation_id(
-    ctx: CoreContext,
-    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
-    mutation_id: i64,
-) -> Result<(), scs_errors::ServiceError> {
-    git_source_of_truth_config
-        .update_source_of_truth_by_mutation_id(&ctx, GitSourceOfTruth::Mononoke, mutation_id)
-        .await
-        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
-    Ok(())
 }
 
 async fn update_mutation_id_by_repo_names_for_reserved_repos(
@@ -1684,19 +1674,9 @@ async fn handle_landed_state(
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
-    retry(
-        |_| {
-            update_source_of_truth_to_mononoke_for_mutation_id(
-                ctx.clone(),
-                git_source_of_truth_config,
-                mutation_id,
-            )
-        },
-        Duration::from_millis(1_000),
-    )
-    .binary_exponential_backoff()
-    .max_attempts(5)
-    .await?;
+    flip_landed_mutation_to_mononoke(&ctx, git_source_of_truth_config, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     Ok(())
 }
 
@@ -2098,6 +2078,25 @@ mod tests {
         assert_eq!(
             spec.hipster_acl, "repos/git/org",
             "hipster_acl should be the top-level namespace ACL, not the full repo name"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_make_repo_spec_honours_readonly_request() {
+        let repo_id = RepositoryId::new(12346);
+        let request = thrift::RepoCreationRequest {
+            repo_name: "org/mirror-repo".to_string(),
+            size_bucket: RepoSizeBucket::SMALL,
+            readonly: Some(true),
+            ..Default::default()
+        };
+
+        let spec =
+            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
+
+        assert!(
+            spec.readonly,
+            "a request with readonly=true must produce a read-only RepoSpec"
         );
     }
 

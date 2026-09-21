@@ -7,6 +7,7 @@
 
 #include "eden/fs/testharness/TestMount.h"
 
+#include <folly/Exception.h>
 #include <folly/FileUtil.h>
 #include <folly/executors/ManualExecutor.h>
 #include <folly/io/IOBuf.h>
@@ -124,13 +125,15 @@ TestMount::TestMount(
   // Create treeCache
   treeCache_ = TreeCache::create(reloadableConfig, makeRefPtr<EdenStats>());
 
+  const auto serverThreadPool =
+      make_shared<UnboundedQueueExecutor>(serverExecutor_);
   serverState_ = make_shared<ServerState>(
       UserInfo::lookup(),
       makeRefPtr<EdenStats>(),
       SessionInfo{},
       privHelper_,
-      make_shared<UnboundedQueueExecutor>(serverExecutor_),
-      serverExecutor_,
+      serverThreadPool,
+      serverThreadPool,
       clock_,
       make_shared<ProcessInfoCache>(),
       make_shared<NullStructuredLogger>(),
@@ -391,9 +394,10 @@ void TestMount::updateEdenConfig(
       testConfigSource_, serverState_->getReloadableConfig(), values);
 }
 
-void TestMount::remount() {
+void TestMount::remount(bool simulateUncleanShutdown) {
   // Create a new copy of the CheckoutConfig
   auto config = make_unique<CheckoutConfig>(*edenMount_->getCheckoutConfig());
+  auto overlayPath = config->getOverlayPath();
   // Create a new ObjectStore pointing to our local store and backing store
   auto objectStore = ObjectStore::create(
       backingStore_,
@@ -417,6 +421,33 @@ void TestMount::remount() {
   EXPECT_EQ(0, weakMount.lock().use_count())
       << "All references to EdenMount should be released before calling "
          "remount()";
+  // Dropping the last reference only starts tearing the mount down. Inodes
+  // are unloaded through the server executor, and the overlay lock the new
+  // mount has to acquire is released once that finishes. A probe on the lock
+  // file from a separate descriptor sees the old mount's lock until then.
+  auto infoPath = overlayPath + "info"_pc;
+  if (access(infoPath.c_str(), F_OK) == 0) {
+    folly::File probe{infoPath.c_str(), O_RDONLY | O_CLOEXEC};
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (!probe.try_lock()) {
+      drainServerExecutor();
+      XCHECK(std::chrono::steady_clock::now() < deadline)
+          << "old EdenMount still holds the overlay lock";
+      // @lint-ignore CLANGTIDY facebook-hte-BadCall-sleep_for
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    probe.unlock();
+  }
+
+  if (simulateUncleanShutdown) {
+#ifndef _WIN32
+    auto nextInodeNumberPath = overlayPath + "next-inode-number"_pc;
+    folly::checkUnixError(
+        unlink(nextInodeNumberPath.c_str()),
+        "removing ",
+        nextInodeNumberPath.view());
+#endif
+  }
 
   // Create a new EdenMount object.
   edenMount_ = EdenMount::create(

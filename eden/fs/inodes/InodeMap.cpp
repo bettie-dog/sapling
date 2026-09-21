@@ -728,18 +728,24 @@ void InodeMap::decFsRefcount(InodeNumber number, uint32_t count) {
   }
 }
 
-void InodeMap::clearFsRefcount(InodeNumber number) {
+bool InodeMap::clearFsRefcount(InodeNumber number) {
   InodePtr inodePtr;
+  bool wasReferenced = false;
   {
     auto data = data_.wlock();
+    auto unloadedIter = data->unloadedInodes_.find(number);
+    if (unloadedIter != data->unloadedInodes_.end()) {
+      wasReferenced = unloadedIter->second.numFsReferences != 0;
+    }
     inodePtr =
         decFsRefcountHelper(data, number, /*count=*/0, /*clearRefCount=*/true);
   }
   // Now release our lock before clearing the inode's FS reference
   // count and immediately releasing our pointer reference.
   if (inodePtr) {
-    inodePtr->clearFsRefcount();
+    wasReferenced = inodePtr->clearFsRefcount();
   }
+  return wasReferenced;
 }
 
 InodePtr InodeMap::decFsRefcountHelper(
@@ -794,6 +800,7 @@ InodePtr InodeMap::decFsRefcountHelper(
         number,
         unloadedEntry.parent,
         unloadedEntry.name);
+    ++data->numForgottenInodes_;
     eraseUnloadedInode(data, unloadedIter);
   }
   return nullptr;
@@ -1228,37 +1235,13 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
     bool isUnlinked,
     const folly::Synchronized<Members>::LockedPtr& data) {
   auto fsCount = inode->getFsRefcount();
-  auto overlay = mount_->getOverlay();
   if (isUnlinked && (data->isUnmounted_ || fsCount == 0)) {
-    try {
-      if (inode->getType() == dtype_t::Dir) {
-        overlay->removeOverlayDir(inode->getNodeId());
-      } else {
-        overlay->removeOverlayFile(inode->getNodeId());
-      }
-    } catch (const std::exception& ex) {
-      // If we fail to update the overlay log an error but do not propagate the
-      // exception to our caller.  There is nothing else we can do to handle
-      // this error.
-      //
-      // We still want to proceed unloading the inode normally in this case.
-      //
-      // The most common case where this can occur if the overlay file was
-      // already corrupt (say, because of a hard reboot that did not sync
-      // filesystem state).
-      XLOGF(
-          ERR,
-          "error saving overlay state while unloading inode {} ({}): {}",
-          inode->getNodeId(),
-          inode->getLogPath(),
-          folly::exceptionStr(ex));
-      mount_->getServerState()->getErrorLogger().log(
-          EdenErrorInfo::overlay(ex, inode->getNodeId().getRawValue())
-              .withMountPoint(mount_->getPath().asString())
-              .withErrorType("overlay_unload_failed"));
-    }
+    // Removing the overlay data is a btrfs unlink and inode eviction, hundreds
+    // of microseconds under load; every caller deletes the inode after
+    // releasing the locks held here, so the destructor does it then instead
+    // of stalling every other InodeMap user on it.
+    inode->removeOverlayDataOnDestruction();
   }
-
   // If the mount point has been unmounted, ignore any outstanding FS
   // refcounts on inodes that still existed before it was unmounted.
   // Everything is unreferenced by FS after an unmount operation, and we no
@@ -1417,6 +1400,7 @@ InodeMap::InodeCounts InodeMap::getInodeCounts() const {
   counts.treeCount = data->numTreeInodes_;
   counts.fileCount = data->numFileInodes_;
   counts.unloadedInodeCount = data->unloadedInodes_.size();
+  counts.forgottenInodeCount = data->numForgottenInodes_;
   counts.periodicUnlinkedUnloadInodeCount =
       numPeriodicallyUnloadedUnlinkedInodes_.load(std::memory_order_relaxed);
   counts.periodicLinkedUnloadInodeCount =

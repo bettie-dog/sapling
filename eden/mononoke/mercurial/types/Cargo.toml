@@ -14,7 +14,7 @@ async-stream = "0.3"
 async-trait = "0.1.92"
 base64 = { version = "0.23.1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
-bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
+bitflags = { version = "2.13.2", features = ["serde", "std"], default-features = false }
 blake3 = { version = "=1.8.6", features = ["mmap", "rayon", "traits-preview"] }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bytes = { version = "1.12.1", features = ["serde"] }
@@ -40,7 +40,7 @@ sapling-types = { version = "0.1.0", path = "../../../scm/lib/types" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_derive = "1.0.229"
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.1", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
